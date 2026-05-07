@@ -1,0 +1,13 @@
+{
+  "name": "claw-hwp",
+  "description": "Read, create, and edit Korean Hangul Word Processor documents (.hwp / .hwpx) in Claude. Built on the rhwp WebAssembly viewer/editor — no Hancom Office, no LibreOffice, no Windows COM required.",
+  "author": {
+    "name": "RECON Labs",
+    "email": "dev@reconlabs.ai",
+    "url": "https://www.reconlabs.ai/"
+  },
+  "homepage": "https://github.com/DoHyun468/claw-hwp",
+  "repository": "https://github.com/DoHyun468/claw-hwp.git",
+  "license": "MIT",
+  "version": "0.0.1"
+}

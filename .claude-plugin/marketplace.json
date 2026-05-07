@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claw-hwp",
+  "description": "Single-plugin marketplace shipping claw-hwp — Korean Hangul Word Processor (.hwp / .hwpx) support for Claude.",
+  "owner": {
+    "name": "RECON Labs",
+    "email": "dev@reconlabs.ai"
+  },
+  "plugins": [
+    {
+      "name": "claw-hwp",
+      "description": "Read, create, and edit Korean Hangul Word Processor documents (.hwp / .hwpx) in Claude. Built on the rhwp WebAssembly viewer/editor — no Hancom Office, no LibreOffice, no Windows COM required.",
+      "author": {
+        "name": "RECON Labs"
+      },
+      "category": "documents",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/DoHyun468/claw-hwp.git",
+        "path": "plugins/claw-hwp",
+        "ref": "main"
+      },
+      "homepage": "https://github.com/DoHyun468/claw-hwp"
+    }
+  ]
+}
