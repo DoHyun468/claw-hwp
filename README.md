@@ -1,7 +1,5 @@
 <p align="center">
-  <a href="https://www.reconlabs.ai/">
-    <img src="https://avatars.githubusercontent.com/u/82856082?s=200&v=4" width="96" alt="RECON Labs" />
-  </a>
+  <img src="plugins/claw-hwp/assets/icon-256.png" width="160" alt="claw-hwp" />
 </p>
 
 <h1 align="center">claw-hwp</h1>
