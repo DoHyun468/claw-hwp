@@ -31,3 +31,6 @@ coverage/
 
 # claude
 .claude/settings.local.json
+
+# scratch / spike work
+spike/
