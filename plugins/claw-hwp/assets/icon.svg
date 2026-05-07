@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="claw-hwp">
+  <title>claw-hwp</title>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#EE9A78"/>
+      <stop offset="100%" stop-color="#B8482A"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.04"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+
+  <!-- Subtle paper-corner fold in top-right, hinting at "document" -->
+  <path d="M832 96 L928 192 L832 192 Z" fill="url(#fold)"/>
+  <path d="M832 96 L832 192 L928 192" fill="none" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="6" stroke-linejoin="round"/>
+
+  <!-- Korean character 한 (Han, for 한글) -->
+  <text x="512" y="690"
+        font-family="'Apple SD Gothic Neo','Noto Sans KR','Pretendard','Nanum Gothic','AppleGothic','Helvetica Neue',sans-serif"
+        font-size="560" font-weight="900"
+        text-anchor="middle" fill="#FFFFFF"
+        letter-spacing="-10">한</text>
+</svg>

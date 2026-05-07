@@ -49,7 +49,7 @@ It runs in Claude Code, Claude Desktop, and claude.ai — no Hancom Office, no L
 - [x] v0.4 — End-to-end smoke tests against rhwp `samples/` fixtures (round-trip verified)
 - [x] v0.5 — Claude Code plugin manifest (`.claude-plugin/plugin.json`) + single-plugin marketplace (`.claude-plugin/marketplace.json`)
 - [x] v0.8 — Vendored Node deps (`vendor/rhwp` + `vendor/fflate`) — zero-config install across Code / Desktop / web
-- [ ] v0.6 — `references/rhwp-api.md` (curated `@rhwp/core` API reference)
+- [x] v0.6 — `references/rhwp-api.md` (curated `@rhwp/core` API reference, ~30 methods + create-doc example)
 - [ ] v0.7 — `create.js` (aligned with MyAgent's existing HWP creation tool)
 - [ ] v0.9 — Real-world install verification + plugin icon
 - [ ] v1.0 — Public release, submit plugin to Anthropic's official marketplace
