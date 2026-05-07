@@ -41,9 +41,9 @@ if (outExt !== '.hwp' && outExt !== '.hwpx') {
 
 const inputBytes = fs.readFileSync(inputPath);
 
-const wasmPath = path.join(__dirname, 'node_modules', '@rhwp', 'core', 'rhwp_bg.wasm');
+const wasmPath = path.join(__dirname, 'vendor', 'rhwp', 'rhwp_bg.wasm');
 const wasmBytes = fs.readFileSync(wasmPath);
-const rhwp = await import('@rhwp/core');
+const rhwp = await import('./vendor/rhwp/rhwp.js');
 await rhwp.default({ module_or_path: wasmBytes });
 
 const doc = new rhwp.HwpDocument(new Uint8Array(inputBytes));

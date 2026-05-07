@@ -48,9 +48,10 @@ It runs in Claude Code, Claude Desktop, and claude.ai — no Hancom Office, no L
 - [x] v0.3 — Python scripts (`unpack.py`, `pack.py`, `validate.py`)
 - [x] v0.4 — End-to-end smoke tests against rhwp `samples/` fixtures (round-trip verified)
 - [x] v0.5 — Claude Code plugin manifest (`.claude-plugin/plugin.json`) + single-plugin marketplace (`.claude-plugin/marketplace.json`)
+- [x] v0.8 — Vendored Node deps (`vendor/rhwp` + `vendor/fflate`) — zero-config install across Code / Desktop / web
 - [ ] v0.6 — `references/rhwp-api.md` (curated `@rhwp/core` API reference)
 - [ ] v0.7 — `create.js` (aligned with MyAgent's existing HWP creation tool)
-- [ ] v0.8 — Bundle Node deps in `vendor/` so plugin works without `npm install`
+- [ ] v0.9 — Real-world install verification + plugin icon
 - [ ] v1.0 — Public release, submit plugin to Anthropic's official marketplace
 - [ ] v1.1+ — PDF / DOCX conversion, image extraction, viewer/editor React packages
 
@@ -66,29 +67,23 @@ claude plugin marketplace add https://github.com/DoHyun468/claw-hwp
 
 # 2. Install the plugin
 claude plugin install claw-hwp@claw-hwp
-
-# 3. Install Node deps (one-time, in the plugin's scripts dir)
-cd ~/.claude/plugins/cache/claw-hwp/claw-hwp/*/plugins/claw-hwp/skills/hwp/scripts
-npm install
 ```
 
-Claude Code auto-loads the skill when you mention `.hwp`/`.hwpx` files. Updates land via `claude plugin marketplace update claw-hwp`.
+That's it. Claude Code auto-loads the skill when you mention `.hwp`/`.hwpx` files. Updates land via `claude plugin marketplace update claw-hwp`.
 
 ### Claude Desktop (macOS / Windows app)
 
 1. Clone or download this repo.
-2. Run `npm install` in `plugins/claw-hwp/skills/hwp/scripts/`.
-3. Open Claude Desktop → **Settings → Skills** → *Upload skill* → select the `plugins/claw-hwp/skills/hwp/` folder (or zip it first).
-4. The skill auto-loads when you attach a `.hwp`/`.hwpx` file or mention Korean document tasks.
+2. Open Claude Desktop → **Settings → Skills** → *Upload skill* → select the `plugins/claw-hwp/skills/hwp/` folder (or zip it first).
+3. The skill auto-loads when you attach a `.hwp`/`.hwpx` file or mention Korean document tasks.
 
 ### claude.ai (web, Pro / Max / Team / Enterprise)
 
 1. Clone or download this repo.
 2. Open claude.ai → **Settings → Capabilities → Skills** → *Add skill*.
 3. Upload the `plugins/claw-hwp/skills/hwp/` folder (zip it first).
-4. The web sandbox installs Node deps automatically on first use.
 
-> **One-time `npm install`** — in all three surfaces the Node scripts depend on `@rhwp/core` (HWPX/HWP WASM, ~5 MB) and `fflate` (~45 KB). Claude Code and Desktop need this run once on the user's machine; claude.ai's sandbox handles it for you.
+> **Zero-config**. Node dependencies (`@rhwp/core` WASM ~5 MB, `fflate` ~80 KB) are vendored into `scripts/vendor/` so the plugin works on any machine with Node 18+ and Python 3.9+ — no `npm install` step.
 
 See `plugins/claw-hwp/skills/hwp/SKILL.md` for the full decision tree (read / create / edit / convert / validate).
 

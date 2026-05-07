@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import { unzipSync, strFromU8 } from 'fflate';
+import { unzipSync, strFromU8 } from './vendor/fflate/index.mjs';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
@@ -100,9 +100,9 @@ process.stdout.write(lines.join('\n') + '\n');
 
 async function convertHwpToHwpx(bytes) {
   // Lazy-load rhwp only for binary .hwp inputs.
-  const wasmPath = path.join(__dirname, 'node_modules', '@rhwp', 'core', 'rhwp_bg.wasm');
+  const wasmPath = path.join(__dirname, 'vendor', 'rhwp', 'rhwp_bg.wasm');
   const wasmBytes = fs.readFileSync(wasmPath);
-  const rhwp = await import('@rhwp/core');
+  const rhwp = await import('./vendor/rhwp/rhwp.js');
   await rhwp.default({ module_or_path: wasmBytes });
   const doc = new rhwp.HwpDocument(new Uint8Array(bytes));
   try {

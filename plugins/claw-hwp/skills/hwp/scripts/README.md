@@ -4,7 +4,7 @@ Bundled scripts referenced by `SKILL.md`. Each script is intentionally low-level
 
 ## Status
 
-End-to-end edit pipeline working. `create.js` deferred pending alignment with MyAgent's existing HWP creation tool.
+End-to-end edit pipeline working, **zero-config** (deps vendored). `create.js` deferred pending alignment with MyAgent's existing HWP creation tool.
 
 | Script | Status | Notes |
 |--------|--------|-------|
@@ -14,7 +14,7 @@ End-to-end edit pipeline working. `create.js` deferred pending alignment with My
 | `pack.py` | ✅ v0 | mimetype-first uncompressed entry per OPF spec. Sorted file order for reproducibility |
 | `validate.py` | ✅ v0 | Zip integrity + mimetype + required files + XML well-formedness |
 | `create.js` | ⏳ deferred | Must align with MyAgent's existing HWP creation tool — see project memory |
-| `vendor/` | not needed (yet) | Currently using `npm install`. May bundle `@rhwp/core` files directly later for offline / sandbox use |
+| `vendor/` | ✅ v0 | `@rhwp/core` (rhwp.js + rhwp_bg.wasm, ~5 MB) and `fflate` (index.mjs, ~80 KB) bundled. Each subdir keeps the upstream LICENSE |
 
 ## Verified pipeline
 
@@ -30,11 +30,20 @@ End-to-end round-trip tested against rhwp's `samples/`:
 
 437-paragraph document survives round-trip with edit applied; structural counts preserved.
 
-## One-time setup
+## End-user setup
+
+**No setup needed.** The Node deps are vendored — scripts run on any machine with Node 18+ and Python 3.9+.
+
+## Maintainer: refreshing vendored deps
+
+`package.json` and `package-lock.json` are kept for maintainers who want to update bundled libraries:
 
 ```bash
 cd skills/hwp/scripts
-npm install
+npm install                      # repopulate node_modules with latest matching versions
+cp node_modules/@rhwp/core/{rhwp.js,rhwp_bg.wasm,LICENSE} vendor/rhwp/
+cp node_modules/fflate/esm/index.mjs vendor/fflate/
+cp node_modules/fflate/LICENSE vendor/fflate/
 ```
 
-Installs `@rhwp/core` (~5MB WASM) and `fflate` (~45KB zip lib) into `node_modules/`. Required before any `*.js` script runs. Python scripts use the standard library only.
+After refreshing, smoke-test by moving `node_modules/` aside and running each script — they should still work because they import only from `vendor/`.
