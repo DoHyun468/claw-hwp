@@ -98,12 +98,13 @@ MIT — see [LICENSE](LICENSE). Copyright © 2026 RECON Labs Inc.
 ---
 
 <p align="center">
-  <sub>
-    Built and maintained at
-    <a href="https://www.reconlabs.ai/">
-      <img src="https://avatars.githubusercontent.com/u/82856082?s=24&v=4" width="14" align="center" alt="RECON Labs" />
-      <b>RECON Labs</b>
-    </a>
-    · <a href="https://github.com/RECON-Labs-Inc">@RECON-Labs-Inc</a>
-  </sub>
+  <a href="https://www.reconlabs.ai/">
+    <img src="https://avatars.githubusercontent.com/u/82856082?s=160&v=4" width="72" alt="RECON Labs" />
+  </a>
+</p>
+
+<h3 align="center">Built and maintained at <a href="https://www.reconlabs.ai/">RECON Labs</a></h3>
+
+<p align="center">
+  Generative-AI 3D content platform — <a href="https://www.reconlabs.ai/">reconlabs.ai</a> · <a href="https://github.com/RECON-Labs-Inc">@RECON-Labs-Inc</a>
 </p>
