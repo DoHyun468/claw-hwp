@@ -1059,6 +1059,16 @@ async function patchHwpxPictures(filePath, patches) {
     applied.unshift({ ok: true, paraIdx: p.paraIdx });
   }
 
+  // Bail BEFORE writing if any patch failed — otherwise a partially-patched
+  // hwpx ends up on disk and the caller can't tell from the file alone which
+  // images are missing their <hp:pic> nodes.
+  const failures = applied.filter((a) => !a.ok);
+  if (failures.length) {
+    throw new Error(
+      `hwpx_patch incomplete: ${failures.length} of ${patches.length} not applied (${failures.map((f) => f.reason).join("; ")})`,
+    );
+  }
+
   // mimetype must stay STORE-compressed per OWPML packaging rules; everything
   // else is fine with default DEFLATE. JSZip preserves the original
   // compression for entries we don't replace, so we only re-stamp section0.
@@ -1069,13 +1079,6 @@ async function patchHwpxPictures(filePath, patches) {
     compressionOptions: { level: 6 },
   });
   fs.writeFileSync(filePath, newBuf);
-
-  const failures = applied.filter((a) => !a.ok);
-  if (failures.length) {
-    throw new Error(
-      `hwpx_patch incomplete: ${failures.length} of ${patches.length} not applied (${failures.map((f) => f.reason).join("; ")})`,
-    );
-  }
 }
 
 // ── Heading charPrIDRef fix ───────────────────────────────────────────────
