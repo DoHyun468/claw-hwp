@@ -15,7 +15,7 @@ This skill helps Claude work with Korean Hangul Word Processor documents — rea
 | Read text content | `node scripts/extract_text.js <file>` — works for both .hwp and .hwpx |
 | Read as markdown (preserves headings/tables) | `node scripts/extract_text.js --format markdown <file>` |
 | Inspect structure (pages, sections, tables) | `node scripts/extract_text.js --inspect <file>` |
-| Create new document from scratch | `node scripts/create.js` (edit content in-script first) |
+| Create new document from scratch | `echo '{"path":"out.hwp","operations":[...]}' \| node scripts/create.js` |
 | Edit existing `.hwpx` | unpack → edit XML directly with `Edit` tool → pack |
 | Edit existing `.hwp` (HWP 5.0 binary) | convert to `.hwpx` via `convert.js` first, then edit-as-hwpx |
 | Convert `.hwp` ↔ `.hwpx` | `node scripts/convert.js <input> <output>` |
@@ -54,11 +54,53 @@ node scripts/extract_text.js --inspect path/to/file.hwp
 
 ### "Create a new document" / "Write this as a hwp file"
 
+`create.js` reads a JSON payload from stdin and writes the file to the path you supply. Output format is decided by the path extension (`.hwp` = HWP 5.0 binary, `.hwpx` = OOXML).
+
 ```bash
-node scripts/create.js
+echo '{
+  "path": "report.hwp",
+  "operations": [
+    {"type": "setup_document", "page_size": "a4", "margin_mm": 25},
+    {"type": "append_heading", "level": 1, "text": "월간 보고서"},
+    {"type": "append_paragraph", "text": "이번 달 핵심 지표 요약입니다. 주요 변화는 **매출 증가**와 *비용 절감*입니다."},
+    {"type": "append_table",
+      "headers": ["항목", "지난달", "이번달"],
+      "rows": [["매출", "100억", "120억"], ["비용", "80억", "75억"]]
+    },
+    {"type": "append_image", "path": "/abs/path/chart.png", "width_cm": 12, "height_cm": 6.6}
+  ]
+}' | node scripts/create.js
 ```
 
-Default output is `output.hwpx`. The script is a template — edit the content blocks (paragraphs, tables, headings) inline before running. See `references/rhwp-api.md` for the @rhwp/core API.
+`stdout` returns one JSON line:
+
+```json
+{ "status": "success", "path": "report.hwp", "bytes_written": 14336, "ops_applied": 5,
+  "verify": { "pageCountAfter": 1, "recovered": true },
+  "log": ["…", "stripped 4 PARA_LINESEG record(s)"] }
+```
+
+Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Always read the JSON to confirm — exit code 0 even on op-level failures isn't guaranteed.
+
+**Op vocabulary** (in the order you'd typically use them):
+
+| Op | Required | Optional |
+|----|----------|----------|
+| `setup_document` | `page_size` (`a4`/`b5`/...), `orientation` (`portrait`/`landscape`) | `margin_mm`, `base_font` |
+| `append_heading` | `level` (1–6), `text` | `align`, `runs` |
+| `append_paragraph` | `text` | `align`, `line_spacing`, `spacing_before`, `spacing_after`, `runs` |
+| `append_table` | `headers`, `rows` | `col_widths_cm`, `merges`, `cell_props` |
+| `append_image` | `path` | `width_cm`, `height_cm`, `alt` |
+| `append_bullet_list`, `append_numbered_list` | `items[]` | — |
+| `append_page_break` | — | — |
+| `replace_text` | `query`, `replacement` | `case_sensitive` |
+
+Inline `**bold**` and `*italic*` are parsed automatically inside `text` and table cell strings. `runs:[{text, bold?, italic?, fontSize?, color?}]` overrides the parser when you need finer control.
+
+**Known limitations** (rhwp serializer constraints — applies to anything emitted via this skill):
+
+- **HWPX tables are dropped by rhwp's `exportHwpx()`**. If a doc has tables, write `.hwp` and (if HWPX is required) round-trip through Hancom Office or 한컴독스 to re-emit the table XML. `convert.js` won't help — it goes through the same rhwp serializer.
+- **HWP→HWPX downconversion is lossy** (tables, images, complex shapes). Default to `.hwp` for tables; default to `.hwpx` only when the document is text-heavy.
 
 ### "Edit this document" / "Replace X with Y" / "Add a new paragraph"
 
@@ -105,7 +147,7 @@ node scripts/convert.js input.hwp /tmp/converted.hwpx
 | Script | Runtime | Purpose |
 |--------|---------|---------|
 | `scripts/extract_text.js` | Node | Read text, markdown, or metadata from .hwp/.hwpx via rhwp WASM |
-| `scripts/create.js` | Node | Generate a new .hwpx from scratch via @rhwp/core |
+| `scripts/create.js` | Node | Generate a new .hwp / .hwpx from a stdin JSON op script via rhwp |
 | `scripts/convert.js` | Node | Convert `.hwp ↔ .hwpx` via rhwp WASM (no LibreOffice required) |
 | `scripts/unpack.py` | Python | Unzip .hwpx → directory of pretty-printed XML |
 | `scripts/pack.py` | Python | Repack directory → .hwpx with auto-repair |
