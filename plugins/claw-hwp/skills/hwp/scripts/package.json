@@ -4,9 +4,12 @@
   "description": "Bundled scripts for the claw-hwp Claude skill",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@rhwp/core": "^0.7.10",
+    "cfb": "^1.2.2",
     "fflate": "^0.8.2"
   }
 }

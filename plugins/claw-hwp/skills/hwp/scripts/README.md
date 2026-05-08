@@ -14,7 +14,7 @@ End-to-end edit pipeline working, **zero-config** (deps vendored). `create.js` d
 | `pack.py` | ✅ v0 | mimetype-first uncompressed entry per OPF spec. Sorted file order for reproducibility |
 | `validate.py` | ✅ v0 | Zip integrity + mimetype + required files + XML well-formedness |
 | `create.js` | ⏳ deferred | Must align with MyAgent's existing HWP creation tool — see project memory |
-| `vendor/` | ✅ v0 | `@rhwp/core` (rhwp.js + rhwp_bg.wasm, ~5 MB) and `fflate` (index.mjs, ~80 KB) bundled. Each subdir keeps the upstream LICENSE |
+| `vendor/` | ✅ v0 | `@rhwp/core` (rhwp.js + rhwp_bg.wasm, ~5 MB), `fflate` (index.mjs, ~80 KB), and `cfb` (cfb.js, ~62 KB) bundled. Each subdir keeps the upstream LICENSE |
 
 ## Verified pipeline
 
@@ -44,6 +44,7 @@ npm install                      # repopulate node_modules with latest matching 
 cp node_modules/@rhwp/core/{rhwp.js,rhwp_bg.wasm,LICENSE} vendor/rhwp/
 cp node_modules/fflate/esm/index.mjs vendor/fflate/
 cp node_modules/fflate/LICENSE vendor/fflate/
+cp node_modules/cfb/{cfb.js,LICENSE} vendor/cfb/
 ```
 
 After refreshing, smoke-test by moving `node_modules/` aside and running each script — they should still work because they import only from `vendor/`.
