@@ -4,18 +4,19 @@
 <meta charset="utf-8">
 <title>claw-hwp preview</title>
 <style>
-  /* Palette is intentionally distinct from MyAgent — slate base, teal accent.
-     No header bar, no language toggle, no chat link, no file picker. */
+  /* Dark base palette aligned with MyAgent's globals.css (oklch low-chroma
+     blue-gray). The 자동 보정 toggle and primary button use slightly raised
+     greys instead of a colored accent — keeps the chrome calm and lets the
+     rendered HWP page stay the visual focus. */
   :root {
-    --bg: #0F172A;
-    --surface: #1E293B;
-    --surface-elev: #273449;
-    --text: #E2E8F0;
-    --text-muted: #94A3B8;
-    --border: #334155;
-    --accent: #14B8A6;
-    --accent-bg: rgba(20, 184, 166, 0.14);
-    --accent-border: rgba(20, 184, 166, 0.45);
+    --bg:            oklch(0.18 0.004 240);
+    --surface:       oklch(0.22 0.005 240);
+    --surface-elev:  oklch(0.26 0.006 240);
+    --border:        oklch(0.32 0.006 240);
+    --border-strong: oklch(0.42 0.008 240);
+    --text:          oklch(0.95 0.003 240);
+    --text-dim:      oklch(0.72 0.006 240);
+    --text-muted:    oklch(0.55 0.006 240);
     --error: #F87171;
   }
   * { box-sizing: border-box; }
@@ -50,23 +51,6 @@
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
-  .zoom {
-    display: flex; align-items: center; gap: 4px;
-    color: var(--text-muted);
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-  }
-  .zoom button {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 4px;
-    padding: 2px 8px;
-    cursor: pointer;
-    font-size: 12px;
-  }
-  .zoom button:hover { background: var(--surface-elev); }
-  .zoom-val { width: 36px; text-align: center; }
   .autofix {
     background: transparent;
     color: var(--text-muted);
@@ -78,9 +62,9 @@
     font-weight: 500;
   }
   .autofix.on {
-    background: var(--accent-bg);
-    color: var(--accent);
-    border-color: var(--accent-border);
+    background: var(--surface-elev);
+    color: var(--text);
+    border-color: var(--border-strong);
   }
   .autofix:hover:not(.on) { background: var(--surface-elev); }
   main {
@@ -157,13 +141,13 @@
   }
   .modal-actions button:hover { background: var(--surface-elev); }
   .modal-actions button.primary {
-    background: var(--accent);
-    color: #0F172A;
-    border-color: var(--accent);
+    background: var(--surface-elev);
+    color: var(--text);
+    border-color: var(--border-strong);
     font-weight: 600;
   }
   .modal-actions button.primary:hover {
-    background: #2DD4BF;
+    background: var(--border);
   }
 </style>
 </head>
@@ -172,11 +156,6 @@
     <span class="filename" id="filename">파일을 불러오는 중…</span>
     <span class="pages" id="pages"></span>
     <button class="autofix" id="autofix" type="button">자동 보정 OFF</button>
-    <div class="zoom">
-      <button id="zoom-out" type="button">−</button>
-      <span class="zoom-val" id="zoom-val">100%</span>
-      <button id="zoom-in" type="button">+</button>
-    </div>
   </div>
   <main id="pages-container">
     <div class="status" id="status">초기화 중…</div>

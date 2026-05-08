@@ -20,9 +20,6 @@ const els = {
   filename: document.getElementById("filename"),
   pages: document.getElementById("pages"),
   autofix: document.getElementById("autofix"),
-  zoomVal: document.getElementById("zoom-val"),
-  zoomIn: document.getElementById("zoom-in"),
-  zoomOut: document.getElementById("zoom-out"),
   container: document.getElementById("pages-container"),
   status: document.getElementById("status"),
   modal: document.getElementById("autofix-modal"),
@@ -37,7 +34,6 @@ const state = {
   fileBytes: null,
   filename: "",
   autoFix: null,
-  zoom: 1.0,
   asked: false,
 };
 
@@ -122,18 +118,17 @@ async function render() {
       wrap.appendChild(canvas);
       els.container.appendChild(wrap);
 
-      // rhwp paints into the canvas at (intrinsic size) × scale. We aim for
-      // CSS pixel parity with targetCssWidth, then scale the canvas to that
-      // CSS size while keeping the buffer at native × dpr × zoom for sharpness.
-      const baseScale = state.zoom;
-      doc.renderPageToCanvas(i, canvas, baseScale * dpr);
+      // rhwp paints into the canvas at (intrinsic size) × scale. We render
+      // at dpr × an oversampling factor so the canvas stays sharp when CSS
+      // scales it down to fit the container width. No zoom controls — the
+      // viewer auto-fits and the user can rely on the OS / Claude Code
+      // pane resize to scale the layout.
+      doc.renderPageToCanvas(i, canvas, dpr);
 
-      const naturalCssW = canvas.width / dpr;
       const cssW = targetCssWidth;
       const cssH = (canvas.height / canvas.width) * cssW;
       canvas.style.width = `${cssW}px`;
       canvas.style.height = `${cssH}px`;
-      canvas.dataset.naturalW = naturalCssW;
     }
     clearStatus();
   } finally {
@@ -159,13 +154,5 @@ els.modalDecline.addEventListener("click", () => {
   hideModal();
   syncAutofixButton();
 });
-
-function setZoom(z) {
-  state.zoom = Math.max(0.5, Math.min(3.0, z));
-  els.zoomVal.textContent = `${Math.round(state.zoom * 100)}%`;
-  render();
-}
-els.zoomIn.addEventListener("click", () => setZoom(state.zoom + 0.1));
-els.zoomOut.addEventListener("click", () => setZoom(state.zoom - 0.1));
 
 loadFromUrl();
