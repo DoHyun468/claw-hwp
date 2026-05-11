@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="plugins/claw-hwp/assets/icon.svg" width="160" alt="claw-hwp" />
-</p>
-
 <h1 align="center">claw-hwp</h1>
 
 <p align="center">
