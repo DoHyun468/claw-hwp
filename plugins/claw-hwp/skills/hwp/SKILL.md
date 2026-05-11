@@ -166,6 +166,16 @@ The viewer auto-loads from the `?path=` query string, renders every page to its 
 
 Port `3737` is the default and can be overridden via `CLAW_HWP_PREVIEW_PORT` env in the launch config if it conflicts.
 
+**When to auto-preview** — fire `preview_start` → `preview_eval` without asking the user in any of these situations. The point is that you verify the result visually instead of pushing that work onto the user.
+
+1. Right after `create.js` / `convert.js` writes a new file or finishes a format conversion — feed the returned `path` straight into the `?path=` query.
+2. Right after the user uploads a `.hwp` / `.hwpx` to the workspace or mentions one by path in a message.
+3. Right after edits to an existing file (e.g. `replace_text`, an unpack-edit-pack round-trip).
+
+Don't tell the user "check if the file looks right" — open the viewer and let them see it. If the preview pane is already showing a viewer, just update `location.href` via `preview_eval` to swap to the new path; do not start a second server or open a second tab.
+
+**Fallback when the preview pane is unavailable** (e.g. Claude API direct, headless CI, or a future split where preview tooling is opt-in): start the server with `node scripts/preview-server.js` directly and open `http://localhost:3737/?path=<absolute path>` in the user's default browser (`open` on macOS, `xdg-open` on Linux, `start` on Windows). Same viewer, just no inline pane.
+
 ## Common pitfalls
 
 - **HWP 5.0 lossy round-trip**: `.hwp` → `.hwpx` → `.hwp` may drop formatting. Default to `.hwpx` output. Only round-trip back to `.hwp` on explicit user request, and warn first.
