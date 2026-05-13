@@ -162,7 +162,7 @@ If neither host is present (Claude API direct / headless CI), see **Fallback** a
 }
 ```
 
-If missing, create or merge before calling `preview_start`. On a typical plugin install the path is `~/.claude/plugins/claw-hwp/skills/hwp/scripts/preview-server.js`. Cowork's `Claude_Preview` plugin handles process management itself — no launch.json needed there. Port `3737` is the default; override via `CLAW_HWP_PREVIEW_PORT`.
+If missing, create or merge before calling `preview_start`. The script path is `${CLAUDE_PLUGIN_ROOT}/skills/hwp/scripts/preview-server.js` — Code substitutes `CLAUDE_PLUGIN_ROOT` at load time. (When typing the path manually for debugging, an installed plugin lives at `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`.) Cowork's `Claude_Preview` plugin handles process management itself — no launch.json needed there. Port `3737` is the default; override via `CLAW_HWP_PREVIEW_PORT`.
 
 **The lifecycle — start, navigate, stop.** The viewer is a long-lived page in a long-lived pane. You do NOT spawn a fresh server per file.
 
@@ -191,16 +191,21 @@ Do this whenever the user says "the pane is empty / didn't open / I can't see it
 **Server lifecycle the agent owns.** As of the auto-shutdown change, `preview-server.js` self-exits ~2 minutes after the last viewer tab closes (heartbeat-based). It may be dead between user requests even if you started it earlier in the session. **Always health-check before any preview action; if dead, start it yourself via Bash — do not ask the user to run anything.**
 
 ```bash
+# Resolve the script path. CLAUDE_PLUGIN_ROOT is set by Code when invoking
+# plugin scripts; the find fallback covers manual / non-Code Bash sessions.
+SCRIPT="${CLAUDE_PLUGIN_ROOT:-}/skills/hwp/scripts/preview-server.js"
+[ -f "$SCRIPT" ] || SCRIPT=$(find "$HOME/.claude/plugins/cache/claw-hwp" \
+  -path '*/skills/hwp/scripts/preview-server.js' 2>/dev/null | sort -V | tail -1)
+
 # Health check — anything other than 204 means dead.
 curl -fsS -o /dev/null http://localhost:3737/__heartbeat || \
-  node ~/.claude/plugins/claw-hwp/skills/hwp/scripts/preview-server.js \
-    >/tmp/claw-hwp-preview.log 2>&1 &
+  node "$SCRIPT" >/tmp/claw-hwp-preview.log 2>&1 &
 disown 2>/dev/null || true
 # Give it a beat to bind the port before you fire the next request.
 sleep 0.5
 ```
 
-Adjust the script path if the plugin is installed somewhere other than `~/.claude/plugins/claw-hwp/`. After that, proceed with whichever delivery path applies:
+After that, proceed with whichever delivery path applies:
 
 - **Claude Code / cowork + `Claude_Preview`**: call `preview_eval` with the URL as before.
 - **Cowork standalone (no `Claude_Preview` plugin), Claude API direct, headless CI**: hand the user a markdown link `[열기 — <filename>](http://localhost:3737/?path=<absolute path>)`. Click opens in their OS default browser. Same viewer, only loss is the inline pane.
