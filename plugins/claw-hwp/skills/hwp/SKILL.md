@@ -188,21 +188,7 @@ Never write "please check if the file looks right." Open the viewer and let them
 
 Do this whenever the user says "the pane is empty / didn't open / I can't see it" after a successful `preview_start`. Don't ask — just stop-then-start.
 
-### Surface check — when preview is even possible
-
-The preview path requires the agent's Bash to run on the **same machine as the user's browser**. That holds in Code (CLI / Desktop Code mode) and in cowork+`Claude_Preview` (the plugin runs the server on the user's Mac). It does **not** hold in cowork standalone — there your Bash is a remote Linux aarch64 sandbox whose `localhost` the user's browser cannot reach.
-
-**Decision rule, applied first thing every time the user wants to view a file:**
-
-| Tools / environment available | Action |
-|---|---|
-| `preview_start` / `preview_eval` / `preview_stop` (or `Claude_Preview:preview_*`) present | Use the host-mediated path below. |
-| None of those, but `uname -s` is `Darwin` / `MINGW*` / `MSYS*` (= Bash is on the user's machine) | Self-host via Bash, hand back a markdown link. |
-| `uname -s` is `Linux` and no `preview_*` tools | **You are in a cowork remote sandbox. STOP. Do not start `preview-server.js` here — the user can never reach it.** Just emit the file(s) and tell the user: open with their HWP app, or run Code locally if they want our preview pane. |
-
-The third row is the trap the previous session fell into — spinning up `preview-server.js` in a sandbox and handing the user a `localhost:3737` link that points at *the sandbox's* localhost, not theirs. Never do this.
-
-**Server lifecycle the agent owns (rows 1–2 only).** `preview-server.js` self-exits ~2 minutes after the last viewer tab closes (heartbeat-based), so it may be dead between user requests even if you started it earlier. Health-check first; if dead, start it via Bash — do not ask the user.
+**Server lifecycle the agent owns.** As of the auto-shutdown change, `preview-server.js` self-exits ~2 minutes after the last viewer tab closes (heartbeat-based). It may be dead between user requests even if you started it earlier in the session. **Always health-check before any preview action; if dead, start it yourself via Bash — do not ask the user to run anything.**
 
 ```bash
 # Resolve the script path. CLAUDE_PLUGIN_ROOT is set by Code when invoking
@@ -219,10 +205,10 @@ disown 2>/dev/null || true
 sleep 0.5
 ```
 
-Then deliver:
+After that, proceed with whichever delivery path applies:
 
-- **Row 1** (host-mediated): call `preview_eval` with `http://localhost:3737/?path=<absolute path>`.
-- **Row 2** (self-hosted, no preview tools): hand the user a markdown link `[열기 — <filename>](http://localhost:3737/?path=<absolute path>)`. Click opens in their OS default browser.
+- **Claude Code / cowork + `Claude_Preview`**: call `preview_eval` with the URL as before.
+- **Cowork standalone (no `Claude_Preview` plugin), Claude API direct, headless CI**: hand the user a markdown link `[열기 — <filename>](http://localhost:3737/?path=<absolute path>)`. Click opens in their OS default browser. Same viewer, only loss is the inline pane.
 
 ## Common pitfalls
 
