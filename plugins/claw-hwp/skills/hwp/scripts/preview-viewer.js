@@ -293,4 +293,12 @@ els.pageInput.addEventListener("keydown", (e) => {
   }
 });
 
+// ── 9. Heartbeat ──────────────────────────────────────────────────────────
+// While this tab is open, ping the server so it knows we're alive. When the
+// tab closes the pings stop, the server's idle timer fires, and the process
+// self-kills — sparing the user from having to remember to stop it.
+setInterval(() => {
+  fetch("/__heartbeat", { method: "GET", cache: "no-store" }).catch(() => {});
+}, 30_000);
+
 loadFromUrl();

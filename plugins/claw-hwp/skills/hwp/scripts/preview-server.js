@@ -18,6 +18,16 @@ const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const PORT = Number(process.env.CLAW_HWP_PREVIEW_PORT || 3737);
 const HOST = process.env.CLAW_HWP_PREVIEW_HOST || "127.0.0.1";
 
+// Auto-shutdown: the viewer pings /__heartbeat every 30s while open. If no
+// heartbeat (or any other request) arrives for IDLE_TIMEOUT_MS, the server
+// kills itself. MIN_LIFETIME_MS keeps it alive long enough for the user to
+// notice the chat link and click it even if no client ever connects.
+const IDLE_TIMEOUT_MS = Number(process.env.CLAW_HWP_PREVIEW_IDLE_MS || 120_000);
+const MIN_LIFETIME_MS = Number(process.env.CLAW_HWP_PREVIEW_MIN_LIFETIME_MS || 180_000);
+const startTime = Date.now();
+let lastActivity = startTime;
+const touch = () => { lastActivity = Date.now(); };
+
 // Files we know how to serve from the script directory. Anything outside
 // this list is rejected so the server can't be used as a generic file
 // browser even though it accepts absolute paths on /file (those go through
@@ -46,6 +56,24 @@ const server = createServer(async (req, res) => {
     parsed = new URL(req.url, `http://${HOST}:${PORT}`);
   } catch {
     return send(res, 400, "text/plain", "bad URL");
+  }
+
+  touch();
+
+  // Liveness ping from the viewer — also resets the idle timer via touch()
+  // above. Kept lightweight so a tab can fire it on a tight interval without
+  // showing up in DevTools network noise too much.
+  if (parsed.pathname === "/__heartbeat") {
+    return send(res, 204, "text/plain", "");
+  }
+
+  // Explicit shutdown for ❌-style kill buttons or agent commands. Writes
+  // the response first, then exits on the next tick so the client sees the
+  // 204 before the socket closes.
+  if (parsed.pathname === "/__shutdown" && req.method === "POST") {
+    send(res, 204, "text/plain", "");
+    setTimeout(() => process.exit(0), 50);
+    return;
   }
 
   // Static assets — viewer page, vendored WASM/JS.
@@ -89,3 +117,14 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   process.stderr.write(`claw-hwp preview server listening on http://${HOST}:${PORT}\n`);
 });
+
+setInterval(() => {
+  const now = Date.now();
+  if (now - startTime < MIN_LIFETIME_MS) return;
+  if (now - lastActivity > IDLE_TIMEOUT_MS) {
+    process.stderr.write(
+      `claw-hwp preview server: idle for ${Math.round((now - lastActivity) / 1000)}s, shutting down\n`,
+    );
+    process.exit(0);
+  }
+}, 30_000).unref();
