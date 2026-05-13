@@ -42,11 +42,12 @@ It runs in Claude Code, Claude Desktop, and claude.ai — no Hancom Office, no L
 - [x] v0.4 — End-to-end smoke tests against rhwp `samples/` fixtures (round-trip verified)
 - [x] v0.5 — Claude Code plugin manifest + single-plugin marketplace
 - [x] v0.6 — `references/rhwp-api.md` (curated `@rhwp/core` API reference)
+- [x] v0.7 — `create.js` core ops (setup_document, append_{heading,paragraph,table,list,image}, replace_text, page/column breaks, load-then-append, extension-based `.hwp`/`.hwpx` dispatch)
 - [x] v0.8 — Vendored Node deps — zero-config install across Code / Desktop / web
-- [x] v0.9 — Plugin icon (한지 + ㄱㄴㄷㄹ, v15-02-vanilla)
-- [ ] v0.7 — `create.js` (aligned with MyAgent's existing HWP creation tool)
+- [x] v0.9 — Plugin icon
 - [ ] v1.0 — Public release, submit plugin to Anthropic's official marketplace
-- [ ] v1.1+ — PDF / DOCX conversion, image extraction, viewer/editor React packages
+- [ ] v1.1 — Footnotes (`append_paragraph_with_footnotes`) + Markdown→HWP with citation styles (numeric_inline / footnote / footnote_with_bibliography) — MyAgent-parity differentiators
+- [ ] v1.2+ — PDF / DOCX conversion, image extraction, viewer/editor React packages
 
 ## Install
 
