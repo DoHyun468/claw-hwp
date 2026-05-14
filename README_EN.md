@@ -88,9 +88,45 @@ claw-hwp is part of a broader open-source movement around Korea's HWP formats. E
 
 ## Install
 
-The same skill folder works across Claude surfaces. Pick the one you use.
+Pick the path that matches your environment. All three surfaces use the same skill files.
 
-### Claude Code (CLI) — recommended
+### New here? — just ask Claude (Claude Desktop, claude.ai web)
+
+Easiest path: ask Claude to install it for you. Paste this one line into any Claude chat (Desktop app or claude.ai web):
+
+```
+https://github.com/DoHyun468/claw-hwp help me install this skill
+```
+
+Claude walks you through the steps based on your OS (Mac / Windows) and surface (app / web). You won't type a single command.
+
+<details>
+<summary>Prefer to install it by hand? (manual steps)</summary>
+
+**1. Download the repo as a zip**
+
+Open <https://github.com/DoHyun468/claw-hwp> → click the green **`Code`** button above the file list → **`Download ZIP`**. You'll get something like `claw-hwp-main.zip`.
+
+**2. Re-zip just the skill folder**
+
+Double-click the downloaded zip to expand it. Inside `claw-hwp-main`, drill into `plugins` → `claw-hwp` → `skills` → `hwp` (you should see `SKILL.md`, `scripts/`, `references/`).
+
+Compress that `hwp` folder into its own zip:
+- **Mac**: right-click the `hwp` folder → **Compress** → `hwp.zip`
+- **Windows**: right-click the `hwp` folder → **Send to → Compressed (zipped) folder** → `hwp.zip`
+
+**3. Upload to Claude**
+
+Pick your surface:
+
+- **Claude Desktop app**: **Settings → Skills → Upload skill** → choose `hwp.zip`
+- **claude.ai web** (Pro / Max / Team / Enterprise plans): **Settings → Capabilities → Skills → Add skill** → choose `hwp.zip`
+
+Done. Attach a `.hwp` / `.hwpx` file or ask Claude to "draft a Korean report" and the skill kicks in.
+
+</details>
+
+### Claude Code (CLI) — one command (developers)
 
 ```bash
 # 1. Add the marketplace (one-time)
@@ -100,19 +136,7 @@ claude plugin marketplace add https://github.com/DoHyun468/claw-hwp
 claude plugin install claw-hwp@claw-hwp
 ```
 
-That's it. Claude Code auto-loads the skill when you mention `.hwp`/`.hwpx` files. Updates land via `claude plugin marketplace update claw-hwp`.
-
-### Claude Desktop (macOS / Windows app)
-
-1. Clone or download this repo.
-2. Open Claude Desktop → **Settings → Skills → Upload skill** → select the `plugins/claw-hwp/skills/hwp/` folder (or zip it first).
-3. The skill auto-loads when you attach a `.hwp`/`.hwpx` file or mention Korean document tasks.
-
-### claude.ai (web, Pro / Max / Team / Enterprise)
-
-1. Clone or download this repo.
-2. Open claude.ai → **Settings → Capabilities → Skills → Add skill**.
-3. Upload the `plugins/claw-hwp/skills/hwp/` folder (zip it first).
+That's it. Claude Code auto-loads the skill when you mention `.hwp` / `.hwpx` files. Updates land via `claude plugin marketplace update claw-hwp`.
 
 > **Zero-config**. Node dependencies (`@rhwp/core` WASM ~5 MB, `fflate` ~80 KB) are vendored into `scripts/vendor/` so the plugin works on any machine with Node 18+ and Python 3.9+ — no `npm install` step.
 

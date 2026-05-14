@@ -88,9 +88,45 @@ claw-hwp 는 한국 HWP 형식을 오픈소스로 다루려는 더 큰 흐름의
 
 ## 설치
 
-같은 스킬 폴더가 모든 환경에서 동일하게 작동합니다. 본인이 쓰는 환경 하나만 따라하시면 됩니다.
+본인이 쓰는 환경에 따라 한 가지 길만 따라하면 됩니다. 세 환경 모두 같은 스킬 파일을 씁니다.
 
-### Claude Code (CLI) — 추천
+### 처음이세요? — Claude 에게 부탁하세요 (Claude Desktop, claude.ai 웹)
+
+가장 쉬운 길은 Claude 한테 직접 시키는 겁니다. Claude 채팅 (Desktop 앱이든 claude.ai 웹이든) 에 아래 한 줄을 그대로 붙여넣으세요:
+
+```
+https://github.com/DoHyun468/claw-hwp 이 스킬 설치 도와줘
+```
+
+사용 중인 OS (Mac / Windows) 와 환경 (앱 / 웹) 에 맞춰 Claude 가 단계별로 안내해 줍니다. 명령어 한 줄도 직접 안 칩니다.
+
+<details>
+<summary>직접 손으로 깔고 싶다면 (수동 단계)</summary>
+
+**1. GitHub 에서 zip 받기**
+
+<https://github.com/DoHyun468/claw-hwp> 페이지를 엽니다 → 파일 목록 위쪽의 녹색 **`Code`** 버튼 클릭 → **`Download ZIP`**. `claw-hwp-main.zip` 같은 파일이 다운로드 됩니다.
+
+**2. 스킬 폴더만 다시 zip 으로 묶기**
+
+받은 zip 을 더블클릭해서 풀면 `claw-hwp-main` 폴더가 생깁니다. 그 안에서 `plugins` → `claw-hwp` → `skills` → `hwp` 폴더까지 들어갑니다 (`SKILL.md` 파일과 `scripts/`, `references/` 폴더가 보이면 맞아요).
+
+이 `hwp` 폴더를 통째로 다시 zip 으로 압축합니다:
+- **Mac**: `hwp` 폴더 우클릭 → **압축** → `hwp.zip` 생성됨
+- **Windows**: `hwp` 폴더 우클릭 → **보내기 → 압축(zip) 폴더** → `hwp.zip` 생성됨
+
+**3. Claude 에 업로드**
+
+본인 환경에 따라:
+
+- **Claude Desktop 앱**: **Settings → Skills → Upload skill** → 방금 만든 `hwp.zip` 선택
+- **claude.ai 웹** (Pro / Max / Team / Enterprise 플랜 필요): **Settings → Capabilities → Skills → Add skill** → 방금 만든 `hwp.zip` 선택
+
+업로드 후 `.hwp` / `.hwpx` 파일을 채팅에 첨부하거나 "한글 보고서 만들어줘" 같이 한글 문서 관련 작업을 시키면 자동으로 스킬이 작동합니다.
+
+</details>
+
+### Claude Code (CLI) — 명령어 한 줄 (개발자용)
 
 ```bash
 # 1. 마켓플레이스 등록 (한 번만)
@@ -100,19 +136,7 @@ claude plugin marketplace add https://github.com/DoHyun468/claw-hwp
 claude plugin install claw-hwp@claw-hwp
 ```
 
-설치하면 끝입니다. `.hwp`/`.hwpx` 파일을 언급하면 Claude Code 가 자동으로 스킬을 불러옵니다. 업데이트는 `claude plugin marketplace update claw-hwp`.
-
-### Claude Desktop (macOS / Windows 앱)
-
-1. 이 저장소를 clone 또는 다운로드 합니다.
-2. Claude Desktop → **Settings → Skills → Upload skill** → `plugins/claw-hwp/skills/hwp/` 폴더 선택 (또는 zip 으로 압축 후 업로드).
-3. `.hwp`/`.hwpx` 파일을 첨부하거나 한글 문서 작업을 언급하면 자동 로드됩니다.
-
-### claude.ai (웹, Pro / Max / Team / Enterprise)
-
-1. 이 저장소를 clone 또는 다운로드 합니다.
-2. claude.ai → **Settings → Capabilities → Skills → Add skill**.
-3. `plugins/claw-hwp/skills/hwp/` 폴더를 zip 으로 압축 후 업로드 합니다.
+설치하면 끝입니다. `.hwp` / `.hwpx` 파일을 언급하면 Claude Code 가 자동으로 스킬을 불러옵니다. 업데이트는 `claude plugin marketplace update claw-hwp`.
 
 > **별도 의존성 설치 불필요**. Node 의존성 (`@rhwp/core` WASM 약 5 MB, `fflate` 약 80 KB) 이 `scripts/vendor/` 에 vendoring 돼 있어, Node 18+ / Python 3.9+ 만 있으면 바로 작동합니다 — `npm install` 단계 없습니다.
 
