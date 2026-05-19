@@ -83,7 +83,9 @@ echo '{
 
 Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Always read the JSON to confirm — exit code 0 even on op-level failures isn't guaranteed.
 
-**Op vocabulary** (in the order you'd typically use them):
+**Op vocabulary** (grouped by purpose):
+
+*Creation / appending content (used while building a doc top-down):*
 
 | Op | Required | Optional |
 |----|----------|----------|
@@ -94,7 +96,14 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 | `append_image` | `path` | `width_cm`, `height_cm`, `alt` |
 | `append_bullet_list`, `append_numbered_list` | `items[]` | — |
 | `append_page_break` | — | — |
-| `replace_text` | `query`, `replacement` | `case_sensitive` |
+
+*In-place editing (run on an existing file — omit `setup_document` so create.js loads the path instead of starting blank):*
+
+| Op | Required | Optional | Notes |
+|----|----------|----------|-------|
+| `replace_text` | `query`, `replacement` | `case_sensitive` | **Body text only.** rhwp's `searchText` does NOT walk into table cells, so anchor text inside `<hp:tbl>` is invisible — use `set_cell_text*` instead. |
+| `set_cell_text` | `section`, `para`, `control`, (`row`+`col`) or `cell`, `text` | `cell_para` | Replaces one cell's text. `row`+`col` is recommended; `cell` is the flat row-major index. |
+| `set_cell_text_by_label` | `label`, `text` | `row_offset`, `col_offset`, `occurrence`, `case_sensitive`, `cell_para`, `section`+`para`+`control` (to scope to one table) | Find a cell whose text contains `label`, then write to the cell at `(label_row + row_offset, label_col + col_offset)`. Doc-wide sweep by default. |
 
 Inline `**bold**` and `*italic*` are parsed automatically inside `text` and table cell strings. `runs:[{text, bold?, italic?, fontSize?, color?}]` overrides the parser when you need finer control.
 
@@ -102,20 +111,63 @@ Inline `**bold**` and `*italic*` are parsed automatically inside `text` and tabl
 
 - **HWPX tables are dropped by rhwp's `exportHwpx()`**. If a doc has tables, write `.hwp` and (if HWPX is required) round-trip through Hancom Office or 한컴독스 to re-emit the table XML. `convert.js` won't help — it goes through the same rhwp serializer.
 - **HWP→HWPX downconversion is lossy** (tables, images, complex shapes). Default to `.hwp` for tables; default to `.hwpx` only when the document is text-heavy.
+- **`replace_text` doesn't see table cells** (see op table above). For table-cell edits on an existing file, the `set_cell_text*` ops are the only path.
 
 ### "Edit this document" / "Replace X with Y" / "Add a new paragraph"
 
-**For `.hwpx` files (recommended path):**
+There are **two editing paths** with different capabilities. Pick by checking the input file extension AND whether the edit touches a table.
+
+#### Decision rule
+
+| Input | Edit touches a table cell? | Use |
+|-------|----------------------------|-----|
+| `.hwpx` | yes or no | **Path A** — unpack + XML edit + pack |
+| `.hwp` | no (body text / paragraph only) | **Path A** — convert to `.hwpx` first, then unpack/edit/pack. Save back to `.hwp` only if required. |
+| `.hwp` | **yes** | **Path B** — wasm op vocab on the original `.hwp`. Do NOT convert: rhwp's hwp→hwpx step drops tables. |
+
+Detect format by reading the first two bytes — `PK` = HWPX (treat as `.hwpx` regardless of extension).
+
+#### Path A — `.hwpx` XML edit (preferred for non-table edits)
+
+Same archetype as `.docx`. Unpack → edit XML directly with the `Edit` tool → pack.
 
 1. Unpack:
    ```bash
    python scripts/unpack.py path/to/file.hwpx /tmp/unpacked/
    ```
-2. Edit XML files directly using your `Edit` tool. Key files:
-   - `/tmp/unpacked/Contents/section0.xml` — main body content
-   - `/tmp/unpacked/Contents/header.xml` — document-level styles, fonts, page settings
-   - `/tmp/unpacked/Contents/content.hpf` — manifest
-   See `references/hwpx-format.md` for element references and common edit patterns.
+2. Edit files in `/tmp/unpacked/Contents/`:
+   - `section0.xml` (plus `section1.xml`, ...) — body content
+   - `header.xml` — document-level styles, fonts, page settings
+   - `content.hpf` — manifest
+
+   Common patterns:
+
+   ```xml
+   <!-- Body paragraph -->
+   <hp:p id="..."><hp:run charPrIDRef="..."><hp:t>본문 텍스트</hp:t></hp:run>
+     <hp:linesegarray>
+       <hp:lineseg textpos="0" .../>
+     </hp:linesegarray>
+   </hp:p>
+
+   <!-- Table cell -->
+   <hp:tbl rowCnt="3" colCnt="2" ...>
+     <hp:tr>
+       <hp:tc rowSpan="1" colSpan="1">
+         <hp:subList>
+           <hp:p><hp:run charPrIDRef="..."><hp:t>100만원</hp:t></hp:run>
+             <hp:linesegarray><hp:lineseg textpos="0" .../></hp:linesegarray>
+           </hp:p>
+         </hp:subList>
+       </hp:tc>
+     </hp:tr>
+   </hp:tbl>
+   ```
+
+   **Lineseg cache invalidation.** `<hp:linesegarray>` is a precomputed line-break cache. If you change a `<hp:t>` text, the cache becomes stale and non-Hancom readers will draw text at wrong positions. Two ways to fix:
+   - **Delete the `<hp:linesegarray>` block** on edited paragraphs. Hancom recalculates on open; the preview viewer's "자동 보정 ON" (default) does the same via `reflowLinesegs()`.
+   - **Or** leave the cache and accept that the inline preview may show slight offsets until 자동 보정 is toggled.
+
 3. Repack:
    ```bash
    python scripts/pack.py /tmp/unpacked/ output.hwpx --original path/to/file.hwpx
@@ -125,13 +177,36 @@ Inline `**bold**` and `*italic*` are parsed automatically inside `text` and tabl
    python scripts/validate.py output.hwpx
    ```
 
-**For `.hwp` (HWP 5.0 binary) files:**
-
+**When the input is `.hwp` but the edit doesn't touch tables**: convert first, then proceed.
 ```bash
-# 1. Convert to .hwpx via rhwp WASM
 node scripts/convert.js input.hwp /tmp/converted.hwpx
-# 2. Then proceed with the .hwpx workflow above
+# Then unpack /tmp/converted.hwpx as above.
+# To save back to .hwp afterwards:
+node scripts/convert.js output.hwpx final.hwp
 ```
+
+#### Path B — `.hwp` wasm ops (only path for in-place table-cell edits)
+
+When the input is `.hwp` and a table cell needs to change, the hwpx round-trip drops the whole table — wasm op vocab is the only safe route. The flow is the same as create.js's normal flow, just on an existing file:
+
+1. Write a JSON op script and pipe it into `create.js`. Because the path already exists and the first op is NOT `setup_document`, create.js loads the existing file:
+   ```bash
+   echo '{
+     "path": "/Users/me/budget.hwp",
+     "operations": [
+       {"type": "set_cell_text_by_label",
+        "label": "1차년도 현금", "col_offset": 1, "text": "100만원"},
+       {"type": "set_cell_text",
+        "section": 0, "para": 1, "control": 0, "row": 2, "col": 1, "text": "50만원"}
+     ]
+   }' | node scripts/create.js
+   ```
+
+2. To discover the right `section / para / control / row / col` coordinates when you don't already know them, dump table structure with `extract_text.js --inspect` (table count + per-table dimensions), or write a tiny probe that calls rhwp's `getCellInfo(sec, para, ctrl, idx)` until it errors. The `set_cell_text_by_label` op handles the common case ("set the cell next to the row labeled X") with no coordinates needed.
+
+3. **`replace_text` will silently miss table cells.** rhwp's `searchText` (and therefore `replaceOne`) does not enter `<hp:tbl>`. If `replace_text` reports 0 matches on what looks like a present anchor, the anchor is almost certainly inside a table — switch to `set_cell_text_by_label`.
+
+4. **Auto-preview after writes.** Per the trigger guidance below, fire `preview_start` / `preview_eval` immediately after the write so the user sees the edit, instead of asking them to verify.
 
 **Output format default**: save edits as `.hwpx`. The HWPX format is the modern Hangul Office standard and avoids the lossy round-trip back to HWP 5.0 binary. Only convert back to `.hwp` if the user explicitly requires HWP 5.0 output (use `node scripts/convert.js output.hwpx final.hwp` and warn that some formatting may be lost).
 

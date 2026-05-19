@@ -895,14 +895,213 @@ const HANDLERS = {
     if (/[\n\r\u2028\u2029]/.test(replacement)) {
       throw new Error("replace_text: replacement cannot contain paragraph-break characters");
     }
-    // replaceOne returns {ok, replaced_count}
+    // replaceOne returns {ok, replaced_count}. NOTE: rhwp's searchText (and
+    // therefore replaceOne) does NOT walk into table cells — anchor text
+    // inside a <hp:tbl> is invisible to this op. Use `set_cell_text` /
+    // `set_cell_text_by_label` for table cells.
     const r = unwrap(
       doc.replaceOne(op.query, replacement, !!op.case_sensitive),
       "replaceOne",
     );
     log.push(`replace_text "${op.query}" → "${replacement}" (${r.replaced_count ?? r.count ?? "?"} matches)`);
   },
+
+  // ── Table cell ops ────────────────────────────────────────────────────────
+  //
+  // rhwp's searchText/replaceText skip table cells, so editing existing
+  // tables needs dedicated coordinate-based ops. The wasm uses a flat
+  // row-major cell_idx (header row counts as row 0). We expose row+col on
+  // the public op for readability and convert internally — column count is
+  // auto-detected by walking cells via getCellInfo until it errors.
+
+  set_cell_text(doc, op, cursor) {
+    const sec = requireInt(op, "section");
+    const para = requireInt(op, "para");
+    const ctrl = requireInt(op, "control");
+    const text = op.text ?? "";
+    if (/[\n\r\u2028\u2029]/.test(text)) {
+      throw new Error("set_cell_text: 'text' cannot contain paragraph-break characters");
+    }
+    const cellPara = op.cell_para ?? 0;
+    const cellIdx = resolveCellIdx(doc, sec, para, ctrl, op);
+    applyCellText(doc, sec, para, ctrl, cellIdx, cellPara, text);
+    log.push(`set_cell_text sec=${sec} para=${para} ctrl=${ctrl} cell=${cellIdx} "${truncForLog(text)}"`);
+  },
+
+  set_cell_text_by_label(doc, op, cursor) {
+    if (typeof op.label !== "string" || op.label.length === 0) {
+      throw new Error("set_cell_text_by_label: 'label' is required");
+    }
+    const text = op.text ?? "";
+    if (/[\n\r\u2028\u2029]/.test(text)) {
+      throw new Error("set_cell_text_by_label: 'text' cannot contain paragraph-break characters");
+    }
+    const rowOff = op.row_offset ?? 0;
+    const colOff = op.col_offset ?? 0;
+    const occurrence = op.occurrence ?? 0;
+    const caseSensitive = !!op.case_sensitive;
+    const cellPara = op.cell_para ?? 0;
+
+    // Optional scoping: if (section, para, control) given, only search that
+    // table; otherwise walk every table in the document.
+    let candidates;
+    if (op.section != null || op.para != null || op.control != null) {
+      const sec = requireInt(op, "section");
+      const para = requireInt(op, "para");
+      const ctrl = requireInt(op, "control");
+      candidates = [{ sec, para, ctrl }];
+    } else {
+      candidates = enumerateTables(doc);
+    }
+
+    const hits = [];
+    for (const { sec, para, ctrl } of candidates) {
+      const grid = describeTable(doc, sec, para, ctrl);
+      if (!grid) continue;
+      for (const cell of grid.cells) {
+        const txt = caseSensitive ? cell.text : cell.text.toLowerCase();
+        const needle = caseSensitive ? op.label : op.label.toLowerCase();
+        if (txt.includes(needle)) hits.push({ sec, para, ctrl, grid, cell });
+      }
+    }
+    if (hits.length === 0) {
+      throw new Error(`set_cell_text_by_label: no cell containing "${op.label}" found`);
+    }
+    if (occurrence >= hits.length) {
+      throw new Error(`set_cell_text_by_label: occurrence ${occurrence} out of range (${hits.length} hits)`);
+    }
+    const hit = hits[occurrence];
+    const targetRow = hit.cell.row + rowOff;
+    const targetCol = hit.cell.col + colOff;
+    const targetCellIdx = hit.grid.indexByRowCol(targetRow, targetCol);
+    if (targetCellIdx == null) {
+      throw new Error(`set_cell_text_by_label: target (row=${targetRow}, col=${targetCol}) is outside the table`);
+    }
+    applyCellText(doc, hit.sec, hit.para, hit.ctrl, targetCellIdx, cellPara, text);
+    log.push(
+      `set_cell_text_by_label label="${op.label}" → ` +
+      `sec=${hit.sec} para=${hit.para} ctrl=${hit.ctrl} ` +
+      `anchor=(${hit.cell.row},${hit.cell.col}) target=(${targetRow},${targetCol}) cell=${targetCellIdx} ` +
+      `"${truncForLog(text)}"`,
+    );
+  },
 };
+
+// ── Cell-op helpers ─────────────────────────────────────────────────────────
+//
+// Module-private (not exposed on OPS) — shared infrastructure for
+// set_cell_text / set_cell_text_by_label.
+
+function requireInt(op, key) {
+  const v = op[key];
+  if (!Number.isInteger(v) || v < 0) {
+    throw new Error(`set_cell_*: '${key}' must be a non-negative integer (got ${JSON.stringify(v)})`);
+  }
+  return v;
+}
+
+function truncForLog(s) {
+  return s.length > 40 ? s.slice(0, 37) + "…" : s;
+}
+
+// Convert public {row,col} or {cell} on the op into a flat cell_idx using
+// the actual table dimensions read from rhwp. We prefer (row,col) — the flat
+// cell index ordering is row-major but the count includes header rows and
+// spans, so hand-counting is error-prone.
+function resolveCellIdx(doc, sec, para, ctrl, op) {
+  if (op.cell != null) return requireInt(op, "cell");
+  const row = requireInt(op, "row");
+  const col = requireInt(op, "col");
+  const grid = describeTable(doc, sec, para, ctrl);
+  if (!grid) throw new Error(`set_cell_text: no table at sec=${sec} para=${para} ctrl=${ctrl}`);
+  const idx = grid.indexByRowCol(row, col);
+  if (idx == null) {
+    throw new Error(`set_cell_text: (row=${row}, col=${col}) is outside the table (rows=${grid.rowCount}, cols=${grid.colCount})`);
+  }
+  return idx;
+}
+
+// Walk a table's cells via getCellInfo until rhwp errors (= past last cell).
+// Returns { rowCount, colCount, cells: [{idx,row,col,rowSpan,colSpan,text}],
+//           indexByRowCol(r,c) } or null if the control isn't a table.
+function describeTable(doc, sec, para, ctrl) {
+  const cells = [];
+  let rowCount = 0, colCount = 0;
+  for (let i = 0; i < 10000; i++) {
+    let info;
+    try {
+      info = JSON.parse(doc.getCellInfo(sec, para, ctrl, i));
+    } catch {
+      break;
+    }
+    if (!info || typeof info.row !== "number") break;
+    let text = "";
+    try { text = doc.getTextInCell(sec, para, ctrl, i, 0, 0, 100000); } catch {}
+    cells.push({
+      idx: i,
+      row: info.row,
+      col: info.col,
+      rowSpan: info.rowSpan ?? 1,
+      colSpan: info.colSpan ?? 1,
+      text,
+    });
+    rowCount = Math.max(rowCount, info.row + (info.rowSpan ?? 1));
+    colCount = Math.max(colCount, info.col + (info.colSpan ?? 1));
+  }
+  if (cells.length === 0) return null;
+  const byRowCol = new Map();
+  for (const c of cells) byRowCol.set(`${c.row},${c.col}`, c.idx);
+  return {
+    rowCount,
+    colCount,
+    cells,
+    indexByRowCol(r, c) {
+      return byRowCol.get(`${r},${c}`);
+    },
+  };
+}
+
+// Walk every paragraph in every section, asking rhwp for table cells at
+// each (sec, para, ctrl) tuple. Returns [{sec, para, ctrl}] for every
+// table control encountered.
+function enumerateTables(doc) {
+  const out = [];
+  const sectionCount = (() => {
+    try { return doc.getSectionCount(); } catch { return 1; }
+  })();
+  for (let sec = 0; sec < sectionCount; sec++) {
+    const paraCount = (() => {
+      try { return doc.getParagraphCount(sec); } catch { return 0; }
+    })();
+    for (let p = 0; p < paraCount; p++) {
+      for (let c = 0; c < 64; c++) {
+        let info;
+        try { info = JSON.parse(doc.getCellInfo(sec, p, c, 0)); } catch { break; }
+        if (!info || typeof info.row !== "number") break;
+        out.push({ sec, para: p, ctrl: c });
+      }
+    }
+  }
+  return out;
+}
+
+function applyCellText(doc, sec, para, ctrl, cellIdx, cellPara, text) {
+  // Read current cell text, then delete + insert. We avoid `replaceText`
+  // here because that API takes (sec, para, charOffset, length) — operates
+  // on body paragraphs, not on a cell's inner paragraph.
+  let current = "";
+  try {
+    current = doc.getTextInCell(sec, para, ctrl, cellIdx, cellPara, 0, 100000) ?? "";
+  } catch (e) {
+    throw new Error(`set_cell_text: cell access failed (sec=${sec} para=${para} ctrl=${ctrl} cell=${cellIdx}): ${e.message}`);
+  }
+  if (current.length > 0) {
+    doc.deleteTextInCell(sec, para, ctrl, cellIdx, cellPara, 0, current.length);
+  }
+  if (text.length > 0) {
+    doc.insertTextInCell(sec, para, ctrl, cellIdx, cellPara, 0, text);
+  }
+}
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
