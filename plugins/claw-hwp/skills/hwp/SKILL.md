@@ -8,6 +8,16 @@ license: MIT
 
 This skill helps Claude work with Korean Hangul Word Processor documents — reading, creating, and editing both the binary `.hwp` (HWP 5.0) and the ZIP-based `.hwpx` formats.
 
+## ⚠️ Hard rules (read first)
+
+> **Default to in-place editing when the user asks to fill in / add to / modify an EXISTING `.hwp` or `.hwpx` form.** `create.js` from scratch destroys the form's layout, fonts, header art, signature blocks, and page numbering — which is almost never what the user wanted when they sent you a template. Reach for `set_cell_text*` (see Path B) first.
+>
+> **`replace_text` reporting 0 matches is NOT a "can't edit" signal — it's a "the anchor is inside a table" signal.** rhwp's `searchText` does not enter `<hp:tbl>`. The correct next step is `set_cell_text_by_label`, not regeneration. See Path B.
+>
+> **Before declaring a limitation, run the coordinate probe in Path B step 2.** If `getCellInfo` returns any table, you can edit those cells. The "HWPX tables are dropped by `exportHwpx()`" warning listed later applies to *conversion* and *new-document emission*, not to in-place edits.
+>
+> **When regeneration IS the right answer**: only after the probe shows the target content is NOT inside an `<hp:tbl>` (e.g. it lives inside an `<hp:rect>` or other shape that this skill's ops can't reach), AND the user has been told that regenerating will lose the original layout, OR the user explicitly asks for a fresh document. State the trade-off plainly first — don't silently swap "fill in" for "create new".
+
 ## Quick reference
 
 | Task | Approach |
@@ -107,11 +117,11 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 
 Inline `**bold**` and `*italic*` are parsed automatically inside `text` and table cell strings. `runs:[{text, bold?, italic?, fontSize?, color?}]` overrides the parser when you need finer control.
 
-**Known limitations** (rhwp serializer constraints — applies to anything emitted via this skill):
+**Known limitations** (rhwp serializer constraints — these apply to *creation* and *format conversion*. They do NOT apply to in-place editing of an existing `.hwp` file: see Path B in the Edit section, which preserves tables completely):
 
-- **HWPX tables are dropped by rhwp's `exportHwpx()`**. If a doc has tables, write `.hwp` and (if HWPX is required) round-trip through Hancom Office or 한컴독스 to re-emit the table XML. `convert.js` won't help — it goes through the same rhwp serializer.
-- **HWP→HWPX downconversion is lossy** (tables, images, complex shapes). Default to `.hwp` for tables; default to `.hwpx` only when the document is text-heavy.
-- **`replace_text` doesn't see table cells** (see op table above). For table-cell edits on an existing file, the `set_cell_text*` ops are the only path.
+- **HWPX tables are dropped when re-emitting via `exportHwpx()`** — i.e. when converting `.hwp` → `.hwpx` or saving a fresh document as `.hwpx`. If a doc has tables, save as `.hwp`. This does **not** affect editing an existing `.hwp` in place; in-place edits via `set_cell_text*` preserve tables.
+- **HWP→HWPX downconversion is lossy** (tables, images, complex shapes). Default to `.hwp` for tables; default to `.hwpx` only when the document is text-heavy. Again, this is a *conversion* constraint, not an *edit* constraint.
+- **`replace_text` doesn't see table cells.** See the op table above and the discussion in Path B. The correct response to 0 matches is to switch to `set_cell_text_by_label`, not to regenerate the document.
 
 ### "Edit this document" / "Replace X with Y" / "Add a new paragraph"
 
@@ -202,9 +212,44 @@ When the input is `.hwp` and a table cell needs to change, the hwpx round-trip d
    }' | node scripts/create.js
    ```
 
-2. To discover the right `section / para / control / row / col` coordinates when you don't already know them, dump table structure with `extract_text.js --inspect` (table count + per-table dimensions), or write a tiny probe that calls rhwp's `getCellInfo(sec, para, ctrl, idx)` until it errors. The `set_cell_text_by_label` op handles the common case ("set the cell next to the row labeled X") with no coordinates needed.
+2. **Coordinate discovery** — when you don't already know `section / para / control / row / col`, do NOT guess and do NOT give up. Run this probe via `node -e` or a temp `.mjs` and read the output:
 
-3. **`replace_text` will silently miss table cells.** rhwp's `searchText` (and therefore `replaceOne`) does not enter `<hp:tbl>`. If `replace_text` reports 0 matches on what looks like a present anchor, the anchor is almost certainly inside a table — switch to `set_cell_text_by_label`.
+   ```javascript
+   // Save as /tmp/probe.mjs, run: node /tmp/probe.mjs <path-to.hwp>
+   import { readFileSync } from 'node:fs';
+   const DIR = '<absolute path to plugin>/skills/hwp/scripts'; // see Bundled scripts below
+   globalThis.measureTextWidth = (f, t) => t.length * (parseFloat(f) || 10) * 0.55;
+   const rhwp = await import(`${DIR}/vendor/rhwp/rhwp.js`);
+   await rhwp.default({ module_or_path: readFileSync(`${DIR}/vendor/rhwp/rhwp_bg.wasm`) });
+   const doc = new rhwp.HwpDocument(new Uint8Array(readFileSync(process.argv[2])));
+   for (let sec = 0; sec < doc.getSectionCount(); sec++) {
+     for (let p = 0, P = doc.getParagraphCount(sec); p < P; p++) {
+       for (let c = 0; c < 64; c++) { // critical: scan all 64 indices per paragraph
+         let info; try { info = JSON.parse(doc.getCellInfo(sec, p, c, 0)); } catch { continue; }
+         if (!info || typeof info.row !== 'number') continue;
+         // It's a table. Walk every cell and print the first non-empty text per row.
+         let rows = 0, cols = 0;
+         const cells = [];
+         for (let i = 0; i < 2000; i++) {
+           let ci; try { ci = JSON.parse(doc.getCellInfo(sec, p, c, i)); } catch { break; }
+           if (!ci || typeof ci.row !== 'number') break;
+           let t = ''; try { t = doc.getTextInCell(sec, p, c, i, 0, 0, 80); } catch {}
+           cells.push({ i, r: ci.row, col: ci.col, t: t.replace(/\s+/g, ' ').trim() });
+           rows = Math.max(rows, ci.row + 1); cols = Math.max(cols, ci.col + 1);
+         }
+         console.log(`sec=${sec} para=${p} ctrl=${c} (${rows}×${cols})`);
+         for (const x of cells) if (x.t) console.log(`  [${x.i}] r=${x.r} c=${x.col} "${x.t}"`);
+       }
+     }
+   }
+   doc.free();
+   ```
+
+   **Why ALL 64 controls per paragraph**: government and corporate forms commonly stack a logo at `ctrl=0`, a checkbox at `ctrl=1`, a textbox at `ctrl=2`, and only THEN the actual cover table at `ctrl=3`. Breaking on the first non-table index silently hides every table behind it. Always scan up to `MAX_CONTROL_IDX = 64`.
+
+   The probe output gives you `sec=X para=Y ctrl=Z` for every table and the labeled cells inside. Pick the table you need, find the row whose anchor matches the user's mention, then write either `set_cell_text` (you have exact `row`+`col`) or `set_cell_text_by_label` with `section`/`para`/`control` scope.
+
+3. **`replace_text` silently misses table cells. This is the most common source of false "can't edit" judgments.** rhwp's `searchText` (and therefore `replaceOne`) does not enter `<hp:tbl>`. If `replace_text` reports 0 matches on what looks like a present anchor, it does NOT mean the document is uneditable. It means the anchor lives in a table cell. **Run the probe above and switch to `set_cell_text_by_label`** — don't fall back to creating a new file.
 
 4. **Auto-preview after writes.** Per the trigger guidance below, fire `preview_start` / `preview_eval` immediately after the write so the user sees the edit, instead of asking them to verify.
 
@@ -324,6 +369,7 @@ In Desktop and CLI paths, "fire preview" means open the viewer / link directly. 
 
 ## Common pitfalls
 
+- **Don't silently regenerate an existing form just because `replace_text` returned 0 matches.** The most common failure mode of this skill: `replace_text` returns 0 → Claude concludes "table editing is unsupported" → calls `create.js` with `setup_document`, destroying the form's layout, header, fonts, signature blocks, and page numbering. The correct first response to 0 matches is the Path B coordinate probe + `set_cell_text_by_label`. Regeneration is acceptable as a final fallback when (a) the probe shows the target isn't in an `<hp:tbl>` and (b) the user has been told the original layout will be lost — not as a silent first reflex.
 - **HWP 5.0 lossy round-trip**: `.hwp` → `.hwpx` → `.hwp` may drop formatting. Default to `.hwpx` output. Only round-trip back to `.hwp` on explicit user request, and warn first.
 - **Misnamed extensions**: a `.hwp` file may actually be HWPX (starts with `PK`). Detect by reading the magic bytes before deciding on workflow.
 - **Encoding**: all HWPX XML is UTF-8. Never transcode. Don't escape Korean characters as XML entities — write them as-is.
