@@ -2928,3 +2928,538 @@ async function appendImageBodyControl(filePath, newBinDataId, imageHeightHwp, te
   writeFileSync(filePath, buf);
   return { clusterSize: cluster.length, newBinDataId };
 }
+
+// ── Phase B: text styling via raw-patch (DocInfo CharShape + Section0 PARA_CHAR_SHAPE) ─
+//
+// Big-form .hwp files can't go through rhwp's exportHwp (round-trip is
+// Hancom-Docs–rejected for large documents). The styling ops added in
+// Phase A (apply_text_style / apply_paragraph_style) consequently work
+// only on from-scratch / small forms.
+//
+// Phase B closes that gap by editing the underlying records directly:
+//   1. read DocInfo, find the default CharShape ID at the target text
+//      (the csId active at that char offset in the paragraph)
+//   2. clone that CharShape's body, mutate the requested style fields
+//      (attr bits, color words, baseSize) into a fresh 74-byte body
+//   3. append the new CharShape to DocInfo (assign next csId)
+//   4. update the paragraph's PARA_CHAR_SHAPE record so the target range
+//      maps to the new csId (with a sentinel entry at the range end to
+//      restore the previous csId)
+//   5. deflate + write back — original bytes untouched everywhere else
+//
+// Ground truth was learned by comparing user-supplied Hancom Office
+// outputs (ktx_phase_b_styling_spec (1).hwp etc.) against the pre-edit
+// base — see the commit log + the dump scripts in /tmp for details.
+// CharShape body layout (74 bytes):
+//   0-13   font_ids[7]     (u16 × 7)
+//   14-20  ratios[7]       (u8 × 7)
+//   21-27  spacings[7]     (i8 × 7)
+//   28-34  relative_sizes  (u8 × 7)
+//   35-41  char_offsets    (i8 × 7)
+//   42-45  base_size       (i32, HWP units = pt × 100)
+//   46-49  attr            (u32 — see bit map below)
+//   50-51  shadow_offset_x/y (i8 × 2)
+//   52-55  text_color      (u32 BGR)
+//   56-59  underline_color (u32 BGR)
+//   60-63  shade_color     (u32 BGR) — highlight (also lives in PARA_RANGE_TAG)
+//   64-67  shadow_color    (u32 BGR)
+//   68-69  border_fill_id  (u16)
+//   70-73  strike_color    (u32 BGR)
+//
+// attr u32 bit map (verified against Hancom Office output):
+//   bit 0   italic
+//   bit 1   bold
+//   bits 2-3 underline (bit 2 alone = type 1 = Bottom; full type field)
+//   bit 3 is ALSO set by Hancom when strikethrough is on (paired with
+//   bit 18) — we faithfully replicate that pattern (attr=0x00040008 for
+//   strike-only) rather than dissect why; the Hancom-emitted bytes are
+//   the ground truth that round-trips through Hancom Docs.
+//   bit 15  superscript
+//   bit 16  subscript
+//   bit 18  strikethrough (low bit of type field, but single-bit set
+//           suffices for Hancom-emitted "취소선만 적용" case)
+
+const TAG_CHAR_SHAPE = 21;        // HWPTAG_CHAR_SHAPE in DocInfo
+const TAG_PARA_RANGE_TAG = 0x46;  // HWPTAG_PARA_RANGE_TAG in Section0
+
+// ColorRef format: u32 little-endian = 0x00BBGGRR.
+function parseColorBGR(hex) {
+  if (typeof hex !== 'string') throw new Error(`color must be hex string, got ${typeof hex}`);
+  const s = hex.replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(s)) throw new Error(`invalid color: ${hex}`);
+  const r = parseInt(s.slice(0, 2), 16);
+  const g = parseInt(s.slice(2, 4), 16);
+  const b = parseInt(s.slice(4, 6), 16);
+  return (b << 16) | (g << 8) | r;  // 0x00BBGGRR
+}
+
+// (We reuse the existing buildRecordHeader() defined above — same signature.)
+
+// Synthesize a 74-byte CharShape body by cloning `base` and overlaying
+// style props. `base` must be a CharShape body the target paragraph
+// already uses, so font/ratio/spacing fields stay consistent with the
+// surrounding text.
+function buildCharShapeBody(base, style) {
+  if (!Buffer.isBuffer(base) || base.length !== 74) {
+    throw new Error(`CharShape base must be a 74-byte Buffer (got ${base ? base.length : typeof base})`);
+  }
+  const buf = Buffer.from(base);
+
+  // attr u32 at offset 46 — start from base, clear managed bits, then OR
+  // requested flags. This way unmanaged fields (outline / shadow /
+  // emboss / engrave / emphasis_dot / kerning) inherited from base are
+  // preserved.
+  let attr = buf.readUInt32LE(46);
+  const MANAGED_MASK = (
+      0x00000001 |  // italic
+      0x00000002 |  // bold
+      0x0000000C |  // bits 2-3: underline type
+      0x00008000 |  // bit 15: superscript
+      0x00010000 |  // bit 16: subscript
+      0x001C0000    // bits 18-20: strike type
+  ) >>> 0;
+  attr = (attr & ~MANAGED_MASK) >>> 0;
+  if (style.italic) attr |= 0x00000001;
+  if (style.bold) attr |= 0x00000002;
+  if (style.underline) attr |= 0x00000004;  // bit 2: underline on, default type=Bottom
+  if (style.strikethrough) attr |= 0x00040008;  // bit 3 + bit 18 (Hancom Office's strike pattern)
+  if (style.superscript) attr |= 0x00008000;
+  if (style.subscript) attr |= 0x00010000;
+  buf.writeUInt32LE(attr >>> 0, 46);
+
+  // baseSize at 42-45 (i32 HWP units = pt × 100)
+  if (style.size != null) {
+    buf.writeInt32LE(Math.round(style.size * 100), 42);
+  }
+
+  // text_color at 52-55 (always emit when caller passes color; otherwise inherit base)
+  if (style.color) {
+    buf.writeUInt32LE(parseColorBGR(style.color) >>> 0, 52);
+  }
+  // underline_color at 56-59
+  if (style.underline_color) {
+    buf.writeUInt32LE(parseColorBGR(style.underline_color) >>> 0, 56);
+  }
+  // strike_color at 70-73
+  if (style.strikethrough_color) {
+    buf.writeUInt32LE(parseColorBGR(style.strikethrough_color) >>> 0, 70);
+  }
+  // shade_color at 60-63 (highlight) — kept here as a fallback path for
+  // renderers that look at CharShape rather than PARA_RANGE_TAG; the
+  // primary highlight write happens via PARA_RANGE_TAG (see callers).
+  if (style.highlight && style.highlight !== false) {
+    const hex = style.highlight === true ? '#ffff00' : style.highlight;
+    buf.writeUInt32LE(parseColorBGR(hex) >>> 0, 60);
+  }
+
+  return buf;
+}
+
+// Walk DocInfo records, returning array of CharShape record bodies in ID order.
+function readCharShapeBodies(diRaw) {
+  const out = [];
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === TAG_CHAR_SHAPE) {
+      out.push(diRaw.slice(r.dataOff, r.dataOff + r.size));
+    }
+  }
+  return out;
+}
+
+// Append a new CharShape record to DocInfo (at end of last CharShape
+// run). Returns the new csId and the updated DocInfo buffer.
+//
+// ALSO bumps the CHAR_SHAPE count in HWPTAG_ID_MAPPINGS — Hancom Docs
+// rejects the file when DocInfo's actual record counts disagree with
+// ID_MAPPINGS. ID_MAPPINGS body is a fixed-order u32 array; CHAR_SHAPE
+// lives at index 9 (offset 36): BIN_DATA, FACE_NAME × 7, BORDER_FILL,
+// **CHAR_SHAPE**, TAB_DEF, NUMBERING, BULLET, PARA_SHAPE, STYLE,
+// MEMO_SHAPE, TRACK_CHANGE, TRACK_AUTHOR.
+const ID_MAPPINGS_CHAR_SHAPE_OFFSET = 9 * 4;
+
+function appendCharShapeToDocInfo(diRaw, body) {
+  if (body.length !== 74) {
+    throw new Error(`CharShape body must be 74 bytes (got ${body.length})`);
+  }
+  // Find the byte offset right after the last existing CharShape record.
+  let insertAt = -1;
+  let csCount = 0;
+  let idMappingsDataOff = -1;
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === TAG_CHAR_SHAPE) {
+      csCount++;
+      insertAt = r.dataOff + r.size;
+    }
+    if (r.tag === 17) {  // HWPTAG_ID_MAPPINGS
+      idMappingsDataOff = r.dataOff;
+    }
+  }
+  if (insertAt < 0) insertAt = diRaw.length;
+  if (idMappingsDataOff < 0) {
+    throw new Error('HWPTAG_ID_MAPPINGS not found in DocInfo — file looks malformed');
+  }
+  const header = buildRecordHeader(TAG_CHAR_SHAPE, 0, body.length);
+  const newRec = Buffer.concat([header, body]);
+  const newDi = Buffer.concat([
+    diRaw.slice(0, insertAt),
+    newRec,
+    diRaw.slice(insertAt),
+  ]);
+  // Bump CHAR_SHAPE count in ID_MAPPINGS. ID_MAPPINGS lives BEFORE
+  // any CHAR_SHAPE record in DocInfo (ID_MAPPINGS tag=17, CHAR_SHAPE
+  // tag=21, and DocInfo records are grouped by tag in ascending
+  // order), so the dataOff we captured remains valid after the splice.
+  const off = idMappingsDataOff + ID_MAPPINGS_CHAR_SHAPE_OFFSET;
+  if (off + 4 > newDi.length) {
+    throw new Error('ID_MAPPINGS body too short to hold CHAR_SHAPE count');
+  }
+  const oldCount = newDi.readUInt32LE(off);
+  newDi.writeUInt32LE(oldCount + 1, off);
+  return { newDi, newCsId: csCount };
+}
+
+// Locate the target string in Section0 raw. Returns the FIRST occurrence:
+//   { paraIdx, paraHeaderRec, paraTextRec, paraCharShapeRec, start, end }
+// `paraIdx` counts level-0 PARA_HEADER records (0-based, document order).
+// `start` / `end` are character offsets within the paragraph text.
+function findTextRangeInSection(secRaw, target) {
+  const records = parseRecords(secRaw);
+  let paraIdx = -1;
+  let curHeader = null;
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_PARA_HEADER && r.level === 0) {
+      paraIdx++;
+      curHeader = r;
+    }
+    if (r.tag === TAG_PARA_TEXT && curHeader) {
+      const text = secRaw.slice(r.dataOff, r.dataOff + r.size).toString('utf16le');
+      const idx = text.indexOf(target);
+      if (idx >= 0) {
+        // Find the matching PARA_CHAR_SHAPE within the same cluster.
+        let csRec = null;
+        for (let j = i + 1; j < records.length; j++) {
+          if (records[j].tag === TAG_PARA_CHAR_SHAPE && records[j].level === 1) {
+            csRec = records[j];
+            break;
+          }
+          if (records[j].tag === TAG_PARA_HEADER && records[j].level === 0) break;
+        }
+        return {
+          paraIdx,
+          paraHeaderRec: curHeader,
+          paraTextRec: r,
+          paraCharShapeRec: csRec,
+          start: idx,
+          end: idx + target.length,
+          textLength: Math.floor(r.size / 2),
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// Bump PARA_HEADER count fields after we add records to the paragraph
+// cluster. Both counters live in the PARA_HEADER body — Hancom Docs
+// validates them against the actual record count and rejects the file
+// if they're out of sync.
+//   body offset 12-13 (u16): num_char_shapes  (= PARA_CHAR_SHAPE entries)
+//   body offset 14-15 (u16): range_tags_count (= PARA_RANGE_TAG records)
+function bumpParaHeaderCounts(secRaw, paraHeaderRec, deltaCharShapes, deltaRangeTags) {
+  if (paraHeaderRec.size < 16) return secRaw;  // malformed; skip
+  if (!deltaCharShapes && !deltaRangeTags) return secRaw;
+  const out = Buffer.from(secRaw);
+  if (deltaCharShapes) {
+    const off = paraHeaderRec.dataOff + 12;
+    out.writeUInt16LE(((out.readUInt16LE(off) + deltaCharShapes) & 0xFFFF) >>> 0, off);
+  }
+  if (deltaRangeTags) {
+    const off = paraHeaderRec.dataOff + 14;
+    out.writeUInt16LE(((out.readUInt16LE(off) + deltaRangeTags) & 0xFFFF) >>> 0, off);
+  }
+  return out;
+}
+
+// Insert (start, newCsId) + (end, prevCsId) entries into a PARA_CHAR_SHAPE
+// record. Returns { secRaw, deltaEntries } — deltaEntries = (new entries -
+// old entries), caller propagates that into the PARA_HEADER count.
+function updateParaCharShapeRange(secRaw, csRec, start, end, newCsId) {
+  // Parse existing entries: (pos u32, csId u32) × N
+  const oldBody = secRaw.slice(csRec.dataOff, csRec.dataOff + csRec.size);
+  const entries = [];
+  for (let off = 0; off + 8 <= oldBody.length; off += 8) {
+    entries.push({
+      pos: oldBody.readUInt32LE(off),
+      csId: oldBody.readUInt32LE(off + 4),
+    });
+  }
+  if (entries.length === 0) {
+    throw new Error('PARA_CHAR_SHAPE record is empty');
+  }
+  // Determine csId active immediately after `end` so we can restore it.
+  let csIdAtEnd = entries[0].csId;
+  for (const e of entries) {
+    if (e.pos <= end) csIdAtEnd = e.csId;
+  }
+  // Remove entries strictly inside (start, end] — they'll be replaced.
+  const filtered = entries.filter(e => e.pos <= start || e.pos > end);
+  filtered.push({ pos: start, csId: newCsId });
+  filtered.push({ pos: end, csId: csIdAtEnd });
+  // Sort by pos, deduplicate (later entry at same pos wins).
+  filtered.sort((a, b) => a.pos - b.pos);
+  const dedup = [];
+  for (const e of filtered) {
+    if (dedup.length && dedup[dedup.length - 1].pos === e.pos) {
+      dedup[dedup.length - 1] = e;
+    } else {
+      dedup.push(e);
+    }
+  }
+  // Build new body
+  const newBody = Buffer.alloc(dedup.length * 8);
+  dedup.forEach((e, i) => {
+    newBody.writeUInt32LE(e.pos >>> 0, i * 8);
+    newBody.writeUInt32LE(e.csId >>> 0, i * 8 + 4);
+  });
+  const newHeader = buildRecordHeader(TAG_PARA_CHAR_SHAPE, 1, newBody.length);
+  const newRec = Buffer.concat([newHeader, newBody]);
+  // Splice into stream — replace old record bytes with new record bytes.
+  const oldHeaderLen = csRec.ext ? 8 : 4;
+  const oldTotalLen = oldHeaderLen + csRec.size;
+  const newSecRaw = Buffer.concat([
+    secRaw.slice(0, csRec.headOff),
+    newRec,
+    secRaw.slice(csRec.headOff + oldTotalLen),
+  ]);
+  return { secRaw: newSecRaw, deltaEntries: dedup.length - entries.length };
+}
+
+// Insert a PARA_RANGE_TAG record (tag=0x46) for a highlight range inside
+// a paragraph cluster. The record goes right after the paragraph's
+// PARA_CHAR_SHAPE (or, if absent, right after the PARA_TEXT).
+//
+// PARA_RANGE_TAG body: start u32, end u32, tag u32
+//   tag upper 8 bits = kind (0x02 = highlight)
+//   tag lower 24 bits = data (BGR color, e.g. 0x00FFFF for #FFFF00 yellow)
+function insertParaRangeTagForHighlight(secRaw, csRec, start, end, hex) {
+  const color = parseColorBGR(hex) >>> 0;
+  const tagWord = (0x02 << 24) | (color & 0xFFFFFF);
+  const body = Buffer.alloc(12);
+  body.writeUInt32LE(start >>> 0, 0);
+  body.writeUInt32LE(end >>> 0, 4);
+  body.writeUInt32LE(tagWord >>> 0, 8);
+  const newRec = Buffer.concat([buildRecordHeader(TAG_PARA_RANGE_TAG, 1, body.length), body]);
+  // Insert right after csRec (so it's part of the paragraph cluster).
+  const csHeaderLen = csRec.ext ? 8 : 4;
+  const insertAt = csRec.headOff + csHeaderLen + csRec.size;
+  return Buffer.concat([
+    secRaw.slice(0, insertAt),
+    newRec,
+    secRaw.slice(insertAt),
+  ]);
+}
+
+// Resolve the csId active at `pos` within a PARA_CHAR_SHAPE record.
+function csIdAtOffset(csRec, secRaw, pos) {
+  const oldBody = secRaw.slice(csRec.dataOff, csRec.dataOff + csRec.size);
+  let id = oldBody.readUInt32LE(4);
+  for (let off = 0; off + 8 <= oldBody.length; off += 8) {
+    const p = oldBody.readUInt32LE(off);
+    if (p <= pos) id = oldBody.readUInt32LE(off + 4);
+  }
+  return id;
+}
+
+/**
+ * Apply text styles to existing `.hwp` content via raw-patch.
+ *
+ * Each op: `{ target, bold?, italic?, underline?, strikethrough?,
+ *             color?, highlight?, size?, font_family?,
+ *             superscript?, subscript?, underline_color? }`
+ *
+ * Resolution model: target is matched as the FIRST occurrence in the
+ * body's PARA_TEXT records (top-level paragraphs only — table cells
+ * and nested controls are not searched in v1). The style applies to
+ * just that occurrence.
+ *
+ * For highlight specifically, two writes happen: (a) `shade_color` on
+ * a fresh CharShape so renderers that look at CharShape see the color,
+ * and (b) a PARA_RANGE_TAG record so Hancom's primary highlight path
+ * (markpen marker in HWPX terminology) is also satisfied.
+ */
+export async function applyTextStyleInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if (typeof op.target !== 'string' || op.target.length === 0) {
+      throw new Error("apply_text_style: 'target' is required");
+    }
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  // Load DocInfo + Section0.
+  const diEntry = findStreamEntry(entries, ['DocInfo']);
+  const diInMini = diEntry.size < 4096;
+  let diChain, diCompressed;
+  if (diInMini) {
+    const rc = ensureRootChain();
+    diChain = walkChain(minifat, diEntry.start);
+    diCompressed = readMiniChainBytes(buf, diChain, rc, ssz, mssz, diEntry.size);
+  } else {
+    diChain = walkChain(fat, diEntry.start);
+    diCompressed = readChainBytes(buf, diChain, ssz, diEntry.size);
+  }
+  let diRaw = Buffer.from(inflateRawSync(diCompressed));
+
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const hit = findTextRangeInSection(secRaw, op.target);
+    if (!hit) {
+      throw new Error(`apply_text_style: target "${op.target}" not found in body`);
+    }
+    if (!hit.paraCharShapeRec) {
+      throw new Error(`apply_text_style: PARA_CHAR_SHAPE not found for target "${op.target}"`);
+    }
+
+    // Determine base CharShape (the one active at the target start).
+    const baseCsId = csIdAtOffset(hit.paraCharShapeRec, secRaw, hit.start);
+    const csBodies = readCharShapeBodies(diRaw);
+    if (baseCsId >= csBodies.length) {
+      throw new Error(`apply_text_style: base csId ${baseCsId} out of range (have ${csBodies.length})`);
+    }
+    // Build new CharShape from base + style overlay.
+    // Apply size=pt → fontSize, font_family handling (Phase B v1: defer fontId resolution).
+    const styleInput = { ...op };
+    if (op.size != null && styleInput.fontSize == null) styleInput.fontSize = op.size;
+    const newBody = buildCharShapeBody(csBodies[baseCsId], styleInput);
+
+    // Dedup: if a CharShape with identical body already exists, reuse it.
+    let newCsId = csBodies.findIndex(b => b.equals(newBody));
+    if (newCsId < 0) {
+      const r = appendCharShapeToDocInfo(diRaw, newBody);
+      diRaw = r.newDi;
+      newCsId = r.newCsId;
+    }
+
+    // Update PARA_CHAR_SHAPE on the target paragraph. Re-locate `hit` —
+    // every section mutation invalidates the previous offsets.
+    let refreshed = findTextRangeInSection(secRaw, op.target);
+    if (!refreshed) throw new Error('internal: target disappeared after CharShape append');
+    const csUpd = updateParaCharShapeRange(
+      secRaw, refreshed.paraCharShapeRec,
+      refreshed.start, refreshed.end, newCsId,
+    );
+    secRaw = csUpd.secRaw;
+    // Bump PARA_HEADER.num_char_shapes by the entry delta — Hancom Docs
+    // rejects the file when this counter doesn't match the actual
+    // entries in PARA_CHAR_SHAPE.
+    if (csUpd.deltaEntries !== 0) {
+      refreshed = findTextRangeInSection(secRaw, op.target);
+      if (refreshed) secRaw = bumpParaHeaderCounts(secRaw, refreshed.paraHeaderRec, csUpd.deltaEntries, 0);
+    }
+
+    // Highlight side: add a PARA_RANGE_TAG so Hancom's primary highlight
+    // path (the markpen-equivalent) is satisfied. Also bumps the
+    // PARA_HEADER.range_tags_count by 1 (one new RANGE_TAG record).
+    if (op.highlight !== undefined && op.highlight !== false) {
+      const hex = op.highlight === true ? '#ffff00' : op.highlight;
+      refreshed = findTextRangeInSection(secRaw, op.target);
+      if (!refreshed) throw new Error('internal: target disappeared after PARA_CHAR_SHAPE update');
+      secRaw = insertParaRangeTagForHighlight(
+        secRaw, refreshed.paraCharShapeRec,
+        refreshed.start, refreshed.end, hex,
+      );
+      refreshed = findTextRangeInSection(secRaw, op.target);
+      if (refreshed) secRaw = bumpParaHeaderCounts(secRaw, refreshed.paraHeaderRec, 0, 1);
+    }
+
+    summary.push({
+      target: op.target,
+      paraIdx: hit.paraIdx,
+      start: hit.start,
+      end: hit.end,
+      baseCsId,
+      newCsId,
+    });
+  }
+
+  // Deflate + write DocInfo.
+  {
+    const inMini = diInMini;
+    const capacity = inMini ? diChain.length * mssz : diChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        diRaw, diChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      rootChain = ext.rootChain;
+      diChain = ext.chain;
+      writeMiniChainBytes(buf, diChain, rootChain, ssz, mssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(diRaw, capacity, ssz, fat, fatAddrs, diChain, buf, false);
+      buf = ext.buf; fat = ext.fat; diChain = ext.chain;
+      writeChainBytes(buf, diChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  // Deflate + write Section0.
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      rootChain = ext.rootChain;
+      secChain = ext.chain;
+      writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
+}
