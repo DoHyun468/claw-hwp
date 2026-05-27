@@ -2057,6 +2057,12 @@ async function readStdin() {
   const APPEND_TABLE_OPS = new Set(['append_table']);
   const SETUP_DOC_OPS = new Set(['setup_document']);
   const APPEND_IMAGE_OPS = new Set(['append_image']);
+  // Phase B: text styling via raw-patch — applies CharShape edits
+  // byte-level on top of existing .hwp without rhwp round-trip.
+  // Works on big forms (50+ pages) where rhwp emit gets rejected by
+  // Hancom Docs. See cell-patch.js applyTextStyleInPlace for the
+  // CharShape body / ID_MAPPINGS / PARA_CHAR_SHAPE handling.
+  const APPLY_TEXT_STYLE_OPS = new Set(['apply_text_style']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2086,7 +2092,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2199,6 +2205,13 @@ async function readStdin() {
         const tSummary = await appendTableInPlace(outPath, tableOps);
         subModes.push(`table:${tSummary.mode || 'in-place'}`);
         for (const e of tSummary) allEdits.push({ kind: 'table', ...e });
+      }
+      const textStyleOps = ops.filter((o) => APPLY_TEXT_STYLE_OPS.has(o.type));
+      if (textStyleOps.length > 0) {
+        const { applyTextStyleInPlace } = await import('./cell-patch.js');
+        const tsSummary = await applyTextStyleInPlace(outPath, textStyleOps);
+        subModes.push(`text_style:${tsSummary.mode || 'in-place'}`);
+        for (const e of tsSummary) allEdits.push({ kind: 'text_style', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');
