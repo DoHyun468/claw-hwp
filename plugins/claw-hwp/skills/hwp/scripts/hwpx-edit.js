@@ -49,6 +49,7 @@
 //   insert_footnote       { index, text }    // appends a footnote at end of paragraph `index`
 //   insert_endnote        { index, text }    // same shape, endnote
 //   insert_hyperlink      { index, url, text } // appends a clickable URL link to paragraph `index`
+//   insert_bookmark       { index, name }      // anchors a named bookmark at the start of paragraph `index`'s first run
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -1565,6 +1566,29 @@ function opInsertNote(doc, kind, paragraphIndex, text) {
 // Template here mirrors a real government-doc instance verbatim (only the URL,
 // display text, and id pair vary). Hancom renders the run's <hp:t> as a
 // clickable link.
+// Bookmark = named anchor at the start of a paragraph's first run, used as
+// the jump target for cross-references / "Go to". The OWPML shape is a
+// minimal self-closing element wrapped in <hp:ctrl>:
+//   <hp:run charPrIDRef="N"><hp:ctrl><hp:bookmark name="…"/></hp:ctrl><hp:t>…</hp:t></hp:run>
+function opInsertBookmark(doc, index, name) {
+  if (!name) throw new Error('insert_bookmark: "name" is required');
+  const paras = doc.paragraphs();
+  if (!Number.isInteger(index) || index < 0 || index >= paras.length) {
+    throw new Error(`insert_bookmark: index ${index} out of range (0..${paras.length - 1})`);
+  }
+  const { section, el } = paras[index];
+  const ctrl = `<hp:ctrl><hp:bookmark name="${xmlEscape(name)}"/></hp:ctrl>`;
+  let inner = el.inner;
+  const runs = scanTopLevel(inner, 'hp:run');
+  if (runs.length && !runs[0].selfClosing) {
+    inner = inner.slice(0, runs[0].openEnd) + ctrl + inner.slice(runs[0].openEnd);
+  } else {
+    inner = `<hp:run charPrIDRef="0">${ctrl}</hp:run>` + inner;
+  }
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:p${el.attrs}>${inner}</hp:p>`));
+  return { index, name, inserted: true };
+}
+
 function opInsertHyperlink(doc, paragraphIndex, url, text) {
   if (!url) throw new Error('insert_hyperlink: "url" is required');
   if (!text) throw new Error('insert_hyperlink: "text" (display label) is required');
@@ -1658,6 +1682,7 @@ function applyOp(doc, op) {
     case 'insert_footnote': return opInsertNote(doc, 'footNote', op.index, op.text);
     case 'insert_endnote': return opInsertNote(doc, 'endNote', op.index, op.text);
     case 'insert_hyperlink': return opInsertHyperlink(doc, op.index, op.url, op.text);
+    case 'insert_bookmark': return opInsertBookmark(doc, op.index, op.name);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }

@@ -136,6 +136,25 @@ render time — we only place the control at the end of the target paragraph.
 
 > rhwp's `.hwp → .hwpx` conversion drops actual notes (it only writes the `<hp:footNotePr>` style declaration), so this template is built from the OWPML envelope rather than cloned from a real instance — visually verify in Hancom Docs on first use. To restyle the marker, follow with `apply_text_style` on a unique anchor before the insertion.
 
+### Bookmark (책갈피)
+
+A bookmark is a named anchor placed at the start of a paragraph's first
+`<hp:run>`, wrapped in `<hp:ctrl>`:
+
+```
+<hp:run charPrIDRef="N">
+  <hp:ctrl><hp:bookmark name="이름"/></hp:ctrl>
+  <hp:t>그 자리의 텍스트</hp:t>
+</hp:run>
+```
+
+The `name` is what cross-references / "Go to" jumps target. The element
+itself is invisible in body rendering.
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `insert_bookmark` | `index`, `name` | Splices `<hp:ctrl><hp:bookmark name="…"/></hp:ctrl>` into the first `<hp:run>` of paragraph `index`, right after its opening tag (so it sits before the run's text). If the paragraph has no run yet (or only a self-closing one), wraps the bookmark in a fresh `<hp:run charPrIDRef="0">`. |
+
 ### Hyperlink (하이퍼링크)
 
 | `type` | Args | Notes |
