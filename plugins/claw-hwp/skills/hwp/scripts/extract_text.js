@@ -263,9 +263,15 @@ function formatMarkdownTable(attrs, body, lines) {
 }
 
 function collectText(xml) {
-  const matches = xml.match(/<hp:t[^>]*>([^<]*)<\/hp:t>/g) || [];
+  // <hp:t> can contain inline marker children (<hp:markpenBegin/>,
+  // <hp:markpenEnd/>, etc.) that Hancom Docs splices around highlighted
+  // text. A `[^<]*` body match stops at the first child tag and silently
+  // drops the rest of the text node. Grab the whole hp:t span, then strip
+  // any inner element tags before decoding.
+  const matches = xml.match(/<hp:t[^>]*>[\s\S]*?<\/hp:t>/g) || [];
   return matches
     .map((s) => s.replace(/^<hp:t[^>]*>|<\/hp:t>$/g, ''))
+    .map((s) => s.replace(/<[^>]+>/g, ''))
     .map(decodeXmlEntities)
     .join('');
 }

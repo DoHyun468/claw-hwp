@@ -48,7 +48,7 @@ each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `append_paragraph` | `text` | Appends to the last section, cloning the last paragraph's para/char refs. |
+| `append_paragraph` | `text` | Appends to the last section, cloning the last paragraph's para/char refs. **Char-style inheritance:** if the immediately preceding paragraph carries inline styling (bold / italic / highlight via its charPr), the new paragraph inherits that ref and renders with the same style. Drop the inheritance with a follow-up `apply_text_style` that explicitly resets the unwanted attr (e.g. `bold: false`). |
 | `delete_paragraph` | `index` | Removes the Nth top-level paragraph. |
 | `set_page_break` | `index`, `on?` (default `true`) | Sets `pageBreak="1"` on paragraph `index` so it starts a new page (the break renders **before** the paragraph). Pass `"on": false` to clear an existing break. |
 
@@ -115,7 +115,7 @@ not a top-level `<hp:secPr>` reference. `applyPageType` is `BOTH` | `EVEN` | `OD
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `set_header` | `text`, `applyPageType?` (default `"BOTH"`) | If a header already exists, replaces its text + updates `applyPageType` (returns `updated: true`). If none exists, inserts a new wrapper paragraph right after the first body paragraph of the first section (returns `inserted: true`). |
+| `set_header` | `text`, `applyPageType?` (default `"BOTH"`) | If a header already exists, replaces its text + updates `applyPageType` (returns `updated: true`). If none exists, inserts a new wrapper paragraph right after the first body paragraph of the first section (returns `inserted: true`). **Index-shift warning:** the `inserted: true` path adds a body paragraph, so every subsequent index-based op (`set_page_break`, `insert_hyperlink`, `apply_paragraph_style`, `delete_paragraph`, etc.) shifts by +1. Easiest fix: place `set_header` **last** in the batch, after all index-dependent ops resolve. |
 | `set_footer` | `text`, `applyPageType?` (default `"BOTH"`) | Same as `set_header` for `<hp:footer>`. |
 | `remove_header` | — | Removes the `<hp:run>` hosting each `<hp:ctrl><hp:header>` (leaves the enclosing paragraph). Returns `removed: N`. |
 | `remove_footer` | — | Same for `<hp:footer>`. |
@@ -140,7 +140,7 @@ render time — we only place the control at the end of the target paragraph.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `insert_hyperlink` | `index`, `url`, `text` | Appends a clickable hyperlink to paragraph `index`. Built as a paired Hancom field (`<hp:fieldBegin type="HYPERLINK">` … `<hp:t>text</hp:t>` … `<hp:fieldEnd>`) inside a new run, mirroring the verified structure from a real government doc. `text` is what the reader sees; `url` is the target. |
+| `insert_hyperlink` | `index`, `url`, `text` | Appends a clickable hyperlink to paragraph `index`. Built as a paired Hancom field (`<hp:fieldBegin type="HYPERLINK">` … `<hp:t>text</hp:t>` … `<hp:fieldEnd>`) inside a new run, mirroring the verified structure from a real government doc. `text` is what the reader sees; `url` is the target. **Link-only paragraph pattern:** the op appends the link to whatever's in paragraph `index`, so to produce a paragraph that's just the link, first `append_paragraph` with empty `text: ""`, then `insert_hyperlink` targeting that new paragraph's index. |
 
 ### Images
 
