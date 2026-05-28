@@ -3228,11 +3228,40 @@ function parseColorBGR(hex) {
 // style props. `base` must be a CharShape body the target paragraph
 // already uses, so font/ratio/spacing fields stay consistent with the
 // surrounding text.
+//
+// CHAR_SHAPE size by HWP version (mirrors the 22 vs 24 PARA_HEADER and
+// 46 vs 58 PARA_SHAPE patterns observed in h22-style files):
+//   70 bytes — HWP 5.0.0 pre-strike-color (some older forms, e.g. h22).
+//              Covers everything up to border_fill_id (offsets 0..69).
+//              No strike_color field.
+//   74 bytes — HWP 5.0.3+ (full layout with trailing strike_color u32).
+// We always emit 74 bytes (zero-pad missing strike_color when base is
+// 70 bytes — `style.strikethrough_color` then writes into the padded
+// region). Hancom Office and Hancom Docs both accept the longer body
+// because records are self-describing — each record carries its own
+// length and the reader simply reads what's there. The h22-side test
+// `apply_text_style({target: "주간업무보고서", bold: true})` exercises
+// this path (h22's existing CharShapes are 70-byte; emitting 74 bytes
+// for the new style keeps the file Hancom-Docs compatible).
 function buildCharShapeBody(base, style) {
-  if (!Buffer.isBuffer(base) || base.length !== 74) {
-    throw new Error(`CharShape base must be a 74-byte Buffer (got ${base ? base.length : typeof base})`);
+  if (!Buffer.isBuffer(base) || base.length < 70) {
+    throw new Error(`CharShape base must be ≥70 bytes (got ${base ? base.length : typeof base})`);
   }
-  const buf = Buffer.from(base);
+  // Match the base's size — emitting a 74-byte CharShape into a document
+  // whose existing CharShapes are uniformly 70 bytes produces mixed-size
+  // CHAR_SHAPE records, which Hancom Docs rejects on open. Concrete case:
+  // h22-style files have all 70-byte CharShapes. Adding a 74-byte one
+  // (even with zero-padded strike_color) caused
+  // `apply_text_style({highlight: ...})` outputs to reject in Hancom Docs
+  // even though the structural patch was otherwise correct. The
+  // strike_color field at offset 70-73 is only used when the document's
+  // format is 74-byte; if the base is 70-byte, we skip the
+  // strikethrough_color write further below (out of bounds in 70-byte
+  // body, but more importantly, Hancom Docs expects all CHAR_SHAPEs in
+  // a 70-byte document to remain 70-byte).
+  const outSize = base.length;
+  const buf = Buffer.alloc(outSize);
+  base.copy(buf, 0, 0, Math.min(base.length, outSize));
 
   // attr u32 at offset 46 — start from base, clear managed bits, then OR
   // requested flags. This way unmanaged fields (outline / shadow /
@@ -3269,8 +3298,9 @@ function buildCharShapeBody(base, style) {
   if (style.underline_color) {
     buf.writeUInt32LE(parseColorBGR(style.underline_color) >>> 0, 56);
   }
-  // strike_color at 70-73
-  if (style.strikethrough_color) {
+  // strike_color at 70-73 (only present in 74-byte HWP 5.0.3+ format —
+  // 70-byte older format has no slot for it. Skip when out of bounds.)
+  if (style.strikethrough_color && buf.length >= 74) {
     buf.writeUInt32LE(parseColorBGR(style.strikethrough_color) >>> 0, 70);
   }
   // shade_color at 60-63 (highlight) — kept here as a fallback path for
@@ -3307,8 +3337,11 @@ function readCharShapeBodies(diRaw) {
 const ID_MAPPINGS_CHAR_SHAPE_OFFSET = 9 * 4;
 
 function appendCharShapeToDocInfo(diRaw, body) {
-  if (body.length !== 74) {
-    throw new Error(`CharShape body must be 74 bytes (got ${body.length})`);
+  // Accept both 70-byte (HWP 5.0.0) and 74-byte (HWP 5.0.3+) sizes —
+  // buildCharShapeBody emits whichever size the document's existing
+  // CHAR_SHAPEs use to avoid mixed-size records that Hancom Docs rejects.
+  if (body.length !== 70 && body.length !== 74) {
+    throw new Error(`CharShape body must be 70 or 74 bytes (got ${body.length})`);
   }
   // Find the byte offset right after the last existing CharShape record.
   let insertAt = -1;
@@ -3348,41 +3381,84 @@ function appendCharShapeToDocInfo(diRaw, body) {
 }
 
 // Locate the target string in Section0 raw. Returns the FIRST occurrence:
-//   { paraIdx, paraHeaderRec, paraTextRec, paraCharShapeRec, start, end }
-// `paraIdx` counts level-0 PARA_HEADER records (0-based, document order).
-// `start` / `end` are character offsets within the paragraph text.
+//   { paraIdx, paraHeaderRec, paraTextRec, paraCharShapeRec, start, end, paraLevel, isInCell }
+// `paraIdx` counts level-0 PARA_HEADER records (0-based, document order),
+// so it identifies the **outer** paragraph the match lives under (which
+// equals the cell's containing top-level paragraph when the match is
+// inside a table). `start` / `end` are character offsets within the
+// paragraph text. `paraLevel` is the level of the matching PARA_TEXT
+// (1 for body text, 3 for table-cell text, 5+ for nested table cells).
+// `isInCell` is `paraLevel >= 3`.
+//
+// Search policy (preserves prior Phase B body-only behavior):
+//   1. FIRST PASS — level-1 PARA_TEXT (body) only. Returns immediately on
+//      match. Preserves the previously-shipped behavior where ktx-style
+//      forms with multiple "추진배경" matches (some in cells, some in
+//      body) consistently picked the body match. Without this two-pass
+//      policy, an earlier table-of-contents cell match would shadow the
+//      real body section heading and the RANGE_TAG would land at level 3
+//      inside a cell, which Hancom Docs rejects.
+//   2. SECOND PASS — all higher levels (cell text at level 3+) only if
+//      the body pass found nothing. This is the h22-style support added
+//      for task #12 — forms whose visible content lives entirely inside
+//      table cells (e.g. h22 work_report has "주간업무보고서" as a 1×2
+//      borderless header table's first cell). For matches at level ≥ 3
+//      the function returns the cell's level-(L-1) PARA_HEADER and
+//      level-L PARA_CHAR_SHAPE so the caller can write styling into the
+//      correct cell paragraph.
 function findTextRangeInSection(secRaw, target) {
   const records = parseRecords(secRaw);
-  let paraIdx = -1;
-  let curHeader = null;
-  for (let i = 0; i < records.length; i++) {
-    const r = records[i];
-    if (r.tag === TAG_PARA_HEADER && r.level === 0) {
-      paraIdx++;
-      curHeader = r;
-    }
-    if (r.tag === TAG_PARA_TEXT && curHeader) {
-      const text = secRaw.slice(r.dataOff, r.dataOff + r.size).toString('utf16le');
-      const idx = text.indexOf(target);
-      if (idx >= 0) {
-        // Find the matching PARA_CHAR_SHAPE within the same cluster.
-        let csRec = null;
-        for (let j = i + 1; j < records.length; j++) {
-          if (records[j].tag === TAG_PARA_CHAR_SHAPE && records[j].level === 1) {
-            csRec = records[j];
-            break;
+
+  // Two-pass search: body-only (level 1) first, then cell levels (≥ 3).
+  // The passes share record tracking but apply different level filters
+  // when checking PARA_TEXT matches.
+  for (const passMinLevel of [1, 3]) {
+    const passMaxLevel = passMinLevel === 1 ? 1 : Infinity;
+    let paraIdx = -1;
+    const headerByLevel = {};  // level → most recent PARA_HEADER at that level
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
+      if (r.tag === TAG_PARA_HEADER) {
+        headerByLevel[r.level] = r;
+        if (r.level === 0) paraIdx++;
+      }
+      if (r.tag === TAG_PARA_TEXT) {
+        if (r.level < passMinLevel || r.level > passMaxLevel) continue;
+        const text = secRaw.slice(r.dataOff, r.dataOff + r.size).toString('utf16le');
+        const idx = text.indexOf(target);
+        if (idx >= 0) {
+          // The owning PARA_HEADER is one level above the PARA_TEXT.
+          // Body: PARA_TEXT lvl 1 → PARA_HEADER lvl 0.
+          // Cell: PARA_TEXT lvl 3 → PARA_HEADER lvl 2.
+          // Nested cell: PARA_TEXT lvl 5 → PARA_HEADER lvl 4. Etc.
+          const ownerHeader = headerByLevel[r.level - 1];
+          if (!ownerHeader) continue;  // orphan PARA_TEXT — malformed; skip
+
+          // Find the PARA_CHAR_SHAPE at the SAME level as the PARA_TEXT.
+          // Walk forward stopping at the next PARA_HEADER at the same or
+          // shallower level (that's the boundary of the current paragraph).
+          let csRec = null;
+          for (let j = i + 1; j < records.length; j++) {
+            const r2 = records[j];
+            if (r2.tag === TAG_PARA_CHAR_SHAPE && r2.level === r.level) {
+              csRec = r2;
+              break;
+            }
+            if (r2.tag === TAG_PARA_HEADER && r2.level <= r.level - 1) break;
           }
-          if (records[j].tag === TAG_PARA_HEADER && records[j].level === 0) break;
+
+          return {
+            paraIdx,
+            paraHeaderRec: ownerHeader,
+            paraTextRec: r,
+            paraCharShapeRec: csRec,
+            start: idx,
+            end: idx + target.length,
+            textLength: Math.floor(r.size / 2),
+            paraLevel: r.level,
+            isInCell: r.level >= 3,
+          };
         }
-        return {
-          paraIdx,
-          paraHeaderRec: curHeader,
-          paraTextRec: r,
-          paraCharShapeRec: csRec,
-          start: idx,
-          end: idx + target.length,
-          textLength: Math.floor(r.size / 2),
-        };
       }
     }
   }
@@ -3451,7 +3527,15 @@ function updateParaCharShapeRange(secRaw, csRec, start, end, newCsId) {
     newBody.writeUInt32LE(e.pos >>> 0, i * 8);
     newBody.writeUInt32LE(e.csId >>> 0, i * 8 + 4);
   });
-  const newHeader = buildRecordHeader(TAG_PARA_CHAR_SHAPE, 1, newBody.length);
+  // Preserve the original PARA_CHAR_SHAPE level. Body PARA_TEXT uses level 1,
+  // so the matching PARA_CHAR_SHAPE is also level 1. Cell PARA_TEXT (level 3)
+  // matches PARA_CHAR_SHAPE at level 3. Hardcoding level=1 was correct for
+  // body-only callers but broke the cell path (task #12): the rewritten
+  // record came out at level 1 inside a level-3 cluster, so the subsequent
+  // `findTextRangeInSection` couldn't locate it again (looks for the same
+  // level as the matching PARA_TEXT), returning paraCharShapeRec=null and
+  // crashing the highlight branch on `csRec.ext`.
+  const newHeader = buildRecordHeader(TAG_PARA_CHAR_SHAPE, csRec.level, newBody.length);
   const newRec = Buffer.concat([newHeader, newBody]);
   // Splice into stream — replace old record bytes with new record bytes.
   const oldHeaderLen = csRec.ext ? 8 : 4;
@@ -3471,6 +3555,13 @@ function updateParaCharShapeRange(secRaw, csRec, start, end, newCsId) {
 // PARA_RANGE_TAG body: start u32, end u32, tag u32
 //   tag upper 8 bits = kind (0x02 = highlight)
 //   tag lower 24 bits = data (BGR color, e.g. 0x00FFFF for #FFFF00 yellow)
+//
+// The new record's level must match the surrounding paragraph cluster:
+// body PARA_CHAR_SHAPE is level 1 → RANGE_TAG level 1; cell PARA_CHAR_SHAPE
+// is level 3 → RANGE_TAG level 3. Hardcoding level=1 (the body-only
+// assumption) for cell targets produced a level-1 RANGE_TAG dangling
+// inside a level-3 cluster, which Hancom Docs validates as malformed and
+// rejects on open. Pass the csRec's actual level through.
 function insertParaRangeTagForHighlight(secRaw, csRec, start, end, hex) {
   const color = parseColorBGR(hex) >>> 0;
   const tagWord = (0x02 << 24) | (color & 0xFFFFFF);
@@ -3478,7 +3569,7 @@ function insertParaRangeTagForHighlight(secRaw, csRec, start, end, hex) {
   body.writeUInt32LE(start >>> 0, 0);
   body.writeUInt32LE(end >>> 0, 4);
   body.writeUInt32LE(tagWord >>> 0, 8);
-  const newRec = Buffer.concat([buildRecordHeader(TAG_PARA_RANGE_TAG, 1, body.length), body]);
+  const newRec = Buffer.concat([buildRecordHeader(TAG_PARA_RANGE_TAG, csRec.level, body.length), body]);
   // Insert right after csRec (so it's part of the paragraph cluster).
   const csHeaderLen = csRec.ext ? 8 : 4;
   const insertAt = csRec.headOff + csHeaderLen + csRec.size;
