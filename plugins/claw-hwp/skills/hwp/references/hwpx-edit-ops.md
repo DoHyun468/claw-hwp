@@ -147,8 +147,8 @@ render time — we only place the control at the end of the target paragraph.
 | `type` | Args | Notes |
 |--------|------|-------|
 | `insert_image` | `source` (disk path), `ext?` (png/jpg/bmp/gif), `width?`, `height?` (HWP units, default ~100mm) | Adds bytes to `BinData/`, registers a unique `<opf:item>` in the manifest (id avoids existing ids), appends a paragraph with an inline `<hp:pic>`. |
-| `replace_image` | `target` (basename or `BinData/...`), `source` | Swaps the bytes of an existing `BinData/` entry. |
-| `delete_image` | `target` | Removes the `BinData/` entry **and** its manifest item **and** every `<hp:pic>` that referenced it (no dangling reference). |
+| `replace_image` | `target` (any of: `"image1"` / `"image1.png"` / `"BinData/image1"` / `"BinData/image1.png"`), `source` | Swaps the bytes of an existing `BinData/` entry. Stem (extension-less) match works, so the manifest id is fine even when you don't know the file extension. |
+| `delete_image` | `target` (same matching rules as `replace_image`) | Removes the `BinData/` entry **and** its manifest item **and** every `<hp:pic>` that referenced it (no dangling reference). |
 
 ## Examples
 
