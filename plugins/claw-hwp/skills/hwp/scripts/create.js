@@ -345,9 +345,11 @@ function buildCharFormatProps(input = {}, defaults = {}) {
   if (input.strike_shape != null) props.strikeShape = input.strike_shape;
   else if (input.strikeShape != null) props.strikeShape = input.strikeShape;
 
-  // emphasisDot — 강조점 (0 = none, 1+ = various dot styles)
-  if (input.emphasis_dot != null) props.emphasisDot = input.emphasis_dot;
-  else if (input.emphasisDot != null) props.emphasisDot = input.emphasisDot;
+  // emphasis_dot (강조점) removed 1.5.x — Hancom Docs (web/cloud) silently
+  // drops it on render even though the CharShape write round-trips through
+  // Hancom Office Desktop. No reliable visual path through 한컴독스, so the
+  // prop is no longer mapped. Callers that still pass `emphasis_dot` /
+  // `emphasisDot` see it silently ignored.
 
   // fontFamily — rhwp's CharShape stores font references as IDs into a
   // FACE_NAME table in DocInfo (DocInfo HWPTAG_FACE_NAME records).
@@ -611,7 +613,17 @@ const HANDLERS = {
 
   append_paragraph(doc, op, cursor) {
     startNewParagraph(doc, cursor);
-    const runs = parseInlineRuns(op.text ?? op.runs ?? "");
+    // op.runs (structured, per-run styling like {text, bold, color, highlight, ...})
+    // wins over op.text (markdown-parsed only — **bold** / *italic*). Previously
+    // this was `parseInlineRuns(op.text ?? op.runs ?? "")` which silently
+    // dropped op.runs when op.text was non-empty (which it almost always is),
+    // making every from-scratch character styling (highlight / underline /
+    // strikethrough / superscript / etc.) silently no-op. Cold-start session
+    // 2026-05-28 caught this: agents that correctly passed runs per SKILL.md
+    // ended up with attr=0x00000000 CharShapes (no styling) on every paragraph.
+    const runs = Array.isArray(op.runs) && op.runs.length > 0
+      ? op.runs
+      : parseInlineRuns(op.text ?? "");
     writeRunsAt(doc, cursor, runs);
     applyParaProps(doc, cursor, {
       align: op.align,
@@ -634,7 +646,10 @@ const HANDLERS = {
     startNewParagraph(doc, cursor);
     const level = Math.max(1, Math.min(6, op.level || 1));
     const def = HEADING_DEFAULTS[level];
-    const runs = parseInlineRuns(op.text || "");
+    // Same precedence as append_paragraph: structured op.runs wins over markdown op.text.
+    const runs = Array.isArray(op.runs) && op.runs.length > 0
+      ? op.runs
+      : parseInlineRuns(op.text || "");
     const heightHU = Math.round(def.fontSize * 100);
     writeRunsAt(doc, cursor, runs, {
       fontSize: heightHU,
@@ -1303,8 +1318,9 @@ function buildCharFormatPropsForApply(input) {
   if (input.strike_shape != null) props.strikeShape = input.strike_shape;
   else if (input.strikeShape != null) props.strikeShape = input.strikeShape;
 
-  if (input.emphasis_dot != null) props.emphasisDot = input.emphasis_dot;
-  else if (input.emphasisDot != null) props.emphasisDot = input.emphasisDot;
+  // emphasis_dot removed 1.5.x — Hancom Docs silently drops it. See
+  // buildCharFormatProps for the rationale; same handling here (silently
+  // ignore any incoming emphasis_dot / emphasisDot).
 
   // font_family is resolved to fontIds upstream via resolveFontFamily.
   // See buildCharFormatProps for the rationale.

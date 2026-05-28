@@ -3710,7 +3710,19 @@ export async function applyTextStyleInPlace(filePath, ops) {
     // Highlight side: add a PARA_RANGE_TAG so Hancom's primary highlight
     // path (the markpen-equivalent) is satisfied. Also bumps the
     // PARA_HEADER.range_tags_count by 1 (one new RANGE_TAG record).
-    if (op.highlight !== undefined && op.highlight !== false) {
+    //
+    // CELL EXCEPTION (level >= 3): empirically, emitting PARA_RANGE_TAG
+    // inside a cell cluster (level 3) is rejected by Hancom Docs even
+    // though the structural emit looks correct (RANGE_TAG at csRec.level,
+    // range_tags_count bumped on the cell PARA_HEADER, CHAR_SHAPE size
+    // matched to the document's format). The rhwp-native cell-text
+    // highlighting code path doesn't emit a RANGE_TAG either — it relies
+    // on CharShape.shade_color alone. So for cell targets, we skip the
+    // RANGE_TAG emit. The shade_color is already in the new CharShape
+    // (buildCharShapeBody writes it at offset 60-63 when op.highlight is
+    // set), so highlight visually still applies — just without the
+    // RANGE_TAG-based primary path.
+    if (op.highlight !== undefined && op.highlight !== false && !hit.isInCell) {
       const hex = op.highlight === true ? '#ffff00' : op.highlight;
       refreshed = findTextRangeInSection(secRaw, op.target);
       if (!refreshed) throw new Error('internal: target disappeared after PARA_CHAR_SHAPE update');

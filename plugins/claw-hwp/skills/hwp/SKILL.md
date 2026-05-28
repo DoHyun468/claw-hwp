@@ -119,7 +119,7 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 | `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt` |
 | `append_bullet_list`, `append_numbered_list` | `items[]` | — |
 | `append_page_break` | — | — |
-| `apply_text_style` ⚠️ | `target` (string to find) | `color`, `bold`, `italic`, `underline`, `strikethrough`, `size` (pt), `highlight` (`true` / `"#RRGGBB"` / `false`), `font_family`, `superscript`, `subscript`, `underline_color`, `letter_spacing`, `char_ratio`, `emphasis_dot` |
+| `apply_text_style` ⚠️ | `target` (string to find) | `color`, `bold`, `italic`, `underline`, `strikethrough`, `size` (pt), `highlight` (`true` / `"#RRGGBB"` / `false`), `font_family`, `superscript`, `subscript`, `underline_color`, `letter_spacing`, `char_ratio` |
 | `apply_paragraph_style` ⚠️ | `index` (paragraph index, 0-based) | `align`, `indent`, `line_spacing` (% e.g. 130), `margin_left`, `margin_right`, `spacing_before`, `spacing_after`, `background_color`, `page_break_before`, `keep_with_next` |
 
 > ⚠️ **`append_table` on existing `.hwp` (raw-patch path) — what it honors and what it doesn't:**
@@ -149,8 +149,7 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 > - 🚫 **Do NOT substitute markdown / HTML / RTF / any other markup as a workaround** when `apply_text_style` or `apply_paragraph_style` errors out (e.g. "PARA_CHAR_SHAPE not found" because the target is inside a table cell, or "ParaShape base must be ≥54 bytes" on an older HWP-5.0.0 form). Hancom Word Processor is NOT a markdown / HTML renderer — writing `**주간업무보고서**` into a cell via `set_cell_text_by_label` does NOT bold the text; it inserts the literal asterisks as part of the cell content, producing visible `**` characters in the user's document. If a styling op fails on a particular target, report the limitation to the user **as a limitation**: "styling for this target is not currently supported on this form because [concrete reason from error]". Do not fabricate a workaround that silently mangles the document. Acceptable follow-ups: (a) suggest the user style the text manually in Hancom Office desktop, (b) ask the user if they want a different target (e.g. a top-level paragraph instead of a cell), or (c) skip the styling op and report what else was applied.
 > - **`font_family`** works for any installed font (e.g., "맑은 고딕", "함초롬돋움", "굴림", "바탕", "Arial"). Internally the op calls `rhwp.findOrCreateFontId(name)` to register the font in DocInfo's FACE_NAME table (all 7 language scripts at once), then writes `fontIds: [id × 7]` on the CharShape. If the name resolves to a valid ID, Hancom Docs renders with that font; if not (negative ID return), it silently falls back to the default `함초롬바탕`. There is no built-in shape-check — the font must exist on the reader's system for the glyphs to render correctly, but the file's CharShape will carry the requested name either way.
 > - **`apply_paragraph_style` index aliases**: pass `index: "last"` (or `-1`) to target the most recently appended paragraph. Useful when intermediate `append_heading` / `append_paragraph` ops would otherwise force you to count: just append + style + repeat.
-> - **Hancom Docs renderer limits (writes ride through but the web viewer ignores them):**
->   - **`emphasis_dot`** (강조점) — written into CharShape; Hancom Office Desktop renders it, but **한컴독스 (web/cloud) silently drops it**. Use sparingly if 한컴독스 is the primary reader.
+> - **Removed in 1.5.x — `emphasis_dot` (강조점)**: previously documented as a prop, but Hancom Docs (web/cloud) silently dropped it on render — confirmed in repeated 한컴독스 verification cycles. The CharShape write itself round-tripped through Hancom Office Desktop fine, but the cloud viewer never displayed the dot. Op no longer accepts the prop; if a caller still passes `emphasis_dot`, it's silently ignored. To get visible "강조점" emphasis, suggest the user use Hancom Office desktop manual styling or pick a different visual cue (e.g. `bold` + `color`).
 
 *In-place editing (run on an existing file — omit `setup_document` so create.js loads the path instead of starting blank):*
 
@@ -160,7 +159,80 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 | `set_cell_text` | `section`, `para`, `control`, (`row`+`col`) or `cell`, `text` | `cell_para` | Replaces one cell's text. `row`+`col` is recommended; `cell` is the flat row-major index. |
 | `set_cell_text_by_label` | `label`, `text` | `row_offset`, `col_offset`, `occurrence`, `case_sensitive`, `cell_para`, `section`+`para`+`control` (to scope to one table) | Find a cell whose text contains `label`, then write to the cell at `(label_row + row_offset, label_col + col_offset)`. Doc-wide sweep by default. |
 
-Inline `**bold**` and `*italic*` are parsed automatically inside `text` and table cell strings. `runs:[{text, bold?, italic?, underline?, strikethrough?, fontSize?, color?, highlight?, font_family?, superscript?, subscript?, underline_color?, letter_spacing?, char_ratio?, emphasis_dot?}]` overrides the parser when you need finer control over a run. All `apply_text_style` props are available per-run too. Per-run styling rides the same rhwp-driven path as a from-scratch build, so it works when constructing new documents and on small in-place edits; for character-level changes on large existing files (50+ pages), use the standalone `apply_text_style` op, which routes through the raw-patch path.
+Inline `**bold**` and `*italic*` are parsed automatically inside `text` and table cell strings. `runs:[{text, bold?, italic?, underline?, strikethrough?, fontSize?, color?, highlight?, font_family?, superscript?, subscript?, underline_color?, letter_spacing?, char_ratio?}]` overrides the parser when you need finer control over a run. All `apply_text_style` props are available per-run too. Per-run styling rides the same rhwp-driven path as a from-scratch build, so it works when constructing new documents and on small in-place edits; for character-level changes on large existing files (50+ pages), use the standalone `apply_text_style` op, which routes through the raw-patch path.
+
+#### 🎯 From-scratch character styling — explicit op patterns
+
+When building a new document and the paragraph should carry character styling
+(bold / italic / color / highlight / size / etc.), **pass `runs` alongside
+`text` on `append_paragraph` — `bold: true` / `highlight: ...` at the
+top-level op are NOT read**. The op signature accepts the props named in
+the table above (`align`, `line_spacing`, `spacing_before`, `spacing_after`,
+`runs`); per-character styling lives inside `runs`. Concrete patterns:
+
+```json
+// Pattern A — entire paragraph one styled run
+{ "type": "append_paragraph", "text": "노란 형광펜 단락",
+  "runs": [{ "text": "노란 형광펜 단락", "highlight": "#FFFF00" }] }
+
+// Pattern B — multiple runs in one paragraph (mixed styling)
+{ "type": "append_paragraph", "text": "굵게 그냥 형광",
+  "runs": [
+    { "text": "굵게 ", "bold": true },
+    { "text": "그냥 " },
+    { "text": "형광", "highlight": "#FFFF00" }
+  ] }
+
+// Pattern C — apply styling to existing target after append (also works)
+[
+  { "type": "append_paragraph", "text": "노란 형광펜 단락" },
+  { "type": "apply_text_style", "target": "노란 형광펜 단락", "highlight": "#FFFF00" }
+]
+```
+
+Pattern A is the canonical from-scratch idiom — keep all the paragraph's
+styling in one place. Pattern C is the in-place / raw-patch idiom (also
+the only path for big-form `.hwp` 50+ pages where the rhwp emit can't
+round-trip Hancom Docs).
+
+⚠️ **Anti-pattern (does not work)**:
+```json
+// WRONG: bold/highlight/color at the top level are ignored
+{ "type": "append_paragraph", "text": "노란 형광펜 단락", "highlight": "#FFFF00" }
+```
+There's no top-level `highlight` / `bold` / `color` field on
+`append_paragraph` — they're per-run. The op silently emits an unstyled
+paragraph if you put them at the top.
+
+#### ⚠️ Background-color leak between paragraphs (from-scratch path)
+
+`apply_paragraph_style({background_color: ...})` on paragraph N can bleed
+into the next freshly appended paragraph N+1. This is a documented
+trade-off in the from-scratch path: the leak comes from `splitParagraph`
+copying paragraph N's paraShape (including its BorderFill reference) into
+N+1, and the alternative — explicitly resetting fill on every paragraph —
+produces visible 1px horizontal stripes (rhwp's auto-generated default
+BorderFill has borderTop/Bottom/Left = type:1 width:0 which Hancom Docs
+renders as thin lines).
+
+**Workaround**: when you set a paragraph's `background_color` and the
+NEXT paragraph should NOT inherit it, explicitly reset on the next
+paragraph:
+```json
+[
+  { "type": "append_paragraph", "text": "회색 배경 단락" },
+  { "type": "apply_paragraph_style", "index": "last",
+    "background_color": "#cccccc" },
+  { "type": "append_paragraph", "text": "다음 단락 (배경 없음)" },
+  // Reset the inherited bg explicitly:
+  { "type": "apply_paragraph_style", "index": "last",
+    "background_color": "#ffffff" }
+]
+```
+
+Alternative: apply `background_color` LAST in the build — after all the
+following paragraphs exist — so the next-paragraph leak target doesn't
+exist yet.
 
 **Known limitations** (rhwp serializer constraints — applies to anything emitted via this skill):
 
