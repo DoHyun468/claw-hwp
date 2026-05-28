@@ -534,7 +534,14 @@ function opInsertTable(doc, index, rows, cols, cells) {
     // black-border <hh:borderFill> (Hancom default) so each cell shows real
     // gridlines instead of Hancom's "boundary hint" dashed-red overlay that
     // appears whenever a cell points at a borderless borderFill.
-    const solidBorderFillId = ensureBorderFill(doc, STD_SLASH_NONE + PLAIN_SIDES + DEFAULT_DIAG);
+    // Include an empty `<hc:fillBrush>` (faceColor="none") so that later
+    // `set_cell_background` cellzones actually paint the full cell — Hancom
+    // Docs only overlays a cellzone fill when the cell's own borderFill
+    // already carries a fillBrush slot to override.
+    const solidBorderFillId = ensureBorderFill(doc,
+      STD_SLASH_NONE + PLAIN_SIDES + DEFAULT_DIAG +
+      '<hc:fillBrush><hc:winBrush faceColor="none" hatchColor="none" alpha="0"/></hc:fillBrush>'
+    );
     srcSection = doc.sectionNames()[0];
     srcPara = null;
     srcParaAttrs = '';
