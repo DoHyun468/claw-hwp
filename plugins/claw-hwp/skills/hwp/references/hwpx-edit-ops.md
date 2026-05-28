@@ -31,6 +31,8 @@ Discover indices with `node scripts/extract_text.js --inspect file.hwpx` (counts
 output skips cell content — to locate a specific cell, use `--format markdown` (renders
 each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 
+> **Indexing trap** — `--inspect`'s `paragraphCount` counts EVERY `<hp:p>` in the doc, including ones inside table cells (e.g. 46 for a doc whose op-facing top-level count is 4). Op `index` args are top-level only — the two numbers DIVERGE on any doc with tables. To count top-level paragraphs reliably, run `--format markdown` (one block per top-level paragraph) or read `Contents/section0.xml` and walk `<hp:p>` at depth 1.
+
 ## Operations
 
 ### Text
@@ -48,6 +50,7 @@ each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 |--------|------|-------|
 | `append_paragraph` | `text` | Appends to the last section, cloning the last paragraph's para/char refs. |
 | `delete_paragraph` | `index` | Removes the Nth top-level paragraph. |
+| `set_page_break` | `index`, `on?` (default `true`) | Sets `pageBreak="1"` on paragraph `index` so it starts a new page (the break renders **before** the paragraph). Pass `"on": false` to clear an existing break. |
 
 ### Tables
 
@@ -61,12 +64,48 @@ each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 | `merge_cells` | `table`, `mode`, + range | `mode:"horizontal"` → `row`, `start`, `count` (sets `colSpan`); `mode:"vertical"` → `col`, `start`, `count` (sets `rowSpan`). `count >= 2`. Absorbed cells removed. Assumes no prior merge in the range. |
 | `insert_table` | `index`, `rows`, `cols`, `cells?` (string[][]) | Inserts a fresh `rows × cols` table as a new paragraph **after** paragraph `index` (use `-1` to prepend at the start of the first section). `cells[r][c]` fills each cell (missing entries → empty). Clones the first existing `<hp:tbl>` of the doc as the template so the new table inherits real Hancom-Docs-valid styling (borderFill, cellSz, cellMargin, etc.). **Requires the base doc to contain at least one table.** |
 
+### Cell styling (cellzoneList / cellSz / subList / paraPr)
+
+Per-cell appearance (background fill, borders, diagonals) lives in
+`<hp:cellzoneList>` inside the table — NOT on `<hp:tc>`. Each cellzone
+maps a `(startRow, startCol)–(endRow, endCol)` area to a `<hh:borderFill>`
+in `header.xml`. Vertical align lives on the cell's `<hp:subList vertAlign>`,
+horizontal align on the cell's first `<hp:p>` paraPrIDRef, and size on
+`<hp:cellSz>`. These ops produce exactly the structure Hancom Docs writes
+when the same edit is performed through its UI.
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `set_cell_background` | `table`, `row`, `col`, `color` (hex) | Adds a cellzone for that cell pointing at a borderFill with `<hc:fillBrush><hc:winBrush faceColor=...>`. Existing borderFills with the same body are reused; new ones get appended (`hh:borderFills@itemCnt` bumped). Note the `hc:` namespace — `hh:fillBrush` is silently ignored by Hancom. |
+| `set_cell_border` | `table`, `row`, `col`, `color` (hex), `width?` (e.g. `"0.3 mm"`, default `"0.3 mm"`), `sides?` (subset of `["LEFT","RIGHT","TOP","BOTTOM"]`, default all four) | Cellzone + borderFill whose chosen sides are `type="SOLID"`. Others stay `type="SOLID" width="0.12 mm" color="#000000"` (the doc default). |
+| `set_cell_diagonal` | `table`, `row`, `col`, `direction` (`"BACKSLASH"` `\` or `"SLASH"` `/`), `color?` (default `"#000000"`), `width?` (default `"0.3 mm"`) | Cellzone + borderFill whose `<hh:slash>` or `<hh:backSlash>` has `type="CENTER"` (Hancom's chosen enum for a solid diagonal — not `"SOLID"`). |
+| `set_cell_align` | `table`, `row`, `col`, `horizontal?` (`"LEFT"`/`"CENTER"`/`"RIGHT"`/`"JUSTIFY"`/`"DISTRIBUTE"`), `vertical?` (`"TOP"`/`"CENTER"`/`"BOTTOM"`) | `vertical` swaps `<hp:subList vertAlign>`. `horizontal` rewrites the cell's first `<hp:p>` paraPrIDRef through the same placeholder-paraPr trick as `apply_paragraph_style`. Either or both. |
+| `set_cell_size` | `table`, `row`, `col`, `width?`, `height?` (HWP units; one or both) | Rewrites the cell's `<hp:cellSz>` attrs. Hancom usually keeps row/column sizes consistent — changing one cell may make the row/column visually uneven until you set sibling cells to the same value. |
+
 ### Styling (clone-mutate-retarget in `header.xml`)
 
 | `type` | Args | Notes |
 |--------|------|-------|
 | `apply_text_style` | `target`, + any of `color` (hex "FF0000"), `bold`, `italic`, `underline`, `size` (HWP units, 1000≈10pt), `highlight` (true → yellow / hex / false → strip), `strikethrough` (bool), `supscript` (bool), `subscript` (bool — mutually exclusive with `supscript`), `fontFace` (face name, must already exist in `<hh:fontfaces>` like "맑은 고딕" / "함초롬바탕") | Two independent paths inside one op: **highlight** splices `<hp:markpenBegin color>...<hp:markpenEnd/>` around `target` inside its `<hp:t>` node (charPr untouched). Everything else **rewrites an unreferenced placeholder `<hh:charPr>` in place** (the pattern Hancom Docs itself uses — appending a new charPr survives load but Hancom strips the discriminating attr on next open). The placeholder's attrs/inner are replaced with the run's current charPr + the requested style mutation, then the run's `charPrIDRef` is retargeted to the placeholder's id. Returns `placeholderReused: true` when a placeholder was found, `false` (and bumps `hh:charProperties@itemCnt`) only when every charPr was already referenced. Restyles **only the first run** whose text contains `target`. |
 | `apply_paragraph_style` | `index`, + any of `align` ("LEFT"/"CENTER"/"RIGHT"/"JUSTIFY"/"DISTRIBUTE"), `indent` (HWP units), `lineSpacing` (percent, e.g. 160) | Clones `paraPr[0]`, mutates, retargets paragraph `index`. Bumps `hh:paraProperties@itemCnt`. |
+
+> **Ordering trap** — when applying both `highlight` AND a charPr-based attr (`bold` / `color` / etc.) to the **same target text**, do the charPr-based op **first**. `highlight` splices `<hp:markpenBegin/>...<hp:markpenEnd/>` inside the `<hp:t>` node, and the charPr-side run-split matcher expects the run's inner to be a single plain `<hp:t>…</hp:t>`. If highlight runs first, the later style call falls back to a whole-run retarget (the bold/color paints the entire paragraph run, not just the target word). Either reorder or pass both in one `apply_text_style` call.
+
+### Lists (글머리 기호 / 번호 매기기)
+
+Bullet / numbered list formatting works by retargeting the paragraph's
+`paraPrIDRef` to a `<hh:paraPr>` whose `<hh:heading>` child sets type
+(`BULLET` / `NUMBER`) and level. The bullet glyph itself lives in
+`<hh:bullets>`; the number format lives in `<hh:numbering>`. New entries
+are registered on demand.
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `set_bullet_list` | `index`, `char?` (e.g. `"▶"`, `"◯"`, `"□"`, `"★"`, `"■"`, `"◆"`, `"✓"`), `level?` (default `0`) | Marks paragraph `index` as a bullet item. Without `char`, uses the doc's default bullet (typically a filled circle). With `char`, registers (or reuses) a `<hh:bullet>` whose `char` attribute is that glyph; Hancom renders the literal char. Creates `<hh:bullets>` from scratch if the doc has none. |
+| `set_number_list` | `index`, `level?` (default `0`), `style?` (`"korean"` or `"decimal"`) | Marks paragraph `index` as a numbered item. With `style: "korean"`, registers a numbering whose levels cycle `1.` / `가.` / `1)` / `가)` / `(1)` / `(가)`. With `style: "decimal"`, registers one whose levels are `1.` / `1.1.` / `1.1.1.` / …. Without `style`, uses the doc's existing numbering id=1 (visual format depends on the template). `level` 0–5 picks the format on that numbering's level chain. |
+| `clear_list` | `index` | Strips any `<hh:heading>` from the paragraph's paraPr, leaving it as plain text. |
+
+> Lists clone the paragraph's CURRENT paraPr and splice the heading in, so the margin/lineSpacing of the body is preserved. The Hancom stock list paraPrs that carry default indents (margin.left=1000+) are intentionally NOT reused — bullet/numbered items render at the body's own left margin.
 
 ### Header / Footer (머리말 / 꼬리말)
 
