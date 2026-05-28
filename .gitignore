@@ -41,3 +41,9 @@ _*.md
 # internal-only / cross-project notes — never publish
 *SNAPSHOT*
 *_NOTES.md
+
+# dev-internal docs (per-developer working notes, not user-facing)
+# Plugin marketplace only fetches plugins/claw-hwp/ — these top-level
+# files aren't useful in the public repo or to plugin users.
+CLAUDE.md
+VERIFIED_BEHAVIORS.md
