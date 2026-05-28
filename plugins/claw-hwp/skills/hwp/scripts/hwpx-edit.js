@@ -1307,9 +1307,17 @@ function ensureChild(inner, snippet, tag) {
 const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', bmp: 'image/bmp', gif: 'image/gif' };
 
 function findBinEntry(doc, target) {
-  const full = target.includes('/') ? target : `BinData/${target}`;
+  // Accept any of: "image1.png" / "image1" (stem only) / "BinData/image1.png" /
+  // "BinData/image1". The stem fallback catches the common case where the
+  // caller has the manifest id (extension-less) instead of the file name.
+  const stem = (s) => s.replace(/\.[^/.]+$/, '');
+  const bare = target.replace(/^BinData\//i, '');
+  const bareStem = stem(bare);
   const names = Object.keys(doc.files).filter((n) => /^BinData\//i.test(n));
-  return names.find((n) => n === full || n.endsWith('/' + target) || n === target) || null;
+  return names.find((n) => {
+    const base = n.replace(/^BinData\//i, '');
+    return base === bare || stem(base) === bareStem;
+  }) || null;
 }
 
 function opReplaceImage(doc, target, sourcePath) {
