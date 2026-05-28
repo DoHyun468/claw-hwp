@@ -1589,6 +1589,47 @@ function opInsertBookmark(doc, index, name) {
   return { index, name, inserted: true };
 }
 
+// Clone the paragraph's current charPr + paint it blue with a solid blue
+// underline, then reuse a placeholder charPr (refCount=0) — same trick as
+// apply_text_style. Result: the hyperlink run looks like a standard web
+// link (blue + underline) on first render, instead of inheriting body text.
+function ensureHyperlinkCharPr(doc, baseCharPrId) {
+  const headerName = doc.headerName();
+  if (!headerName) throw new Error('insert_hyperlink: Contents/header.xml missing');
+  let header = doc.read(headerName);
+  const charPrs = scanTopLevel(header, 'hh:charPr');
+  if (!charPrs.length) throw new Error('insert_hyperlink: no <hh:charPr> in header.xml');
+  const base = charPrs.find((c) => getAttr(c.attrs, 'id') === baseCharPrId) || charPrs[0];
+
+  // wantInner = base.inner with underline set to BOTTOM SOLID #0000FF.
+  const ul = '<hh:underline type="BOTTOM" shape="SOLID" color="#0000FF"/>';
+  const wantInner = /<hh:underline\b[^/]*\/>/.test(base.inner)
+    ? base.inner.replace(/<hh:underline\b[^/]*\/>/, ul)
+    : base.inner + ul;
+  // wantAttrs = base.attrs with textColor=#0000FF.
+  const wantBaseAttrs = setOrAddAttr(base.attrs, 'textColor', '#0000FF').replace(/\s*id="\d+"/, '');
+
+  // Exact reuse?
+  for (const c of charPrs) {
+    if (c.inner === wantInner && c.attrs.replace(/\s*id="\d+"/, '') === wantBaseAttrs) {
+      return getAttr(c.attrs, 'id');
+    }
+  }
+
+  // Placeholder reuse / append.
+  const refCounts = buildCharPrRefCounts(doc);
+  const placeholder = charPrs.find((c) => (refCounts[getAttr(c.attrs, 'id')] || 0) === 0 && getAttr(c.attrs, 'id') !== baseCharPrId);
+  const useId = placeholder ? getAttr(placeholder.attrs, 'id')
+                            : String(Math.max(...charPrs.map((c) => Number(getAttr(c.attrs, 'id') || 0))) + 1);
+  const newAttrs = setOrAddAttr(base.attrs, 'textColor', '#0000FF').replace(/\s*id="\d+"/, ` id="${useId}"`);
+  const updated = `<hh:charPr${newAttrs}>${wantInner}</hh:charPr>`;
+  header = placeholder
+    ? spliceEl(header, placeholder, updated)
+    : bumpListCount(spliceEl(header, base, `<hh:charPr${base.attrs}>${base.inner}</hh:charPr>` + updated), 'hh:charProperties', +1);
+  doc.write(headerName, header);
+  return useId;
+}
+
 function opInsertHyperlink(doc, paragraphIndex, url, text) {
   if (!url) throw new Error('insert_hyperlink: "url" is required');
   if (!text) throw new Error('insert_hyperlink: "text" (display label) is required');
@@ -1597,7 +1638,8 @@ function opInsertHyperlink(doc, paragraphIndex, url, text) {
     throw new Error(`insert_hyperlink: paragraph index ${paragraphIndex} out of range (0..${paras.length - 1})`);
   }
   const { section, el } = paras[paragraphIndex];
-  const charPrId = (el.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+  const baseCharPrId = (el.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+  const charPrId = ensureHyperlinkCharPr(doc, baseCharPrId);
   const beginId = freshId();
   const fieldid = freshId();
   const u = xmlEscape(url);
