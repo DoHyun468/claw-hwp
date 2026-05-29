@@ -959,75 +959,6 @@ function opSetPageBreak(doc, index, on) {
   return { index, pageBreak: want === '1' };
 }
 
-// Look up a <hh:bullet> by its `char` attribute, or append a new one to
-// <hh:bullets> and return its id. char="▶" / "◯" / "□" / "★" all work —
-// Hancom Docs reads the char and renders it. When `char` is empty/missing,
-// returns "1" (the default idRef every standard doc carries).
-function ensureBullet(doc, char) {
-  if (!char) return '1';
-  const headerName = doc.headerName();
-  if (!headerName) throw new Error('ensureBullet: Contents/header.xml missing');
-  let header = doc.read(headerName);
-  const headBody = `<hh:paraHead level="0" align="LEFT" useInstWidth="0" autoIndent="1" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0"/>`;
-  const list = scanTopLevel(header, 'hh:bullets')[0];
-  if (!list) {
-    // Doc has no <hh:bullets> at all — create one (positioned right after
-    // <hh:numberings>, the way Hancom Docs lays out its standard headers).
-    // Place the requested char at id=1: Hancom Docs web ignores idRef and
-    // only renders bullets[0], so a placeholder at id=1 would hide the char.
-    const newBullet = `<hh:bullet id="1" char="${char}" useImage="0">${headBody}</hh:bullet>`;
-    const block = `<hh:bullets itemCnt="1">${newBullet}</hh:bullets>`;
-    let newHeader;
-    if (/<\/hh:numberings>/.test(header)) {
-      newHeader = header.replace(/(<\/hh:numberings>)/, `$1${block}`);
-    } else {
-      // Last-resort: drop right before </hh:head>.
-      newHeader = header.replace(/(<\/hh:head>)/, `${block}$1`);
-    }
-    doc.write(headerName, newHeader);
-    return '1';
-  }
-  const bulletEls = scanTopLevel(list.inner, 'hh:bullet');
-  // Hancom Docs web ignores BULLET heading idRef and only renders the first
-  // <hh:bullet> entry it sees. To make the requested glyph visible in web,
-  // ensure the lowest-id <hh:bullet> carries this char. If a char="" placeholder
-  // sits at a lower id, swap their `char` attrs (preserving ids so existing
-  // BULLET heading idRefs keep working everywhere).
-  const matched = bulletEls.find((b) => getAttr(b.attrs, 'char') === char);
-  const placeholder = bulletEls.find((b) => getAttr(b.attrs, 'char') === '');
-  if (matched) {
-    const matchedId = getAttr(matched.attrs, 'id');
-    if (placeholder && Number(getAttr(placeholder.attrs, 'id')) < Number(matchedId)) {
-      const placeId = getAttr(placeholder.attrs, 'id');
-      const placeUpd = `<hh:bullet${setOrAddAttr(placeholder.attrs, 'char', char)}>${placeholder.inner}</hh:bullet>`;
-      const matchedUpd = `<hh:bullet${setOrAddAttr(matched.attrs, 'char', '')}>${matched.inner}</hh:bullet>`;
-      // Splice the later one first so the earlier one's offsets stay valid.
-      const [first, second] = placeholder.start < matched.start ? [placeholder, matched] : [matched, placeholder];
-      const [firstUpd, secondUpd] = placeholder.start < matched.start ? [placeUpd, matchedUpd] : [matchedUpd, placeUpd];
-      let newInner = spliceEl(list.inner, second, secondUpd);
-      newInner = spliceEl(newInner, first, firstUpd);
-      doc.write(headerName, spliceEl(header, list, `<hh:bullets${list.attrs}>${newInner}</hh:bullets>`));
-      return placeId;
-    }
-    return matchedId;
-  }
-  if (placeholder) {
-    const placeId = getAttr(placeholder.attrs, 'id');
-    const newPlaceAttrs = setOrAddAttr(placeholder.attrs, 'char', char);
-    const updated = `<hh:bullet${newPlaceAttrs}>${placeholder.inner}</hh:bullet>`;
-    const newListInner = spliceEl(list.inner, placeholder, updated);
-    doc.write(headerName, spliceEl(header, list, `<hh:bullets${list.attrs}>${newListInner}</hh:bullets>`));
-    return placeId;
-  }
-  const ids = bulletEls.map((b) => Number(getAttr(b.attrs, 'id') || 0));
-  const newId = String(Math.max(0, ...ids) + 1);
-  const newBullet = `<hh:bullet id="${newId}" char="${char}" useImage="0">${headBody}</hh:bullet>`;
-  let newHeader = spliceEl(header, list, `<hh:bullets${list.attrs}>${list.inner + newBullet}</hh:bullets>`);
-  newHeader = bumpListCount(newHeader, 'hh:bullets', +1);
-  doc.write(headerName, newHeader);
-  return newId;
-}
-
 // Register (or reuse) an <hh:numbering> entry whose paraHead text is the
 // literal bullet glyph (e.g. ▶). Hancom Docs web silently downgrades
 // freshly-emitted <hh:heading type="BULLET"> to NONE on load — public OSS
@@ -1138,6 +1069,125 @@ function ensureNumbering(doc, style) {
 // web rejects our synthesised list paraPrs even when byte-level identical to
 // stock, so reusing an existing one is the only reliable path to list
 // rendering surviving cloud open.
+// Inject Hancom-round-trip stub fingerprint into `doc` so that
+// `reuseExistingListParaPr` can land on a Hancom-authored BULLET/NUMBER
+// paraPr that survives Hancom Docs web's silent strip. Mirrors what
+// `create.js:patchHwpxStubFingerprint` does for fresh-from-rhwp output,
+// but runs in-memory against the Hwpx doc instance so any edit pipeline
+// (not just `create.js`) gets list-rendering coverage. Returns true if
+// the stub was loaded and at least one paraPr was injected.
+//
+// The stub lives at `scripts/templates/hancom_native_stub.hwpx` — a
+// minimal hwpx extracted from a file that round-tripped through Hancom
+// Docs. If the stub is missing the function returns false and the caller
+// falls back to a literal-glyph prefix.
+function injectHancomListInfra(doc) {
+  const stubPath = path.join(__dirname, 'templates', 'hancom_native_stub.hwpx');
+  if (!fs.existsSync(stubPath)) return false;
+  const headerName = doc.headerName();
+  if (!headerName) return false;
+
+  let header = doc.read(headerName);
+  let stubFiles;
+  try {
+    stubFiles = unzipSync(new Uint8Array(fs.readFileSync(stubPath)));
+  } catch {
+    return false;
+  }
+  const stubHeader = strFromU8(stubFiles['Contents/header.xml']);
+  if (!stubHeader) return false;
+
+  // Pull stub snippets
+  const stubBulletParaPr = (stubHeader.match(/<hh:paraPr id="2"[^>]*>[\s\S]*?<\/hh:paraPr>/) || [])[0];
+  const stubNumberParaPr = (stubHeader.match(/<hh:paraPr id="3"[^>]*>[\s\S]*?<\/hh:paraPr>/) || [])[0];
+  const stubBullets = (stubHeader.match(/<hh:bullets\b[^>]*>[\s\S]*?<\/hh:bullets>/) || [])[0];
+  const stubNumbering = (stubHeader.match(/<hh:numbering id="1"[^>]*>[\s\S]*?<\/hh:numbering>/) || [])[0];
+
+  // Avoid duplicate injection if a Hancom-authored list paraPr already lives in this doc.
+  const hasBullet = /<hh:heading\s+type="BULLET"/.test(header);
+  const hasNumber = /<hh:heading\s+type="NUMBER"/.test(header);
+
+  // Renumber stub's paraPr ids to avoid clashing with existing ones.
+  const existingIds = [...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map((m) => Number(m[1]));
+  const maxId = existingIds.length ? Math.max(...existingIds) : 0;
+  let bulletId = String(maxId + 1);
+  let numberId = String(maxId + 2);
+
+  let injected = 0;
+  if (!hasBullet && stubBulletParaPr) {
+    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`);
+    header = header.replace('</hh:paraProperties>', newBullet + '</hh:paraProperties>');
+    injected++;
+  }
+  if (!hasNumber && stubNumberParaPr) {
+    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`);
+    header = header.replace('</hh:paraProperties>', newNumber + '</hh:paraProperties>');
+    injected++;
+  }
+  if (injected > 0) {
+    header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + injected) + b);
+  }
+
+  // Add the namespace `<hp:case hp:required-namespace="…HwpUnitChar">`
+  // references so Hancom doesn't normalize the stub paraPrs back to NONE.
+  if (!/<hh:head[^>]*xmlns:hwpunitchar=/.test(header)) {
+    header = header.replace(
+      /(<hh:head[^>]*?xmlns:ooxmlchart="[^"]+")/,
+      '$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"'
+    );
+  }
+  header = header.replace(/(<hh:head[^>]*?)version="1\.2"/, '$1version="1.5"');
+
+  // Inject bullets table if missing
+  if (!/<hh:bullets/.test(header) && stubBullets) {
+    header = header.replace('</hh:numberings>', '</hh:numberings>' + stubBullets);
+  }
+  // Replace placeholder numbering id=1 (empty paraHeads) with stub's korean one
+  if (stubNumbering) {
+    const cur1 = header.match(/<hh:numbering id="1"[^>]*>[\s\S]*?<\/hh:numbering>/);
+    if (cur1 && !/<hh:paraHead\b[^/]*>[^<]+<\/hh:paraHead>/.test(cur1[0])) {
+      header = header.replace(cur1[0], stubNumbering);
+    }
+  }
+  doc.write(headerName, header);
+
+  // Patch content.hpf — add xmlns:hwpunitchar + Scripts manifest entries
+  const hpfName = Object.keys(doc.files).find((n) => /content\.hpf$/i.test(n));
+  if (hpfName) {
+    let hpf = doc.read(hpfName);
+    if (!/xmlns:hwpunitchar=/.test(hpf)) {
+      hpf = hpf.replace(
+        /(xmlns:ooxmlchart="[^"]+")(\s+xmlns:epub=)/,
+        '$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"$2'
+      );
+    }
+    if (!/headersc/.test(hpf)) {
+      hpf = hpf.replace(
+        /(<opf:item id="section0"[^>]*\/>)(\s*<opf:item id="settings")/,
+        '$1<opf:item id="headersc" href="Scripts/headerScripts" media-type="application/x-javascript ;charset=utf-16"/><opf:item id="sourcesc" href="Scripts/sourceScripts" media-type="application/x-javascript ;charset=utf-16"/>$2'
+      );
+      hpf = hpf.replace(
+        /(<opf:itemref idref="section0")\/>(\s*<\/opf:spine>)/,
+        '$1 linear="yes"/><opf:itemref idref="headersc" linear="yes"/><opf:itemref idref="sourcesc" linear="yes"/>$2'
+      );
+      hpf = hpf.replace(/<opf:itemref idref="header"\/>/, '<opf:itemref idref="header" linear="yes"/>');
+    }
+    doc.write(hpfName, hpf);
+  }
+
+  // Copy Scripts/ verbatim from stub. These are binary (UTF-16 LE), so
+  // assign raw bytes directly to doc.files. DON'T add to doc.dirty — the
+  // save() loop runs strToU8(doc.text[name]) on every dirty entry, which
+  // would crash for binary content where doc.text is undefined.
+  for (const name of Object.keys(stubFiles)) {
+    if (!name.startsWith('Scripts/')) continue;
+    if (doc.files[name]) continue;
+    doc.files[name] = stubFiles[name];
+  }
+
+  return injected > 0;
+}
+
 function reuseExistingListParaPr(doc, type, lvl) {
   const headerName = doc.headerName();
   if (!headerName) return null;
@@ -1180,21 +1230,34 @@ function opSetParagraphList(doc, index, type, level, options) {
   // honeypot pattern: don't synthesise list paraPrs from scratch, ride on
   // the host doc's existing ones if it has any.
   if (t === 'BULLET' || t === 'NUMBER') {
-    const reused = reuseExistingListParaPr(doc, t, lvl);
+    // 1. Try reusing an existing Hancom-authored list paraPr.
+    let reused = reuseExistingListParaPr(doc, t, lvl);
+    // 2. If none exists, inject the Hancom-round-trip stub fingerprint into
+    //    this doc (adds Scripts/, xmlns:hwpunitchar, and native BULLET +
+    //    NUMBER paraPrs sourced from templates/hancom_native_stub.hwpx).
+    //    Then retry the reuse — the freshly-injected paraPr should match.
+    //    This lets users edit any plain hwpx and still get web-safe list
+    //    rendering, not just hwpxes that already round-tripped through
+    //    Hancom Docs.
+    if (!reused) {
+      const injected = injectHancomListInfra(doc);
+      if (injected) reused = reuseExistingListParaPr(doc, t, lvl);
+    }
     if (reused) {
       const newOpen = el.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${reused}"`);
       doc.write(section, spliceEl(doc.read(section), el, `<hp:p${newOpen}>${el.inner}</hp:p>`));
       return { index, type: t, level: lvl, paraPrId: reused, reusedHancomNative: true };
     }
-    // No Hancom-native list paraPr in the host doc. Synthesising one fails
-    // on Hancom Docs web (silent BULLET→NONE / NUMBER→BULLET downgrade), so
-    // fall back to a literal glyph prefix in the paragraph text. This is
-    // what every public OSS hwpx writer (airmang, chrisryugj, kordoc) does
-    // for cross-viewer reliability — the bullet "▶ " becomes plain text but
-    // renders identically across web AND desktop, every time.
+    // 3. Stub inject failed (stub file missing, etc.) — fall back to a
+    //    literal glyph prefix in the paragraph text. BULLET uses the
+    //    requested char (default ▶); NUMBER uses `${options.number || 1}.`.
+    //    Multiple NUMBER paragraphs need separate number values from the
+    //    caller — this fallback doesn't auto-increment across calls.
     const prefix = options && options.fallbackPrefix === false
       ? null
-      : t === 'BULLET' ? `${(options && options.char) || '▶'} ` : null;
+      : t === 'BULLET'
+        ? `${(options && options.char) || '▶'} `
+        : `${(options && options.number != null) ? Number(options.number) : 1}. `;
     if (prefix) {
       const escapedPrefix = xmlEscape(prefix);
       const newInner = el.inner.replace(
@@ -1202,11 +1265,15 @@ function opSetParagraphList(doc, index, type, level, options) {
         (_, open, text) => `${open}${escapedPrefix}${text}`
       );
       doc.write(section, spliceEl(doc.read(section), el, `<hp:p${el.attrs}>${newInner}</hp:p>`));
-      return { index, type: t, level: lvl, fallback: 'text-prefix', char: (options && options.char) || '▶' };
+      return {
+        index, type: t, level: lvl,
+        fallback: 'text-prefix',
+        prefix: prefix.trimEnd(),
+      };
     }
   }
 
-  // ensureBullet / ensureNumbering may mutate header.xml — call them FIRST so
+  // ensureBulletAsNumbering / ensureNumbering may mutate header.xml — call them FIRST so
   // subsequent header reads (for paraPrs) see the new lists. Doing it after
   // caching `header` makes the trailing doc.write overwrite the lists change.
   const bulletChar = options && options.char ? String(options.char) : '';
