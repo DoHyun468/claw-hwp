@@ -143,11 +143,19 @@ class Hwpx {
     this.dirty.add(name);
   }
   // Flatten top-level <hp:p> across all sections into a global ordered list.
+  // `scanTopLevel(xml, 'hp:p')` only walks same-tag nesting, so paragraphs
+  // sitting inside table cells (depth-1 in document tree but depth-0 in
+  // hp:p nesting) WOULD slip in. Filter them out by checking whether each
+  // hit's start offset falls inside any top-level <hp:tbl> range.
   paragraphs() {
     const list = [];
     for (const name of this.sectionNames()) {
       const xml = this.read(name);
-      for (const el of scanTopLevel(xml, 'hp:p')) list.push({ section: name, el });
+      const tblRanges = scanTopLevel(xml, 'hp:tbl').map((t) => [t.start, t.end]);
+      for (const el of scanTopLevel(xml, 'hp:p')) {
+        const insideTable = tblRanges.some(([a, b]) => a < el.start && el.start < b);
+        if (!insideTable) list.push({ section: name, el });
+      }
     }
     return list;
   }
@@ -247,7 +255,11 @@ function opAppendParagraph(doc, text) {
   if (/<\/hs:sec>\s*$/.test(xml)) xml = xml.replace(/<\/hs:sec>\s*$/, para + '</hs:sec>');
   else xml += para;
   doc.write(last, xml);
-  return { appended: true };
+  // Report the new paragraph's index so chained ops (set_bullet_list,
+  // set_page_break, insert_hyperlink, etc.) can target it without the
+  // caller having to track paragraph counts manually.
+  const newIndex = doc.paragraphs().length - 1;
+  return { appended: true, index: newIndex };
 }
 
 function opDeleteParagraph(doc, index) {
@@ -530,25 +542,30 @@ function opInsertTable(doc, index, rows, cols, cells) {
     const firstTrIdx = srcTbl.el.inner.indexOf('<hp:tr');
     tblMeta = firstTrIdx >= 0 ? srcTbl.el.inner.slice(0, firstTrIdx) : '';
   } else {
-    // Fallback path — no source table to clone. Register a SOLID 0.12mm
-    // black-border <hh:borderFill> (Hancom default) so each cell shows real
-    // gridlines instead of Hancom's "boundary hint" dashed-red overlay that
-    // appears whenever a cell points at a borderless borderFill.
-    // Include an empty `<hc:fillBrush>` (faceColor="none") so that later
-    // `set_cell_background` cellzones actually paint the full cell — Hancom
-    // Docs only overlays a cellzone fill when the cell's own borderFill
-    // already carries a fillBrush slot to override.
-    const solidBorderFillId = ensureBorderFill(doc,
-      STD_SLASH_NONE + PLAIN_SIDES + DEFAULT_DIAG +
-      '<hc:fillBrush><hc:winBrush faceColor="none" hatchColor="none" alpha="0"/></hc:fillBrush>'
+    // Fallback path — no source table to clone. Hancom Docs's web viewer
+    // suppresses cellzone fills when the table's own borderFill paints a
+    // visible grid AND the cell's own borderFill also paints solid borders:
+    // it picks one of those, the cellzone fill loses. Mirror the structure
+    // the clone path inherits from real Hancom-authored tables:
+    //   - tbl-wide borderFill: all sides NONE (invisible, no double-grid)
+    //   - cell-self borderFill: 4-side SOLID 0.12mm black (the real grid)
+    //     and NO diagonal, NO fillBrush (those would also break the fill).
+    // With this split, set_cell_background cellzones paint the whole cell.
+    const invisibleTblBfId = ensureBorderFill(doc,
+      STD_SLASH_NONE +
+      '<hh:leftBorder type="NONE" width="0.1 mm" color="none"/>' +
+      '<hh:rightBorder type="NONE" width="0.1 mm" color="none"/>' +
+      '<hh:topBorder type="NONE" width="0.1 mm" color="none"/>' +
+      '<hh:bottomBorder type="NONE" width="0.1 mm" color="none"/>'
     );
+    const visibleCellBfId = ensureBorderFill(doc, STD_SLASH_NONE + PLAIN_SIDES);
     srcSection = doc.sectionNames()[0];
     srcPara = null;
     srcParaAttrs = '';
     templateRowAttrs = '';
-    cellTemplateAttrs = FALLBACK_CELL_ATTRS.replace(/borderFillIDRef="\d+"/, `borderFillIDRef="${solidBorderFillId}"`);
+    cellTemplateAttrs = FALLBACK_CELL_ATTRS.replace(/borderFillIDRef="\d+"/, `borderFillIDRef="${visibleCellBfId}"`);
     cellTemplateInner = FALLBACK_CELL_INNER;
-    srcTblAttrs = FALLBACK_TBL_ATTRS.replace(/borderFillIDRef="\d+"/, `borderFillIDRef="${solidBorderFillId}"`);
+    srcTblAttrs = FALLBACK_TBL_ATTRS.replace(/borderFillIDRef="\d+"/, `borderFillIDRef="${invisibleTblBfId}"`);
     tblMeta = FALLBACK_TBL_META;
   }
 
@@ -674,36 +691,154 @@ function ensureBorderFill(doc, wantInner) {
   return newId;
 }
 
+// Merge a new cell-area into the table's cellzoneList. When an existing
+// cellzone has the SAME borderFillIDRef and is horizontally adjacent
+// (same row range, col extends by 1) or vertically adjacent (same col
+// range, row extends by 1), grow that cellzone's range instead of pushing
+// a fresh `<hp:cellzone>`. This mirrors what Hancom Docs itself emits when
+// the user paints the same color on a sequence of adjacent cells — and
+// it's what unlocks Hancom Docs's "fill the whole cell" rendering: per-
+// cell isolated cellzones render as glyph-height background strips only.
 function addCellzone(doc, tableIndex, row, col, borderFillId) {
   const { section, el } = getTable(doc, tableIndex);
   const inner = el.inner;
-  const zone = `<hp:cellzone startRowAddr="${row}" startColAddr="${col}" endRowAddr="${row}" endColAddr="${col}" borderFillIDRef="${borderFillId}"/>`;
   const lists = scanTopLevel(inner, 'hp:cellzoneList');
+  // Parse existing cellzones (if any).
+  const parseZones = (raw) => {
+    const re = /<hp:cellzone\s+startRowAddr="(\d+)"\s+startColAddr="(\d+)"\s+endRowAddr="(\d+)"\s+endColAddr="(\d+)"\s+borderFillIDRef="(\d+)"\/>/g;
+    const out = [];
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      out.push({ startRow: +m[1], startCol: +m[2], endRow: +m[3], endCol: +m[4], bf: m[5] });
+    }
+    return out;
+  };
+  const zones = lists.length ? parseZones(lists[0].inner) : [];
+  // Try to extend an existing zone (same bf + adjacent).
+  let merged = false;
+  for (const z of zones) {
+    if (z.bf !== borderFillId) continue;
+    // Single-cell add for this op — check horizontal adjacency first.
+    const horizAdj = z.startRow === row && z.endRow === row &&
+                     (z.endCol + 1 === col || z.startCol - 1 === col);
+    const vertAdj = z.startCol === col && z.endCol === col &&
+                    (z.endRow + 1 === row || z.startRow - 1 === row);
+    // Already contained — silent no-op.
+    const contained = z.startRow <= row && row <= z.endRow &&
+                      z.startCol <= col && col <= z.endCol;
+    if (contained) { merged = true; break; }
+    if (horizAdj) {
+      z.startCol = Math.min(z.startCol, col);
+      z.endCol = Math.max(z.endCol, col);
+      merged = true;
+      break;
+    }
+    if (vertAdj) {
+      z.startRow = Math.min(z.startRow, row);
+      z.endRow = Math.max(z.endRow, row);
+      merged = true;
+      break;
+    }
+  }
+  if (!merged) zones.push({ startRow: row, startCol: col, endRow: row, endCol: col, bf: borderFillId });
+  const serialized = zones.map((z) =>
+    `<hp:cellzone startRowAddr="${z.startRow}" startColAddr="${z.startCol}" endRowAddr="${z.endRow}" endColAddr="${z.endCol}" borderFillIDRef="${z.bf}"/>`
+  ).join('');
   let newInner;
   if (lists.length) {
-    const cz = lists[0];
-    newInner = spliceEl(inner, cz, `<hp:cellzoneList>${cz.inner + zone}</hp:cellzoneList>`);
+    newInner = spliceEl(inner, lists[0], `<hp:cellzoneList>${serialized}</hp:cellzoneList>`);
   } else {
-    // cellzoneList sits between the table's meta children and the first <hp:tr>.
     const firstTr = inner.indexOf('<hp:tr');
     if (firstTr < 0) throw new Error('cell style: table has no rows');
-    newInner = inner.slice(0, firstTr) + `<hp:cellzoneList>${zone}</hp:cellzoneList>` + inner.slice(firstTr);
+    newInner = inner.slice(0, firstTr) + `<hp:cellzoneList>${serialized}</hp:cellzoneList>` + inner.slice(firstTr);
   }
   const newTbl = `<hp:tbl${el.attrs}>${newInner}</hp:tbl>`;
   doc.write(section, spliceEl(doc.read(section), el, newTbl));
 }
 
-function opSetCellBackground(doc, tableIndex, row, col, color) {
+function opSetCellBackground(doc, tableIndex, row, col, color, mode) {
   const c = normHex(color);
-  // Hancom-native shape (verified against 한컴독스 round-trip):
-  //   borders all NONE (background isn't supposed to draw a border)
-  //   diagonal SOLID default
-  //   fillBrush is in the `hc:` namespace, NOT `hh:` — using hh: makes Hancom
-  //   ignore the brush entirely and the cell stays unfilled.
-  const brush = `<hc:fillBrush><hc:winBrush faceColor="${c}" hatchColor="#999999" alpha="0"/></hc:fillBrush>`;
-  const bfId = ensureBorderFill(doc, STD_SLASH_NONE + NONE_SIDES + DEFAULT_DIAG + brush);
-  addCellzone(doc, tableIndex, row, col, bfId);
-  return { table: tableIndex, row, col, color: c, borderFillId: bfId };
+  // `mode` controls how the color gets applied — Hancom's web viewer
+  // doesn't always paint a cellzone fill across the full cell on tables
+  // built without a clone source, so we offer the caller a choice:
+  //   "cellzone": only `<hp:cellzone>` (whole-cell on most renderers, but
+  //               on Hancom web fallback tables it may shrink to a glyph
+  //               strip; matches what 한독 itself writes for desktop-
+  //               authored tables).
+  //   "shade":   only character shading (글자 모양 → 음영) — strictly
+  //               glyph-height, no margins, but it ALWAYS renders.
+  //   "both" (default): both at once — cellzone gives the full-cell look
+  //               where supported, shade guarantees the visible color
+  //               otherwise.
+  const m = (mode || 'both').toLowerCase();
+  if (!['cellzone', 'shade', 'both'].includes(m)) {
+    throw new Error(`set_cell_background: mode must be "cellzone" | "shade" | "both" (got ${mode})`);
+  }
+  let bfId = null;
+  if (m === 'cellzone' || m === 'both') {
+    const brush = `<hc:fillBrush><hc:winBrush faceColor="${c}" hatchColor="#999999" alpha="0"/></hc:fillBrush>`;
+    bfId = ensureBorderFill(doc, STD_SLASH_NONE + NONE_SIDES + DEFAULT_DIAG + brush);
+    addCellzone(doc, tableIndex, row, col, bfId);
+  }
+  if (m === 'shade' || m === 'both') {
+    applyCellShadeColor(doc, tableIndex, row, col, c);
+  }
+  return { table: tableIndex, row, col, color: c, mode: m, borderFillId: bfId };
+}
+
+// Stamp shadeColor on the charPr of every run inside the cell at (row, col).
+// Reuses a placeholder charPr (refCount=0) cloned from the cell's current
+// charPr, so existing styling (font, size, color) is preserved.
+function applyCellShadeColor(doc, tableIndex, row, col, color) {
+  const { section, el } = getTable(doc, tableIndex);
+  const rows = scanTopLevel(el.inner, 'hp:tr');
+  if (row < 0 || row >= rows.length) return;
+  const tcs = scanTopLevel(rows[row].inner, 'hp:tc');
+  if (col < 0 || col >= tcs.length) return;
+  const tc = tcs[col];
+  const runMatch = tc.inner.match(/<hp:run\s+[^>]*charPrIDRef="(\d+)"/);
+  if (!runMatch) return;
+  const sourceRef = runMatch[1];
+  const headerName = doc.headerName();
+  if (!headerName) return;
+  let header = doc.read(headerName);
+  const charPrs = scanTopLevel(header, 'hh:charPr');
+  if (!charPrs.length) return;
+  const base = charPrs.find((c) => getAttr(c.attrs, 'id') === sourceRef) || charPrs[0];
+  // Already shaded with same color? Reuse.
+  for (const c of charPrs) {
+    if (c.inner === base.inner && getAttr(c.attrs, 'shadeColor') === color) {
+      const useId = getAttr(c.attrs, 'id');
+      retargetCellRuns(doc, tableIndex, row, col, useId);
+      return;
+    }
+  }
+  // Otherwise mutate a placeholder (or append).
+  const refCounts = buildCharPrRefCounts(doc);
+  const placeholder = charPrs.find((c) => (refCounts[getAttr(c.attrs, 'id')] || 0) === 0 && getAttr(c.attrs, 'id') !== sourceRef);
+  const useId = placeholder ? getAttr(placeholder.attrs, 'id')
+                            : String(Math.max(...charPrs.map((c) => Number(getAttr(c.attrs, 'id') || 0))) + 1);
+  const newAttrs = setOrAddAttr(base.attrs, 'shadeColor', color).replace(/\s*id="\d+"/, ` id="${useId}"`);
+  const updated = `<hh:charPr${newAttrs}>${base.inner}</hh:charPr>`;
+  header = placeholder
+    ? spliceEl(header, placeholder, updated)
+    : bumpListCount(spliceEl(header, base, `<hh:charPr${base.attrs}>${base.inner}</hh:charPr>` + updated), 'hh:charProperties', +1);
+  doc.write(headerName, header);
+  retargetCellRuns(doc, tableIndex, row, col, useId);
+}
+
+// Replace charPrIDRef on every <hp:run> inside a specific cell.
+function retargetCellRuns(doc, tableIndex, row, col, newCharPrId) {
+  const { section, el } = getTable(doc, tableIndex);
+  const rows = scanTopLevel(el.inner, 'hp:tr');
+  const tcs = scanTopLevel(rows[row].inner, 'hp:tc');
+  const tc = tcs[col];
+  const newCellInner = tc.inner.replace(/(<hp:run\s+[^>]*?charPrIDRef=")\d+(")/g, `$1${newCharPrId}$2`);
+  const newTc = `<hp:tc${tc.attrs}>${newCellInner}</hp:tc>`;
+  const newRowInner = spliceEl(rows[row].inner, tc, newTc);
+  const newRow = `<hp:tr${rows[row].attrs}>${newRowInner}</hp:tr>`;
+  const newTblInner = spliceEl(el.inner, rows[row], newRow);
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${newTblInner}</hp:tbl>`));
 }
 
 function opSetCellBorder(doc, tableIndex, row, col, color, width, sides) {
@@ -838,12 +973,10 @@ function ensureBullet(doc, char) {
   if (!list) {
     // Doc has no <hh:bullets> at all — create one (positioned right after
     // <hh:numberings>, the way Hancom Docs lays out its standard headers).
-    // id=1 always exists in Hancom's stock bullets; we mirror that with the
-    // first explicit-char entry getting id=2.
-    const defaultBullet = `<hh:bullet id="1" char="" useImage="0">${headBody}</hh:bullet>`;
-    const newId = '2';
-    const newBullet = `<hh:bullet id="${newId}" char="${char}" useImage="0">${headBody}</hh:bullet>`;
-    const block = `<hh:bullets itemCnt="2">${defaultBullet}${newBullet}</hh:bullets>`;
+    // Place the requested char at id=1: Hancom Docs web ignores idRef and
+    // only renders bullets[0], so a placeholder at id=1 would hide the char.
+    const newBullet = `<hh:bullet id="1" char="${char}" useImage="0">${headBody}</hh:bullet>`;
+    const block = `<hh:bullets itemCnt="1">${newBullet}</hh:bullets>`;
     let newHeader;
     if (/<\/hh:numberings>/.test(header)) {
       newHeader = header.replace(/(<\/hh:numberings>)/, `$1${block}`);
@@ -852,16 +985,77 @@ function ensureBullet(doc, char) {
       newHeader = header.replace(/(<\/hh:head>)/, `${block}$1`);
     }
     doc.write(headerName, newHeader);
-    return newId;
+    return '1';
   }
-  for (const b of scanTopLevel(list.inner, 'hh:bullet')) {
-    if (getAttr(b.attrs, 'char') === char) return getAttr(b.attrs, 'id');
+  const bulletEls = scanTopLevel(list.inner, 'hh:bullet');
+  // Hancom Docs web ignores BULLET heading idRef and only renders the first
+  // <hh:bullet> entry it sees. To make the requested glyph visible in web,
+  // ensure the lowest-id <hh:bullet> carries this char. If a char="" placeholder
+  // sits at a lower id, swap their `char` attrs (preserving ids so existing
+  // BULLET heading idRefs keep working everywhere).
+  const matched = bulletEls.find((b) => getAttr(b.attrs, 'char') === char);
+  const placeholder = bulletEls.find((b) => getAttr(b.attrs, 'char') === '');
+  if (matched) {
+    const matchedId = getAttr(matched.attrs, 'id');
+    if (placeholder && Number(getAttr(placeholder.attrs, 'id')) < Number(matchedId)) {
+      const placeId = getAttr(placeholder.attrs, 'id');
+      const placeUpd = `<hh:bullet${setOrAddAttr(placeholder.attrs, 'char', char)}>${placeholder.inner}</hh:bullet>`;
+      const matchedUpd = `<hh:bullet${setOrAddAttr(matched.attrs, 'char', '')}>${matched.inner}</hh:bullet>`;
+      // Splice the later one first so the earlier one's offsets stay valid.
+      const [first, second] = placeholder.start < matched.start ? [placeholder, matched] : [matched, placeholder];
+      const [firstUpd, secondUpd] = placeholder.start < matched.start ? [placeUpd, matchedUpd] : [matchedUpd, placeUpd];
+      let newInner = spliceEl(list.inner, second, secondUpd);
+      newInner = spliceEl(newInner, first, firstUpd);
+      doc.write(headerName, spliceEl(header, list, `<hh:bullets${list.attrs}>${newInner}</hh:bullets>`));
+      return placeId;
+    }
+    return matchedId;
   }
-  const ids = scanTopLevel(list.inner, 'hh:bullet').map((b) => Number(getAttr(b.attrs, 'id') || 0));
+  if (placeholder) {
+    const placeId = getAttr(placeholder.attrs, 'id');
+    const newPlaceAttrs = setOrAddAttr(placeholder.attrs, 'char', char);
+    const updated = `<hh:bullet${newPlaceAttrs}>${placeholder.inner}</hh:bullet>`;
+    const newListInner = spliceEl(list.inner, placeholder, updated);
+    doc.write(headerName, spliceEl(header, list, `<hh:bullets${list.attrs}>${newListInner}</hh:bullets>`));
+    return placeId;
+  }
+  const ids = bulletEls.map((b) => Number(getAttr(b.attrs, 'id') || 0));
   const newId = String(Math.max(0, ...ids) + 1);
   const newBullet = `<hh:bullet id="${newId}" char="${char}" useImage="0">${headBody}</hh:bullet>`;
   let newHeader = spliceEl(header, list, `<hh:bullets${list.attrs}>${list.inner + newBullet}</hh:bullets>`);
   newHeader = bumpListCount(newHeader, 'hh:bullets', +1);
+  doc.write(headerName, newHeader);
+  return newId;
+}
+
+// Register (or reuse) an <hh:numbering> entry whose paraHead text is the
+// literal bullet glyph (e.g. ▶). Hancom Docs web silently downgrades
+// freshly-emitted <hh:heading type="BULLET"> to NONE on load — public OSS
+// writers (pypandoc-hwpx, honeypot) work around this by rerouting bullets
+// through type="NUMBER" with the glyph in <hh:paraHead> as literal text,
+// numFormat="DIGIT" and no `^N` placeholder. Hancom prints the literal char
+// for every level (1–10).
+function ensureBulletAsNumbering(doc, char) {
+  const headerName = doc.headerName();
+  if (!headerName) throw new Error('ensureBulletAsNumbering: Contents/header.xml missing');
+  let header = doc.read(headerName);
+  const list = scanTopLevel(header, 'hh:numberings')[0];
+  if (!list) throw new Error('ensureBulletAsNumbering: <hh:numberings> missing');
+  const escaped = xmlEscape(char);
+  // Reuse a numbering whose level=1 paraHead text exactly equals `char`.
+  const numberingEls = scanTopLevel(list.inner, 'hh:numbering');
+  for (const n of numberingEls) {
+    const m = n.inner.match(/<hh:paraHead\b[^>]*\slevel="1"[^>]*>([^<]*)<\/hh:paraHead>/);
+    if (m && m[1] === escaped) return getAttr(n.attrs, 'id');
+  }
+  const ids = numberingEls.map((n) => Number(getAttr(n.attrs, 'id') || 0));
+  const newId = String(Math.max(0, ...ids) + 1);
+  const head = (lvl) =>
+    `<hh:paraHead start="1" level="${lvl}" align="LEFT" useInstWidth="1" autoIndent="1" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">${escaped}</hh:paraHead>`;
+  const body = [1,2,3,4,5,6,7,8,9,10].map(head).join('');
+  const newNum = `<hh:numbering id="${newId}" start="1">${body}</hh:numbering>`;
+  let newHeader = spliceEl(header, list, `<hh:numberings${list.attrs}>${list.inner + newNum}</hh:numberings>`);
+  newHeader = bumpListCount(newHeader, 'hh:numberings', +1);
   doc.write(headerName, newHeader);
   return newId;
 }
@@ -885,12 +1079,13 @@ function ensureNumbering(doc, style) {
   // Match on the level=2 paraHead text — that's where korean (`^2.`) and
   // decimal (`^1.^2.`) diverge.
   const want = s === 'decimal' ? '^1.^2.' : '^2.';
-  for (const n of scanTopLevel(list.inner, 'hh:numbering')) {
+  const numberingEls = scanTopLevel(list.inner, 'hh:numbering');
+  for (const n of numberingEls) {
     const m = n.inner.match(/<hh:paraHead\b[^>]*\slevel="2"[^>]*>([^<]*)<\/hh:paraHead>/);
     if (m && m[1] === want) return getAttr(n.attrs, 'id');
   }
   // Build new numbering definition.
-  const ids = scanTopLevel(list.inner, 'hh:numbering').map((n) => Number(getAttr(n.attrs, 'id') || 0));
+  const ids = numberingEls.map((n) => Number(getAttr(n.attrs, 'id') || 0));
   const newId = String(Math.max(0, ...ids) + 1);
   const head = (lvl, fmt, text) =>
     `<hh:paraHead start="1" level="${lvl}" align="LEFT" useInstWidth="1" autoIndent="1" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="${fmt}" charPrIDRef="4294967295" checkable="0">${text}</hh:paraHead>`;
@@ -914,11 +1109,48 @@ function ensureNumbering(doc, style) {
       head(6, 'HANGUL_SYLLABLE', '(^6)') +
       emptyHead(7) + emptyHead(8) + emptyHead(9) + emptyHead(10);
   }
+  // Hancom Docs web also mis-renders NUMBER heading idRef the same way it
+  // mis-renders BULLET (only the first numbering entry is honored). If the
+  // doc carries a placeholder numbering at id=1 (every paraHead is empty
+  // self-closing, i.e. text=""), rewrite that placeholder in-place so the
+  // requested format lands at the lowest idRef.
+  const isPlaceholderNumbering = (n) =>
+    !/<hh:paraHead\b[^/]*>[^<]+<\/hh:paraHead>/.test(n.inner);
+  const placeholder = numberingEls.find(isPlaceholderNumbering);
+  if (placeholder) {
+    const placeId = getAttr(placeholder.attrs, 'id');
+    const updated = `<hh:numbering${placeholder.attrs}>${body}</hh:numbering>`;
+    const newListInner = spliceEl(list.inner, placeholder, updated);
+    doc.write(headerName, spliceEl(header, list, `<hh:numberings${list.attrs}>${newListInner}</hh:numberings>`));
+    return placeId;
+  }
   const newNum = `<hh:numbering id="${newId}" start="1">${body}</hh:numbering>`;
   let newHeader = spliceEl(header, list, `<hh:numberings${list.attrs}>${list.inner + newNum}</hh:numberings>`);
   newHeader = bumpListCount(newHeader, 'hh:numberings', +1);
   doc.write(headerName, newHeader);
   return newId;
+}
+
+// Find an existing paraPr in header.xml that already declares the requested
+// heading (type/level) — preferably one authored by Hancom (i.e. cloned in
+// from a doc that round-tripped through Hancom Docs). Returns the paraPr id
+// to retarget, or null if no compatible paraPr exists. Critical: Hancom Docs
+// web rejects our synthesised list paraPrs even when byte-level identical to
+// stock, so reusing an existing one is the only reliable path to list
+// rendering surviving cloud open.
+function reuseExistingListParaPr(doc, type, lvl) {
+  const headerName = doc.headerName();
+  if (!headerName) return null;
+  const header = doc.read(headerName);
+  const paraPrs = scanTopLevel(header, 'hh:paraPr');
+  for (const pp of paraPrs) {
+    const hm = pp.inner.match(/<hh:heading\s+type="([^"]+)"\s+idRef="[^"]*"\s+level="(\d+)"/);
+    if (!hm) continue;
+    if (hm[1] !== type) continue;
+    if (Number(hm[2]) !== lvl) continue;
+    return getAttr(pp.attrs, 'id');
+  }
+  return null;
 }
 
 // Bullet / numbered list — Hancom's mechanism is a paraPr with
@@ -939,13 +1171,57 @@ function opSetParagraphList(doc, index, type, level, options) {
   const headerName = doc.headerName();
   if (!headerName) throw new Error('set_paragraph_list: Contents/header.xml missing');
 
+  // Hancom Docs web (cloud viewer) silently strips synthesised
+  // <hh:heading type="BULLET|NUMBER"> from any paraPr it didn't author —
+  // even when our paraPr inner is byte-level identical to a Hancom-native
+  // paraPr. So before creating a new paraPr, scan the doc for a Hancom-
+  // authored paraPr already carrying the desired heading type/level and
+  // reuse it (just retarget the paragraph's paraPrIDRef). This honors the
+  // honeypot pattern: don't synthesise list paraPrs from scratch, ride on
+  // the host doc's existing ones if it has any.
+  if (t === 'BULLET' || t === 'NUMBER') {
+    const reused = reuseExistingListParaPr(doc, t, lvl);
+    if (reused) {
+      const newOpen = el.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${reused}"`);
+      doc.write(section, spliceEl(doc.read(section), el, `<hp:p${newOpen}>${el.inner}</hp:p>`));
+      return { index, type: t, level: lvl, paraPrId: reused, reusedHancomNative: true };
+    }
+    // No Hancom-native list paraPr in the host doc. Synthesising one fails
+    // on Hancom Docs web (silent BULLET→NONE / NUMBER→BULLET downgrade), so
+    // fall back to a literal glyph prefix in the paragraph text. This is
+    // what every public OSS hwpx writer (airmang, chrisryugj, kordoc) does
+    // for cross-viewer reliability — the bullet "▶ " becomes plain text but
+    // renders identically across web AND desktop, every time.
+    const prefix = options && options.fallbackPrefix === false
+      ? null
+      : t === 'BULLET' ? `${(options && options.char) || '▶'} ` : null;
+    if (prefix) {
+      const escapedPrefix = xmlEscape(prefix);
+      const newInner = el.inner.replace(
+        /(<hp:t(?:\s[^>]*)?>)([^<]*)/,
+        (_, open, text) => `${open}${escapedPrefix}${text}`
+      );
+      doc.write(section, spliceEl(doc.read(section), el, `<hp:p${el.attrs}>${newInner}</hp:p>`));
+      return { index, type: t, level: lvl, fallback: 'text-prefix', char: (options && options.char) || '▶' };
+    }
+  }
+
   // ensureBullet / ensureNumbering may mutate header.xml — call them FIRST so
   // subsequent header reads (for paraPrs) see the new lists. Doing it after
   // caching `header` makes the trailing doc.write overwrite the lists change.
   const bulletChar = options && options.char ? String(options.char) : '';
   const numberStyle = options && options.style ? options.style : null;
   let listIdRef = '1';
-  if (t === 'BULLET') listIdRef = ensureBullet(doc, bulletChar);
+  // Effective heading type — Hancom Docs web silently strips synthesised
+  // type="BULLET" back to NONE, so route bullets through type="NUMBER" with
+  // the glyph living as the numbering's <hh:paraHead> text content
+  // (pypandoc-hwpx pattern, the only public OSS approach proven to survive
+  // 한컴 docs web normalize).
+  let emittedType = t;
+  if (t === 'BULLET') {
+    listIdRef = ensureBulletAsNumbering(doc, bulletChar || '▶');
+    emittedType = 'NUMBER';
+  }
   else if (t === 'NUMBER') listIdRef = ensureNumbering(doc, numberStyle);
 
   let header = doc.read(headerName);
@@ -961,7 +1237,7 @@ function opSetParagraphList(doc, index, type, level, options) {
   if (t === 'NONE') {
     wantInner = base.inner.replace(/<hh:heading\b[^/]*\/>/g, '');
   } else {
-    const heading = `<hh:heading type="${t}" idRef="${listIdRef}" level="${lvl}"/>`;
+    const heading = `<hh:heading type="${emittedType}" idRef="${listIdRef}" level="${lvl}"/>`;
     if (/<hh:heading\b[^/]*\/>/.test(base.inner)) {
       wantInner = base.inner.replace(/<hh:heading\b[^/]*\/>/, heading);
     } else {
@@ -969,6 +1245,20 @@ function opSetParagraphList(doc, index, type, level, options) {
         ? base.inner.replace(/(<hh:align\s+[^>]*\/>)/, `$1${heading}`)
         : heading + base.inner;
     }
+    // Hancom Docs web silently drops the bullet/number glyph when the
+    // paragraph aligns to JUSTIFY. LEFT renders identically for single-line
+    // body text and keeps the glyph visible across both web and desktop.
+    wantInner = wantInner.replace(
+      /<hh:align\s+horizontal="JUSTIFY"/,
+      '<hh:align horizontal="LEFT"'
+    );
+    // Hancom Docs normalizes paraPr inner format on load and silently strips
+    // <hh:heading type="BULLET|NUMBER"> back to NONE when the surrounding
+    // child layout doesn't match its stock template. The stock template has
+    // <hh:autoSpacing> right after <hh:breakSetting>, then <hp:switch>
+    // wrapping margin+lineSpacing (HwpUnitChar compat), with margin children
+    // in the hc: namespace. Rewrite our inner to match before Hancom can.
+    wantInner = stockizeParaPrInner(wantInner);
   }
 
   // Reuse only a paraPr whose inner matches wantInner EXACTLY (i.e. one we
@@ -1298,6 +1588,50 @@ function bumpListCount(header, listTag, delta) {
 function setOrAddAttr(attrs, name, value) {
   if (new RegExp(`${name}="[^"]*"`).test(attrs)) return attrs.replace(new RegExp(`${name}="[^"]*"`), `${name}="${value}"`);
   return ` ${name}="${value}"` + attrs.replace(/^\s*/, ' ');
+}
+
+// Rewrite a paraPr inner so Hancom Docs accepts the BULLET/NUMBER heading
+// without normalizing-then-stripping it. The fingerprint Hancom requires:
+//   align → heading → breakSetting → autoSpacing → hp:switch{ margin+lineSpacing } → border
+// Margin children must live in the `hc:` namespace under <hp:switch>, not
+// inline <hh:margin> with hh: children. Any other order/wrapping triggers the
+// silent BULLET→NONE rewrite on load.
+function stockizeParaPrInner(inner) {
+  const grab = (re) => { const m = inner.match(re); return m ? m[0] : ''; };
+  const align = grab(/<hh:align\b[^/]*\/>/);
+  const heading = grab(/<hh:heading\b[^/]*\/>/);
+  const breakSetting = grab(/<hh:breakSetting\b[^/]*\/>/);
+  const autoSpacing = grab(/<hh:autoSpacing\b[^/]*\/>/);
+  const margin = grab(/<hh:margin\b[^>]*>[\s\S]*?<\/hh:margin>/) || grab(/<hh:margin\b[^/]*\/>/);
+  const lineSpacing = grab(/<hh:lineSpacing\b[^/]*\/>/);
+  const border = grab(/<hh:border\b[^/]*\/>/);
+  if (!margin || !lineSpacing) return inner;  // unfamiliar shape — leave as-is
+  // Convert margin's inner children hh:* → hc:* AND force attr order to
+  // `value="..." unit="..."`. Hancom's stock margin children use that order;
+  // if ours emit `unit="..." value="..."` instead, Hancom's load-time
+  // normalizer treats the paraPr as foreign and silently downgrades any
+  // BULLET/NUMBER heading on it (BULLET→NONE, NUMBER→BULLET) — which is
+  // what was killing our list rendering in 한컴 docs web.
+  const marginHc = margin
+    .replace(/<hh:(intent|left|right|prev|next)\b([^/]*)\/>/g, (_, tag, attrs) => {
+      const unitM = attrs.match(/unit="([^"]*)"/);
+      const valueM = attrs.match(/value="([^"]*)"/);
+      const v = valueM ? valueM[1] : '0';
+      const u = unitM ? unitM[1] : 'HWPUNIT';
+      return `<hc:${tag} value="${v}" unit="${u}"/>`;
+    })
+    .replace(/<\/hh:(intent|left|right|prev|next)>/g, '</hc:$1>');
+  const block = marginHc + lineSpacing;
+  const switchBlock =
+    '<hp:switch>' +
+      '<hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">' +
+        block +
+      '</hp:case>' +
+      '<hp:default>' +
+        block +
+      '</hp:default>' +
+    '</hp:switch>';
+  return align + heading + breakSetting + autoSpacing + switchBlock + border;
 }
 function toggleChild(inner, tag, on) {
   const has = new RegExp(`<${tag.replace(/:/g, '\\:')}\\b[^>]*/?>`).test(inner);
@@ -1667,7 +2001,19 @@ function opInsertHyperlink(doc, paragraphIndex, url, text) {
       `<hp:t>${xmlEscape(text)}</hp:t>` +
       `<hp:ctrl><hp:fieldEnd beginIDRef="${beginId}" fieldid="${fieldid}"/></hp:ctrl>` +
     `</hp:run>`;
-  const rebuilt = `<hp:p${el.attrs}>${el.inner + run}</hp:p>`;
+  // If the paragraph already has a single plain-text run, replace it — that
+  // run's text is the user-visible label, which insert_hyperlink overwrites.
+  // Without this, the original text and the hyperlink display label render
+  // back-to-back. Multi-run or ctrl-bearing paragraphs append (don't drop
+  // structural runs blindly).
+  const runs = scanTopLevel(el.inner, 'hp:run');
+  const onlyPlainText = (r) =>
+    !/<hp:ctrl\b/.test(r.inner) &&
+    /^\s*<hp:t[^>]*>[^<]*<\/hp:t>\s*$/.test(r.inner);
+  const newInner = runs.length === 1 && onlyPlainText(runs[0])
+    ? spliceEl(el.inner, runs[0], run)
+    : el.inner + run;
+  const rebuilt = `<hp:p${el.attrs}>${newInner}</hp:p>`;
   doc.write(section, dropLinesegs(spliceEl(doc.read(section), el, rebuilt)));
   return { index: paragraphIndex, url, text, beginId, fieldid, inserted: true };
 }

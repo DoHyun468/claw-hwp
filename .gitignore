@@ -47,3 +47,6 @@ _*.md
 # files aren't useful in the public repo or to plugin users.
 CLAUDE.md
 VERIFIED_BEHAVIORS.md
+
+# verified hwpx samples — DO NOT DELETE. Local-only, never publish.
+_verified_hwpx_samples/

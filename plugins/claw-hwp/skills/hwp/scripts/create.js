@@ -1835,6 +1835,137 @@ async function patchHwpxPictures(filePath, patches) {
 // at body size. Look up the matching charPr id in header.xml by (height, bold)
 // and rewrite the run that owns the heading text.
 
+// Patch hwpx with Hancom-round-trip "fingerprint" so 한컴 docs web treats it
+// as Hancom-native and preserves list rendering. Without this, Hancom Docs
+// web silently strips any <hh:heading type="BULLET|NUMBER"> we emit — even
+// when our paraPr inner is byte-level identical to a Hancom-authored one.
+// Sources for the injected bits: a v7_debug stub that was round-tripped
+// through Hancom Docs (see scripts/templates/hancom_native_stub.hwpx).
+//
+// The patches applied:
+//   1. content.hpf: add xmlns:hwpunitchar (referenced by <hp:switch>), and
+//      Scripts/headerScripts + sourceScripts manifest+spine entries.
+//   2. header.xml <hh:head>: add xmlns:hwpunitchar, bump version 1.2 → 1.5
+//      (Hancom-native fingerprint).
+//   3. header.xml: append Hancom-native BULLET + NUMBER paraPrs (renumbered
+//      to avoid id collisions) + bullets[1]="▶" + numberings[1] korean
+//      (if missing). hwpx-edit.js's reuseExistingListParaPr will then find
+//      and reuse these for set_bullet_list / set_numbered_list ops.
+//   4. Copy Scripts/headerScripts + Scripts/sourceScripts verbatim from stub.
+//
+// Caveat (2026-05-29): empirically these patches alone may NOT be enough —
+// v22_stub verification showed Hancom still strips our list headings even
+// after injecting paraPrs + namespace + Scripts. The full fix likely
+// requires settings.xml + version.xml + other metadata to match a Hancom-
+// round-tripped file. Keep this as best-effort; the BULLET text-prefix
+// fallback in hwpx-edit.js's opSetParagraphList covers the remaining gap.
+async function patchHwpxStubFingerprint(filePath) {
+  const stubPath = path.join(__dirname, "templates", "hancom_native_stub.hwpx");
+  if (!fs.existsSync(stubPath)) return { patched: false, reason: "stub missing" };
+
+  const out = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const stub = await JSZip.loadAsync(fs.readFileSync(stubPath));
+
+  // ── 1. Copy Scripts/ from stub ──────────────────────────────────────────
+  for (const name of Object.keys(stub.files)) {
+    if (name.startsWith("Scripts/") && !out.file(name)) {
+      const data = await stub.file(name).async("uint8array");
+      out.file(name, data);
+    }
+  }
+
+  // ── 2. Patch content.hpf — namespace + Scripts manifest entries ─────────
+  const hpfEntry = out.file("Contents/content.hpf");
+  if (hpfEntry) {
+    let hpf = await hpfEntry.async("string");
+    if (!/xmlns:hwpunitchar=/.test(hpf)) {
+      hpf = hpf.replace(
+        /(xmlns:ooxmlchart="[^"]+")(\s+xmlns:epub=)/,
+        '$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"$2'
+      );
+    }
+    if (!/headersc/.test(hpf)) {
+      hpf = hpf.replace(
+        /(<opf:item id="section0"[^>]*\/>)(\s*<opf:item id="settings")/,
+        '$1<opf:item id="headersc" href="Scripts/headerScripts" media-type="application/x-javascript ;charset=utf-16"/><opf:item id="sourcesc" href="Scripts/sourceScripts" media-type="application/x-javascript ;charset=utf-16"/>$2'
+      );
+      hpf = hpf.replace(
+        /(<opf:itemref idref="section0")\/>(\s*<\/opf:spine>)/,
+        '$1 linear="yes"/><opf:itemref idref="headersc" linear="yes"/><opf:itemref idref="sourcesc" linear="yes"/>$2'
+      );
+      hpf = hpf.replace(/<opf:itemref idref="header"\/>/, '<opf:itemref idref="header" linear="yes"/>');
+    }
+    out.file("Contents/content.hpf", hpf);
+  }
+
+  // ── 3. Patch header.xml — namespace + version + Hancom-native list bits ─
+  const headerEntry = out.file("Contents/header.xml");
+  if (!headerEntry) return { patched: true, paraPrInjected: false };
+  let header = await headerEntry.async("string");
+
+  // Namespace on <hh:head>
+  if (!/<hh:head[^>]*xmlns:hwpunitchar=/.test(header)) {
+    header = header.replace(
+      /(<hh:head[^>]*?xmlns:ooxmlchart="[^"]+")/,
+      '$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"'
+    );
+  }
+  // Version bump
+  header = header.replace(/(<hh:head[^>]*?)version="1\.2"/, '$1version="1.5"');
+
+  // Pull Hancom-native paraPr/bullets/numbering snippets from stub
+  const stubHeader = await stub.file("Contents/header.xml").async("string");
+  const stubBulletParaPr = (stubHeader.match(/<hh:paraPr id="2"[^>]*>[\s\S]*?<\/hh:paraPr>/) || [])[0];
+  const stubNumberParaPr = (stubHeader.match(/<hh:paraPr id="3"[^>]*>[\s\S]*?<\/hh:paraPr>/) || [])[0];
+  const stubBullets = (stubHeader.match(/<hh:bullets\b[^>]*>[\s\S]*?<\/hh:bullets>/) || [])[0];
+  const stubNumberings = (stubHeader.match(/<hh:numbering id="1"[^>]*>[\s\S]*?<\/hh:numbering>/) || [])[0];
+
+  // Renumber paraPrs to avoid id conflicts with rhwp's existing ones
+  const existingIds = [...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map(m => Number(m[1]));
+  const maxId = existingIds.length ? Math.max(...existingIds) : 0;
+  const bulletId = String(maxId + 1);
+  const numberId = String(maxId + 2);
+
+  // Check if a BULLET / NUMBER paraPr already exists (e.g. user already
+  // round-tripped). Skip injection if so.
+  const hasBullet = /<hh:heading\s+type="BULLET"/.test(header);
+  const hasNumber = /<hh:heading\s+type="NUMBER"/.test(header);
+
+  let injected = 0;
+  if (!hasBullet && stubBulletParaPr) {
+    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`);
+    header = header.replace("</hh:paraProperties>", newBullet + "</hh:paraProperties>");
+    injected++;
+  }
+  if (!hasNumber && stubNumberParaPr) {
+    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`);
+    header = header.replace("</hh:paraProperties>", newNumber + "</hh:paraProperties>");
+    injected++;
+  }
+  if (injected > 0) {
+    header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + injected) + b);
+  }
+
+  // Inject bullets table if missing
+  if (!/<hh:bullets/.test(header) && stubBullets) {
+    header = header.replace("</hh:numberings>", "</hh:numberings>" + stubBullets);
+  }
+
+  // If numberings[1] exists but is a placeholder (no paraHead text content), replace it
+  if (stubNumberings) {
+    const cur1 = header.match(/<hh:numbering id="1"[^>]*>[\s\S]*?<\/hh:numbering>/);
+    if (cur1 && !/<hh:paraHead\b[^/]*>[^<]+<\/hh:paraHead>/.test(cur1[0])) {
+      header = header.replace(cur1[0], stubNumberings);
+    }
+  }
+
+  out.file("Contents/header.xml", header);
+
+  const newBytes = await out.generateAsync({ type: "nodebuffer" });
+  fs.writeFileSync(filePath, newBytes);
+  return { patched: true, paraPrInjected: injected, bulletId, numberId };
+}
+
 async function patchHwpxHeadings(filePath, patches) {
   if (patches.length === 0) return 0;
   const buf = fs.readFileSync(filePath);
@@ -2544,6 +2675,23 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: fixed ${n} heading charPrIDRef`);
     } catch (err) {
       log.push(`hwpx_heading_patch failed: ${err.message}`);
+    }
+  }
+
+  // Stamp the hwpx with a Hancom-round-trip fingerprint so 한컴 docs web
+  // accepts list paragraphs. rhwp's output reads as "foreign" to Hancom and
+  // any <hh:heading type="BULLET|NUMBER"> we emit gets silently stripped on
+  // open. Injecting Hancom-native paraPrs + xmlns:hwpunitchar + Scripts/
+  // (from scripts/templates/hancom_native_stub.hwpx) lets hwpx-edit.js's
+  // reuseExistingListParaPr land on a paraPr Hancom will preserve. Best
+  // effort — the BULLET text-prefix fallback in opSetParagraphList covers
+  // any remaining gap.
+  if (ext === ".hwpx") {
+    try {
+      const r = await patchHwpxStubFingerprint(outPath);
+      if (r.patched) log.push(`hwpx_stub_fingerprint: paraPr injected=${r.paraPrInjected || 0}`);
+    } catch (err) {
+      log.push(`hwpx_stub_fingerprint failed: ${err.message}`);
     }
   }
 
