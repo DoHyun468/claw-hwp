@@ -310,13 +310,15 @@ For `.hwp` input, route through `create.js`. When the path already exists and th
 
 3. **`replace_text` will silently miss table cells.** rhwp's `searchText` (and therefore `replaceOne`) does not enter `<hp:tbl>`. If `replace_text` reports 0 matches on what looks like a present anchor, the anchor is almost certainly inside a table — switch to `set_cell_text_by_label`.
 
-4. **Auto-preview after writes.** Per the trigger guidance below, fire `preview_start` / `preview_eval` immediately after the write so the user sees the edit, instead of asking them to verify.
+4. **Auto-preview after writes.** Per the trigger guidance below, fire `preview_start` / `preview_eval` immediately after the write so the user sees the edit visually right away. **Preview ≠ verification** — it's our lightweight renderer for quick feedback, not a 한컴 compatibility check. For real verification see "Verifying in 한컴독스" section.
 
 **Output format default**: **keep the input's original format**. `.hwp` in → `.hwp` out (raw-patch via `cell-patch.js`, tables preserved). `.hwpx` in → `.hwpx` out (XML edit via `hwpx-edit.js`, tables preserved). Use `convert.js` only when the user explicitly requests a `.hwp ↔ .hwpx` format change — it routes through rhwp's serializer which drops tables.
 
 ### "Show me what this looks like" / "Preview this HWP file"
 
-The skill ships a tiny Node HTTP server (`scripts/preview-server.js`) that serves a vanilla-JS canvas-based viewer; rhwp WASM does the actual rendering in the browser, so the result matches Hancom Office closely. No LibreOffice, no external browser plugin.
+> ⚠️ **Preview is feedback, not verification.** This is our own lightweight renderer (rhwp WASM canvas) — fast and convenient for showing edits visually, but **NOT** a 한컴 compatibility check. It can show a file as fine that 한컴독스 silently rejects (round-trip strips, fingerprint issues, web-only mis-renders, silent attribute drops). **Real verification = 한컴독스 (web) or 한컴오피스 (desktop) only** — see the "Verifying in 한컴독스" section for the companion skill (`hancomdocs-capture`).
+
+The skill ships a tiny Node HTTP server (`scripts/preview-server.js`) that serves a vanilla-JS canvas-based viewer; rhwp WASM does the actual rendering in the browser. The result matches Hancom Office closely **for layout preview purposes**, but does not exercise 한컴 round-trip parsing — that's what the companion verification skill is for. No LibreOffice, no external browser plugin.
 
 **The preview path depends on which Claude surface you're running in.** The decision rule, applied first thing every time the user wants to view a file:
 
@@ -424,13 +426,43 @@ Auto-detection: if no file argument is passed, the launcher picks the most recen
 
 #### When to fire preview (all paths)
 
-Don't ask, just do it. Visual verification is your job.
+Don't ask, just do it. **Showing the user a quick visual is your job** — but flag that this preview is feedback only, NOT a 한컴 compatibility verification (real verification = 한컴독스 / 한컴오피스 — see "Verifying in 한컴독스" section).
 
 1. Right after `create.js` / `convert.js` writes a new file or finishes a format conversion.
 2. Right after the user uploads a `.hwp` / `.hwpx` or mentions one by path.
 3. Right after edits (`replace_text`, unpack-edit-pack round-trip).
 
 In Desktop and CLI paths, "fire preview" means open the viewer / link directly. In cowork, "fire preview" means emit the hosted-viewer URL block alongside the file (launcher block only if asked or offline). Never write "please check if the file looks right" — give the user a working preview path.
+
+### Verifying in 한컴독스 (companion skill)
+
+`claw-hwp` produces `.hwp` / `.hwpx` bytes. **Important: the local preview (`preview-server.js`) does NOT verify 한컴 compatibility.** It's our own rhwp WASM renderer — fast and convenient for showing edits, but it can pass files that 한컴독스 silently rejects (round-trip strips, fingerprint issues, web-only mis-renders, silent attribute drops). **Real verification only happens by opening the file in 한컴독스 (web) or 한컴오피스 (desktop).**
+
+> **Vocabulary discipline — never call preview "검증" in your reports.** Use "미리보기" / "preview" / "시각 피드백" for the preview step. The word "검증" / "verification" is **reserved for the 한컴독스/한컴오피스 opening step** (real compatibility test). Conflating them trains the user to trust preview as a compatibility check, which it isn't.
+
+For automated verification, use the **separate** companion skill `hancomdocs-capture` (한컴독스 web automation with login state). Invoke it independently after editing — see that skill's own SKILL.md for the invocation contract.
+
+**Install** (currently from GitHub; marketplace publish pending):
+
+```bash
+claude plugin install https://github.com/DoHyun468/hancomdocs-capture
+# After publish: claude plugin install hancomdocs-capture
+```
+
+If not installed and the user needs visual verification, suggest the install command above; otherwise proceed without it (claw-hwp itself never depends on capture).
+
+#### When to proactively suggest verification
+
+For these operations, **proactively suggest** verification via `hancomdocs-capture` or instructing the user to open in 한컴독스 (web) / 한컴오피스 (desktop) — these categories have known or strongly suspected silent-strip / rejection patterns:
+
+1. **Bullet / number lists** — HWPX `set_bullet_list`, `set_number_list` — 한컴독스 web silent strip unless hwpx fingerprint matches Hancom-native (24 failed iterations before fix landed)
+2. **Table structure changes** — HWPX `insert_table`, `merge_cells`, `set_cell_size`, `append_table_column` — base clone consistency concerns
+3. **Paragraph styling beyond text** — `apply_paragraph_style` (HWPX XML / HWP raw-patch), HWPX `set_page_break` — paraPr sanitize concerns
+4. **Header / footer / notes** — HWPX `set_header`, `set_footer`, `insert_footnote`, `insert_endnote` — control envelope verification gaps
+5. **Image insertion** — HWPX `insert_image`, HWP `append_image` on existing files — BinData / manifest / hp:pic 3-track sync (large forms 50+ pages reject on rhwp `exportHwp` round-trip)
+6. **Format conversion** — `convert.js` (`.hwp ↔ .hwpx`) — tables drop, large forms round-trip reject
+
+Otherwise: don't push verification — user can invoke the companion skill themselves if needed.
 
 ## Common pitfalls
 
