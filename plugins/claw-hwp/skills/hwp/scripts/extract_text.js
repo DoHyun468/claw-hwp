@@ -76,12 +76,14 @@ if (opts.withCellText && !opts.inspect) {
   process.stderr.write('note: --with-cell-text has no effect without --inspect; ignoring.\n');
 }
 
-// For --inspect on .hwp input, count tables via rhwp wasm directly. We can't
-// reuse the hwpx-XML path here because rhwp.exportHwpx() drops every table,
-// so an inspect that goes through the hwpx zip always reports tableCount=0
-// on .hwp inputs. That made the "form has tables → use form-fill flow"
-// heuristic in SKILL.md silently misfire and convinced past agent sessions
-// that empty-looking forms were genuinely empty. We talk to rhwp directly.
+// For --inspect on .hwp input, count tables by talking to rhwp directly
+// (the getCellInfo/getTextInCell sweep) rather than via exportHwpx → hwpx-XML.
+// The direct sweep yields per-table cell counts (and the --with-cell-text
+// dump) in one pass and addresses cells in the original .hwp's coordinate
+// space — that's what set_cell_text uses. (Historical note: older rhwp builds
+// dropped tables on exportHwpx, so the hwpx-XML path reported tableCount=0 and
+// convinced past sessions that table-heavy forms were empty; rhwp 0.7.x
+// preserves tables, but the direct sweep is still what gives cell-level data.)
 if (opts.inspect && !isHwpxZip) {
   process.stdout.write(JSON.stringify(await inspectHwpViaRhwp(inputBytes, opts.withCellText), null, 2) + '\n');
   process.exit(0);

@@ -250,8 +250,7 @@ exist yet.
 
 **Known limitations** (rhwp serializer constraints — applies to anything emitted via this skill):
 
-- **`.hwpx` from-scratch drops tables**: rhwp's `exportHwpx()` strips tables when `create.js` writes a fresh `.hwpx` or `convert.js` runs `.hwp → .hwpx`. For a new `.hwpx` with tables, write `.hwp` instead — or start from an existing `.hwpx` with tables and add/edit via `hwpx-edit.js` (`insert_table`, cell ops). **Editing an existing `.hwpx` preserves its tables in place.**
-- **`.hwp ↔ .hwpx` conversion via `convert.js` is lossy** (tables, images, complex shapes can break). Editing in the original format (`.hwp` raw-patch / `.hwpx` XML edit) keeps everything intact — only run `convert.js` when the user explicitly asks for a format change.
+- **`.hwp ↔ .hwpx` conversion keeps tables but isn't pixel-faithful.** `convert.js` (and a from-scratch `.hwpx` built with tables) preserves table **structure and cell content** — the tables open and render in Hancom Docs (verified: a 70-table form converted with all 70 intact). What conversion does NOT fully preserve is **visual fidelity**: cell background colors/shading can partially drop, spacing and page breaks can shift, and **images do not render after conversion** (verified — the picture bytes survive in the `.hwpx` but Hancom Docs doesn't draw them; complex shapes untested). So edit in the input's original format when fidelity matters (`.hwp` raw-patch / `.hwpx` XML edit keep everything intact in place); only run `convert.js` when the user explicitly asks for a format change. **Editing an existing `.hwpx` (or `.hwp`) in place involves no conversion and preserves everything.**
 - **`replace_text` doesn't see table cells** (see op table above). For table-cell edits on an existing file, the `set_cell_text*` ops are the only path.
 - **In-place `apply_text_style` and `apply_paragraph_style` on large multi-page `.hwp` files (50+ pages)** are both supported via raw-patch (CharShape, and ParaShape + BorderFill respectively) and produce Hancom-Docs-compatible output.
 
@@ -268,7 +267,7 @@ exist yet.
 
 Detect format by reading the first two bytes — `PK` = HWPX (treat as `.hwpx` regardless of extension).
 
-Conversion between formats (`.hwp ↔ .hwpx`) is a **separate** tool — only use when the user explicitly requests a format change. It goes through rhwp's serializer which drops tables.
+Conversion between formats (`.hwp ↔ .hwpx`) is a **separate** tool — only use when the user explicitly requests a format change. It goes through rhwp's serializer, which keeps tables but isn't pixel-faithful (cell shading, spacing, and page breaks can shift).
 
 #### `.hwpx` editing — `hwpx-edit.js`
 
@@ -326,7 +325,7 @@ For `.hwp` input, route through `create.js`. When the path already exists and th
 
 4. **Auto-preview after writes.** Per the trigger guidance below, fire `preview_start` / `preview_eval` immediately after the write so the user sees the edit visually right away. **Preview ≠ verification** — it's our lightweight renderer for quick feedback, not a 한컴 compatibility check. For real verification see "Verifying in 한컴독스" section.
 
-**Output format default**: **keep the input's original format**. `.hwp` in → `.hwp` out (raw-patch via `cell-patch.js`, tables preserved). `.hwpx` in → `.hwpx` out (XML edit via `hwpx-edit.js`, tables preserved). Use `convert.js` only when the user explicitly requests a `.hwp ↔ .hwpx` format change — it routes through rhwp's serializer which drops tables.
+**Output format default**: **keep the input's original format**. `.hwp` in → `.hwp` out (raw-patch via `cell-patch.js`, tables preserved). `.hwpx` in → `.hwpx` out (XML edit via `hwpx-edit.js`, tables preserved). Use `convert.js` only when the user explicitly requests a `.hwp ↔ .hwpx` format change — it routes through rhwp's serializer, which keeps tables but can shift visual fidelity (cell shading, spacing, page breaks).
 
 ### "Show me what this looks like" / "Preview this HWP file"
 
@@ -474,7 +473,7 @@ For these operations, **proactively suggest** verification via `hancomdocs-captu
 3. **Paragraph styling beyond text** — `apply_paragraph_style` (HWPX XML / HWP raw-patch), HWPX `set_page_break` — paraPr sanitize concerns
 4. **Header / footer / notes** — HWPX `set_header`, `set_footer`, `insert_footnote`, `insert_endnote` — control envelope verification gaps
 5. **Image insertion** — HWPX `insert_image`, HWP `append_image` on existing files — BinData / manifest / hp:pic 3-track sync (large forms 50+ pages reject on rhwp `exportHwp` round-trip)
-6. **Format conversion** — `convert.js` (`.hwp ↔ .hwpx`) — tables drop, large forms round-trip reject
+6. **Format conversion** — `convert.js` (`.hwp ↔ .hwpx`) — tables survive but visual fidelity can shift (cell shading, spacing, page breaks); large forms round-trip reject
 
 Otherwise: don't push verification — user can invoke the companion skill themselves if needed.
 
