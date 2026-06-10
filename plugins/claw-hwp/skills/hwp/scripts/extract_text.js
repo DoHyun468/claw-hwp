@@ -189,6 +189,15 @@ async function convertHwpToHwpx(bytes) {
   const wasmBytes = fs.readFileSync(wasmPath);
   const rhwp = await import('./vendor/rhwp/rhwp.js');
   await rhwp.default({ module_or_path: wasmBytes });
+  // exportHwpx() runs rhwp's layout pass, which calls globalThis.measureTextWidth.
+  // Without this stub it throws "measureTextWidth is not a function" on any form
+  // whose content triggers layout (e.g. table-heavy government forms) — so plain
+  // text / markdown extraction of such .hwp files crashed and returned nothing.
+  // Mirrors the stub in inspectHwpViaRhwp / create.js / cell-patch.js.
+  if (typeof globalThis.measureTextWidth !== 'function') {
+    globalThis.measureTextWidth = (font, text) =>
+      text.length * (parseFloat(font) || 10) * 0.55;
+  }
   const doc = new rhwp.HwpDocument(new Uint8Array(bytes));
   try {
     return doc.exportHwpx();
