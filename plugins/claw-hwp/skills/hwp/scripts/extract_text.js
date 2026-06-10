@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import { unzipSync, strFromU8 } from './vendor/fflate/index.mjs';
+import { dumpTables } from './cell-inspect.js';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
@@ -22,12 +23,14 @@ function printUsage() {
     `  --format text       (default) plain text, one paragraph per line\n` +
     `  --format markdown   structured markdown (preserves tables)\n` +
     `  --inspect           emit JSON metadata only\n` +
+    `  --with-cell-text    with --inspect on a .hwp: also dump every table's\n` +
+    `                      cells (row/col/text) under a "tables" field\n` +
     `  -h, --help          show this message\n`
   );
 }
 
 function parseArgs(argv) {
-  const opts = { format: 'text', inspect: false, input: null };
+  const opts = { format: 'text', inspect: false, withCellText: false, input: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--format') {
@@ -38,6 +41,8 @@ function parseArgs(argv) {
       opts.format = v;
     } else if (a === '--inspect') {
       opts.inspect = true;
+    } else if (a === '--with-cell-text') {
+      opts.withCellText = true;
     } else if (a === '-h' || a === '--help') {
       opts.help = true;
     } else if (a.startsWith('--')) {
@@ -67,6 +72,10 @@ if (opts.help || !opts.input) {
 const inputBytes = fs.readFileSync(opts.input);
 const isHwpxZip = inputBytes[0] === 0x50 && inputBytes[1] === 0x4b; // 'PK'
 
+if (opts.withCellText && !opts.inspect) {
+  process.stderr.write('note: --with-cell-text has no effect without --inspect; ignoring.\n');
+}
+
 // For --inspect on .hwp input, count tables via rhwp wasm directly. We can't
 // reuse the hwpx-XML path here because rhwp.exportHwpx() drops every table,
 // so an inspect that goes through the hwpx zip always reports tableCount=0
@@ -74,7 +83,7 @@ const isHwpxZip = inputBytes[0] === 0x50 && inputBytes[1] === 0x4b; // 'PK'
 // heuristic in SKILL.md silently misfire and convinced past agent sessions
 // that empty-looking forms were genuinely empty. We talk to rhwp directly.
 if (opts.inspect && !isHwpxZip) {
-  process.stdout.write(JSON.stringify(await inspectHwpViaRhwp(inputBytes), null, 2) + '\n');
+  process.stdout.write(JSON.stringify(await inspectHwpViaRhwp(inputBytes, opts.withCellText), null, 2) + '\n');
   process.exit(0);
 }
 
@@ -92,6 +101,12 @@ const sectionXmls = Object.entries(files)
   .map(([, b]) => strFromU8(b));
 
 if (opts.inspect) {
+  if (opts.withCellText) {
+    process.stderr.write(
+      'note: --with-cell-text is only available for .hwp inputs; for .hwpx, ' +
+      'table cell text is included via --format markdown.\n'
+    );
+  }
   process.stdout.write(JSON.stringify(inspect(sectionXmls, isHwpxZip), null, 2) + '\n');
   process.exit(0);
 }
@@ -116,7 +131,7 @@ process.stdout.write(lines.join('\n') + '\n');
 // cell info. Breaking on the first non-table control would miss the table
 // at ctrl=3 on Korean government form cover pages (logo at 0, checkbox at
 // 1, textbox at 2, table at 3) — the exact bug we hit in 1.3.0.
-async function inspectHwpViaRhwp(bytes) {
+async function inspectHwpViaRhwp(bytes, withCellText = false) {
   const wasmPath = path.join(__dirname, 'vendor', 'rhwp', 'rhwp_bg.wasm');
   const wasmBytes = fs.readFileSync(wasmPath);
   const rhwp = await import('./vendor/rhwp/rhwp.js');
@@ -150,7 +165,7 @@ async function inspectHwpViaRhwp(bytes) {
         }
       }
     }
-    return {
+    const result = {
       fileType: 'hwp',
       sectionCount,
       paragraphCount,
@@ -158,6 +173,11 @@ async function inspectHwpViaRhwp(bytes) {
       cellCount,
       imageCount: null,  // rhwp doesn't surface this directly; skip for now
     };
+    // --with-cell-text: attach the full per-table cell inventory. dumpTables
+    // re-walks the tables to read each cell's text (getTextInCell); the count
+    // loop above only touched getCellInfo, so the text reads happen just once.
+    if (withCellText) result.tables = dumpTables(doc);
+    return result;
   } finally {
     if (typeof doc.free === 'function') doc.free();
   }

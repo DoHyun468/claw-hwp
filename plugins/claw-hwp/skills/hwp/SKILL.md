@@ -38,6 +38,7 @@ When the user says "preview", they almost always mean "show me the file" — sta
 | Read text content | `node scripts/extract_text.js <file>` — works for both .hwp and .hwpx |
 | Read as markdown (preserves headings/tables) | `node scripts/extract_text.js --format markdown <file>` |
 | Inspect structure (pages, sections, tables) | `node scripts/extract_text.js --inspect <file>` |
+| Inspect + dump every table's cell text (`.hwp`) | `node scripts/extract_text.js --inspect --with-cell-text <file.hwp>` |
 | Create new document from scratch | `echo '{"path":"out.hwp","operations":[...]}' \| node scripts/create.js` |
 | Edit existing `.hwpx` | `echo '{"path":"f.hwpx","operations":[...]}' \| node scripts/hwpx-edit.js` (op vocab in `references/hwpx-edit-ops.md`) |
 | Edit existing `.hwp` | `echo '{"path":"f.hwp","operations":[...]}' \| node scripts/create.js` (raw-patch via `cell-patch.js` — byte-level in-place, preserves tables, Hancom-Docs compatible) |
@@ -74,6 +75,19 @@ For metadata only:
 ```bash
 node scripts/extract_text.js --inspect path/to/file.hwp
 # Returns JSON: { pageCount, sectionCount, paragraphCount, tableCount, hasImages, ... }
+```
+
+To also read **every table's cell contents** out of a `.hwp` — handy for
+locating which cell holds a given value before a `set_cell_text` edit, or for
+dumping a form's full structure in one pass — add `--with-cell-text`:
+```bash
+node scripts/extract_text.js --inspect --with-cell-text path/to/form.hwp
+# Adds a "tables" array to the JSON. Each entry:
+#   { sec, para, ctrl, rowCount, colCount,
+#     cells: [ { idx, row, col, rowSpan, colSpan, text }, ... ] }
+# (sec, para, ctrl) are the same coordinates set_cell_text uses, so you can
+# read a cell here and write it back with set_cell_text. .hwp only — for
+# .hwpx, table cell text already comes through --format markdown.
 ```
 
 ### "Create a new document" / "Write this as a hwp file"
