@@ -5,12 +5,17 @@ Inverse of unpack.py. The mimetype file is written first and stored
 uncompressed (per the OCF / OPF spec) so the resulting archive is
 valid for HWPX viewers.
 
-This script does NOT regenerate the OPF manifest in
-``Contents/content.hpf``. If you added or removed files in the
-unpacked directory, edit that manifest by hand or invoke validate.py
-to detect mismatches.
+On repack this script auto-repairs two things that, left stale, make
+Hancom Docs reject the file:
 
-It DOES auto-sync the root ``<hh:head ... secCnt="N">`` in
+1. It prunes OPF manifest entries in ``Contents/content.hpf`` (the
+   ``<opf:item>`` plus its ``<opf:spine><opf:itemref>``) for any file that
+   is no longer present in the unpacked directory — so removing a section or
+   image no longer leaves a dangling reference. It does NOT *add* manifest
+   entries for newly added files; register those with their own
+   ``<opf:item>`` (or run validate.py to detect the mismatch).
+
+2. It auto-syncs the root ``<hh:head ... secCnt="N">`` in
 ``Contents/header.xml`` to the number of ``Contents/sectionN.xml`` body
 sections on repack. Hancom Docs trusts secCnt over the actual file set,
 so a stale secCnt after adding/removing a section makes Hancom Docs (web)
@@ -36,6 +41,10 @@ SECTION_NAME_RE = re.compile(r"section\d+\.xml")
 # only appears on <head>, but we anchor on the tag to be safe. Bytes regex —
 # header.xml is UTF-8 and secCnt's value is ASCII digits.
 SECCNT_RE = re.compile(rb'<(?:\w+:)?head\b[^>]*?secCnt="(\d+)"')
+CONTENT_HPF_REL = "Contents/content.hpf"
+# A self-closing <opf:item .../> manifest entry. `item\b` won't match
+# <opf:itemref> (there's no word boundary between "item" and "ref").
+OPF_ITEM_RE = re.compile(rb"<opf:item\b[^>]*/>")
 
 
 def count_sections(unpacked_dir: Path) -> int:
@@ -66,6 +75,43 @@ def sync_seccnt(header_bytes: bytes, n: int):
     return patched, old, new
 
 
+def collect_rel_files(unpacked_dir: Path) -> set:
+    """Set of every packaged file's posix path relative to the unpacked dir."""
+    rels = set()
+    for root, _dirs, fnames in os.walk(unpacked_dir):
+        for fn in fnames:
+            rels.add((Path(root) / fn).relative_to(unpacked_dir).as_posix())
+    return rels
+
+
+def prune_manifest(hpf_bytes: bytes, present: set):
+    """Drop <opf:item> manifest entries whose href file is gone, plus the
+    matching <opf:spine><opf:itemref idref=...>. Returns (patched, removed_ids).
+
+    Covers the common removal case (deleting a section or image without
+    hand-editing content.hpf) so the manual unpack->edit->pack path doesn't
+    leave a dangling manifest reference that Hancom rejects. It does NOT add
+    entries for newly added files — register those with their own <opf:item>.
+    """
+    removed_ids = []
+
+    def drop_dangling(m):
+        tag = m.group(0)
+        href_m = re.search(rb'href="([^"]*)"', tag)
+        if href_m and href_m.group(1).decode("utf-8") not in present:
+            id_m = re.search(rb'id="([^"]*)"', tag)
+            if id_m:
+                removed_ids.append(id_m.group(1))
+            return b""
+        return tag
+
+    patched = OPF_ITEM_RE.sub(drop_dangling, hpf_bytes)
+    for rid in removed_ids:
+        ref_re = re.compile(rb'<opf:itemref\b[^>]*idref="' + re.escape(rid) + rb'"[^>]*/>')
+        patched = ref_re.sub(b"", patched)
+    return patched, [r.decode("utf-8") for r in removed_ids]
+
+
 def pack(unpacked_dir: Path, output_path: Path) -> int:
     mimetype_path = unpacked_dir / MIMETYPE
     if not mimetype_path.exists():
@@ -79,8 +125,10 @@ def pack(unpacked_dir: Path, output_path: Path) -> int:
             file=sys.stderr,
         )
 
+    present = collect_rel_files(unpacked_dir)
     section_count = count_sections(unpacked_dir)
     seccnt_change = None
+    pruned_ids = []
 
     written = 0
     with zipfile.ZipFile(output_path, "w") as zf:
@@ -105,6 +153,14 @@ def pack(unpacked_dir: Path, output_path: Path) -> int:
                         seccnt_change = (old, new)
                         written += 1
                         continue
+                # Prune content.hpf manifest/spine entries for files now gone.
+                if rel == CONTENT_HPF_REL:
+                    patched, removed = prune_manifest(full.read_bytes(), present)
+                    if removed:
+                        zf.writestr(rel, patched, compress_type=zipfile.ZIP_DEFLATED)
+                        pruned_ids.extend(removed)
+                        written += 1
+                        continue
                 zf.write(full, rel, compress_type=zipfile.ZIP_DEFLATED)
                 written += 1
 
@@ -112,6 +168,12 @@ def pack(unpacked_dir: Path, output_path: Path) -> int:
         print(
             f"synced header.xml secCnt: {seccnt_change[0]} -> {seccnt_change[1]} "
             f"({section_count} section file(s))",
+            file=sys.stderr,
+        )
+    if pruned_ids:
+        print(
+            f"pruned {len(pruned_ids)} dangling manifest entr"
+            f"{'y' if len(pruned_ids) == 1 else 'ies'}: {', '.join(pruned_ids)}",
             file=sys.stderr,
         )
     return written

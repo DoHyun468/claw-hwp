@@ -38,7 +38,7 @@ After `python scripts/unpack.py file.hwpx /tmp/u/`, the directory looks like:
 ```
 
 **You will edit**: `Contents/section*.xml` (body content) and occasionally `Contents/header.xml` (when style/font changes are needed).
-**You will rarely edit**: `Contents/content.hpf` (let `pack.py` regenerate the manifest if you add files).
+**You will rarely edit**: `Contents/content.hpf` — when you **add** a file (e.g. a new image), register its `<opf:item>` here yourself; when you **remove** a file, `pack.py` prunes its entry for you on repack.
 **Do not edit**: `mimetype`, `version.xml`, `META-INF/*`, `Preview/*`. They will be left alone by `pack.py`.
 
 > **Section count lives in two places — keep them in sync.** The number of body sections is recorded both implicitly (the set of `Contents/sectionN.xml` files plus their `<opf:item>` / spine entries in `content.hpf`) **and** explicitly in the root `<hh:head … secCnt="N">` of `header.xml`. If you add or remove a section you MUST update `secCnt` to the real count: Hancom Docs trusts `secCnt` and refuses to open the file ("문서를 열 수 없습니다") when it disagrees with the actual section files — even though more lenient viewers open it fine. `pack.py` auto-syncs `secCnt` to the number of `sectionN.xml` files on repack, so the `unpack → edit → pack` path is covered; if you assemble the archive another way, patch `secCnt` yourself.
@@ -289,7 +289,7 @@ To **add a row**: clone an existing `<hp:tr>` block, increment `cellAddr` `rowAd
 - **Don't edit `<hp:linesegarray>` values.** They are recomputed on render. Leave the existing array; if inserting new paragraphs, copy a sibling's `<hp:linesegarray>` as-is.
 - **Encoding.** All HWPX XML is UTF-8. Korean text is written directly (`한글` not `&#54620;&#44544;`). XML escape only `&`, `<`, `>` (and `"` / `'` inside attribute values).
 - **Whitespace in `<hp:t>`.** Leading/trailing spaces are preserved. If you need a newline within a paragraph, use a separate `<hp:lineBreak/>` element (not `\n` inside `<hp:t>`).
-- **`content.hpf` manifest sync.** When you add a new image to `BinData/`, `pack.py` regenerates the manifest. When deleting an image, also remove its `<opf:item>` from `Contents/content.hpf` (or let `pack.py --rebuild-manifest` handle it).
+- **`content.hpf` manifest sync.** When you **add** a file to the package (e.g. a new image in `BinData/`), add a matching `<opf:item href="…" media-type="…"/>` to `Contents/content.hpf` yourself — `pack.py` does not invent entries for new files. When you **remove** a file (image or section), `pack.py` auto-prunes its `<opf:item>` and the matching `<opf:spine><opf:itemref>` on repack, so no hand-editing is needed. `validate.py` flags any manifest entry whose href points at a missing file.
 - **Misnamed extension as binary.** If `unpack.py` reports "not a zip", the file is HWP 5.0 binary, not HWPX. Convert via `node scripts/convert.js file.hwp /tmp/file.hwpx` first.
 
 ---
