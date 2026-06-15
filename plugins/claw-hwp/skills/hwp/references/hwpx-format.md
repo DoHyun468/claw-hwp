@@ -41,6 +41,8 @@ After `python scripts/unpack.py file.hwpx /tmp/u/`, the directory looks like:
 **You will rarely edit**: `Contents/content.hpf` (let `pack.py` regenerate the manifest if you add files).
 **Do not edit**: `mimetype`, `version.xml`, `META-INF/*`, `Preview/*`. They will be left alone by `pack.py`.
 
+> **Section count lives in two places — keep them in sync.** The number of body sections is recorded both implicitly (the set of `Contents/sectionN.xml` files plus their `<opf:item>` / spine entries in `content.hpf`) **and** explicitly in the root `<hh:head … secCnt="N">` of `header.xml`. If you add or remove a section you MUST update `secCnt` to the real count: Hancom Docs trusts `secCnt` and refuses to open the file ("문서를 열 수 없습니다") when it disagrees with the actual section files — even though more lenient viewers open it fine. `pack.py` auto-syncs `secCnt` to the number of `sectionN.xml` files on repack, so the `unpack → edit → pack` path is covered; if you assemble the archive another way, patch `secCnt` yourself.
+
 ---
 
 ## Namespaces
@@ -282,6 +284,7 @@ To **add a row**: clone an existing `<hp:tr>` block, increment `cellAddr` `rowAd
 
 - **Never invent IDRef values.** `paraPrIDRef`, `charPrIDRef`, `styleIDRef`, `borderFillIDRef`, etc. must reference an existing item in `header.xml`'s `<hh:refList>`. When adding new content, copy the IDRef from a sibling element with similar formatting. To introduce a new style, you must also add the matching `<hh:paraPr>` / `<hh:charPr>` to `header.xml` — this is a v0.2 topic, deferred.
 - **`rowCnt` / `colCnt` must match actual `<hp:tr>` / `<hp:tc>` counts.** When adding/removing rows or columns, update both. Hangul Office is forgiving on this; rhwp may not be.
+- **`header.xml` `secCnt` must match the `sectionN.xml` count.** Adding/removing a `Contents/sectionN.xml` (and its `content.hpf` entries) is not enough — the root `<hh:head … secCnt="N">` is a separate section-count meta. Stale `secCnt` → Hancom Docs (web) rejects the file with "문서를 열 수 없습니다", while lenient viewers still open it (so it's easy to miss). `pack.py` auto-syncs it on repack; if you assemble the zip yourself, set it by hand. (HWPX analog of `.hwp`'s DocInfo `HWPTAG_DOCUMENT_PROPERTIES` section count.)
 - **`cellAddr` consistency in tables.** Every `<hp:tc>` has `colAddr` / `rowAddr`. After insertion/deletion, these must form a consistent grid (no gaps, no duplicates). For rectangular tables, addresses go (0,0), (0,1), ..., (0,colCnt-1), (1,0), ...
 - **Don't edit `<hp:linesegarray>` values.** They are recomputed on render. Leave the existing array; if inserting new paragraphs, copy a sibling's `<hp:linesegarray>` as-is.
 - **Encoding.** All HWPX XML is UTF-8. Korean text is written directly (`한글` not `&#54620;&#44544;`). XML escape only `&`, `<`, `>` (and `"` / `'` inside attribute values).
