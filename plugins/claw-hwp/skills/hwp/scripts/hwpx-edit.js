@@ -63,6 +63,7 @@
 //   set_page_number       { where?, align? }   // 쪽 번호 — where: footer|header, align: LEFT|CENTER|RIGHT
 //   split_cell            { table, row, col, rows?, cols? }  // 셀 나누기 — split one cell into rows×cols
 //   set_caption           { target?, index?, text, side?, gap_mm? }  // 캡션 — target: image|chart|shape|table
+//   apply_style           { index, style }   // 스타일 적용 — style: name ("개요 1"/"본문") or id
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -1968,6 +1969,42 @@ function opApplyParagraphStyle(doc, index, style) {
   return { index, paraPrId: newId };
 }
 
+// Apply a built-in named paragraph style (스타일 적용 — e.g. "개요 1" heading,
+// "본문", "바탕글"). Every .hwpx ships ~22 <hh:style> definitions in header.xml,
+// each declaring its own paraPrIDRef + charPrIDRef. Applying one = point the
+// paragraph's styleIDRef at the style id AND adopt the style's paraPr + char so
+// it actually renders (and shows under that name in Hancom's style menu, feeding
+// TOC/outline). Hancom re-indexes paraPr/char ids on its own save, so we use the
+// style's declared refs from THIS doc's header (internally consistent).
+function opApplyStyle(doc, index, style) {
+  const headerName = doc.headerName();
+  if (!headerName) throw new Error('apply_style: Contents/header.xml missing');
+  const styles = scanTopLevel(doc.read(headerName), 'hh:style');
+  if (!styles.length) throw new Error('apply_style: no <hh:style> in header.xml');
+  const want = String(style == null ? '' : style).trim();
+  if (!want) throw new Error('apply_style: style (name or id) required');
+  const wl = want.toLowerCase();
+  const hit = styles.find((s) => getAttr(s.attrs, 'id') === want
+    || getAttr(s.attrs, 'name') === want
+    || (getAttr(s.attrs, 'engName') || '').toLowerCase() === wl);
+  if (!hit) {
+    const avail = styles.map((s) => getAttr(s.attrs, 'name')).filter(Boolean).join(', ');
+    throw new Error(`apply_style: style "${want}" not found. Available: ${avail}`);
+  }
+  const styleId = getAttr(hit.attrs, 'id');
+  const ppr = getAttr(hit.attrs, 'paraPrIDRef');
+  const cpr = getAttr(hit.attrs, 'charPrIDRef');
+  const paras = doc.paragraphs();
+  if (index < 0 || index >= paras.length) throw new Error(`apply_style: index ${index} out of range (0..${paras.length - 1})`);
+  const { section, el } = paras[index];
+  let open = /styleIDRef="\d+"/.test(el.attrs) ? el.attrs.replace(/styleIDRef="\d+"/, `styleIDRef="${styleId}"`) : `${el.attrs} styleIDRef="${styleId}"`;
+  if (ppr != null) open = /paraPrIDRef="\d+"/.test(open) ? open.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${ppr}"`) : `${open} paraPrIDRef="${ppr}"`;
+  let inner = el.inner;
+  if (cpr != null) inner = inner.replace(/(<hp:run\b[^>]*\bcharPrIDRef=")\d+(")/g, `$1${cpr}$2`);
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:p${open}>${dropLinesegs(inner)}</hp:p>`));
+  return { index, style: getAttr(hit.attrs, 'name'), styleId, paraPrId: ppr, charPrId: cpr };
+}
+
 // Increment itemCnt="N" on the named OWPML list wrapper (e.g. hh:charPrList),
 // so Hancom's strict reader doesn't ignore an appended definition.
 function bumpListCount(header, listTag, delta) {
@@ -2886,6 +2923,7 @@ function applyOp(doc, op) {
     case 'set_page_number': return opSetPageNumber(doc, op.where, op.align);
     case 'split_cell': return opSplitCell(doc, op.table, op.row, op.col, op.rows, op.cols);
     case 'set_caption': return opSetCaption(doc, op.target, op.index, op.text, op.side, op.gap_mm);
+    case 'apply_style': return opApplyStyle(doc, op.index, op.style);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
