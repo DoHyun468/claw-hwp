@@ -132,7 +132,7 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 | `append_table` ⚠️ | `headers`, `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props` |
 | `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt` |
 | `append_equation` | `script` (Hangul equation script — token reference in `references/equation-syntax.md`) | `size` (HWP units/100, default 1000 ≈ 10pt), `color` (`#RRGGBB`), `align` |
-| `append_bullet_list`, `append_numbered_list` | `items[]` | — |
+| `append_bullet_list`, `append_numbered_list` | `items[]` | — (adds the item paragraphs; to put the **marker** on existing paragraphs use the in-place `set_numbered_list` / `set_bullet_list` ops below) |
 | `append_page_break` | — | — |
 | `set_header`, `set_footer` | `text` | `apply_to` (0 = both pages, default) — 머리말/꼬리말, whole document |
 | `append_footnote` | `text` | — (attaches a footnote to the **end of the current paragraph** — add right after the `append_paragraph` it annotates) |
@@ -179,6 +179,8 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 | `set_cell_background` | `section`, `para`, `control`, `row`, `col`, `background_color` | — | Shades one table cell a solid color. Merges the fill into the cell's **existing** BorderFill so its borders/diagonal are preserved, then repoints just that cell (sibling cells untouched). `background_color` = `"#RRGGBB"`. Same `(section, para, control, row, col)` addressing as `set_cell_text`. Section 0 only. Hancom-Docs render verified. |
 | `set_cell_border` | `section`, `para`, `control`, `row`, `col`, `sides` | `color`, `width`, `line_type` | Sets one cell's borders. `sides` = `"all"` or an array of `"top"`/`"bottom"`/`"left"`/`"right"`. Merges into the cell's **existing** BorderFill so its fill/diagonal and untouched sides are preserved. `color` = `"#RRGGBB"` (default black), `width` = preset index (default 1 = thin), `line_type` = `solid`(default)/`dashed`/`dotted`/`double`. Section 0 only. Hancom-Docs render verified. |
 | `set_cell_diagonal` | `section`, `para`, `control`, `row`, `col`, `direction` | `color`, `width`, `line_type` | Draws a diagonal across one cell. `direction` = `"slash"` (／) / `"backslash"` (＼) / `"x"` (╳ both). Merges into the cell's **existing** BorderFill so its fill/borders are preserved. `color` = `"#RRGGBB"` (default black), `width` = preset index (default 1; index of mm preset `0.1,0.12,0.15,0.2,0.25,0.3,0.4,0.5,…` so `0.5mm`=7), `line_type` = `solid`(default)/`dashed`/`dotted`/`double`. Section 0 only. Hancom-Docs render verified. |
+| `set_numbered_list` | `target` (string) or `index` (0-based para) | — | Turns an existing body paragraph into a **numbered** list item (`1.`, `2.`, …). Sets the paragraph's PARA_SHAPE heading kind + a NUMBERING ref. Apply to several paragraphs in **one payload** → they share one numbering and count continuously (1., 2., 3.). Section 0 only. Hancom-Docs render verified. |
+| `set_bullet_list` | `target` (string) or `index` (0-based para) | — | Turns an existing body paragraph into a **bulleted** list item (`●`). Same addressing/payload semantics as `set_numbered_list`. Section 0 only. Hancom-Docs render verified. |
 
 Inline `**bold**` and `*italic*` are parsed automatically inside `text` and table cell strings. `runs:[{text, bold?, italic?, underline?, strikethrough?, fontSize?, color?, highlight?, font_family?, superscript?, subscript?, underline_color?, letter_spacing?, char_ratio?}]` overrides the parser when you need finer control over a run. All `apply_text_style` props are available per-run too. Per-run styling rides the same rhwp-driven path as a from-scratch build, so it works when constructing new documents and on small in-place edits; for character-level changes on large existing files (50+ pages), use the standalone `apply_text_style` op, which routes through the raw-patch path.
 
@@ -270,7 +272,7 @@ exist yet.
 | Input | Use | What's available |
 |-------|-----|------------------|
 | `.hwpx` | **`hwpx-edit.js`** | text · paragraph · table (`insert_table`, cell content/background/border/diagonal/align/size, row/column, merge) · image (insert/replace/delete) · char & paragraph styling · header/footer · page break · bullet/number lists (style: korean/decimal, custom bullet glyph) · footnote/endnote · hyperlink |
-| `.hwp` | **`create.js`** (raw-patch via `cell-patch.js`) | set_cell_text · set_cell_background · set_cell_border · set_cell_diagonal · replace_text · append_paragraph/heading/table/list/break · setup_document · apply_text_style · apply_paragraph_style |
+| `.hwp` | **`create.js`** (raw-patch via `cell-patch.js`) | set_cell_text · set_cell_background · set_cell_border · set_cell_diagonal · set_numbered_list · set_bullet_list · replace_text · append_paragraph/heading/table/list/break · setup_document · apply_text_style · apply_paragraph_style |
 
 Detect format by reading the first two bytes — `PK` = HWPX (treat as `.hwpx` regardless of extension).
 
@@ -311,7 +313,7 @@ Notes:
 
 #### `.hwp` editing — `create.js` (raw-patch via `cell-patch.js`)
 
-For `.hwp` input, route through `create.js`. When the path already exists and the first op is NOT `setup_document`, `create.js` loads the file and dispatches `RAW_PATCH_OPS` (set_cell_text · set_cell_background · set_cell_border · set_cell_diagonal · replace_text · append_paragraph/heading/table/list/break · setup_document · apply_text_style · apply_paragraph_style) through `cell-patch.js` for **byte-level in-place editing** — the original bytes stay intact, only the modified records are patched, and the output is Hancom-Docs compatible (verified). No `.hwp → .hwpx` conversion involved, so tables are preserved end-to-end.
+For `.hwp` input, route through `create.js`. When the path already exists and the first op is NOT `setup_document`, `create.js` loads the file and dispatches `RAW_PATCH_OPS` (set_cell_text · set_cell_background · set_cell_border · set_cell_diagonal · set_numbered_list · set_bullet_list · replace_text · append_paragraph/heading/table/list/break · setup_document · apply_text_style · apply_paragraph_style) through `cell-patch.js` for **byte-level in-place editing** — the original bytes stay intact, only the modified records are patched, and the output is Hancom-Docs compatible (verified). No `.hwp → .hwpx` conversion involved, so tables are preserved end-to-end.
 
 1. Write a JSON op script and pipe it into `create.js`. Because the path already exists and the first op is NOT `setup_document`, create.js loads the existing file:
    ```bash

@@ -3869,6 +3869,16 @@ const TAG_BORDER_FILL = 20;
 //   16-17 reserved
 const ID_MAPPINGS_BORDER_FILL_OFFSET = 8 * 4;
 const ID_MAPPINGS_PARA_SHAPE_OFFSET = 13 * 4;
+const ID_MAPPINGS_NUMBERING_OFFSET = 11 * 4;
+const ID_MAPPINGS_BULLET_OFFSET = 12 * 4;
+const TAG_NUMBERING = 23;
+const TAG_BULLET = 24;
+// Native Hancom records, GT-extracted (cell-style/list via Hancom web → .hwp):
+//   NUMBERING = standard decimal "^1." per level (^1 = the auto-number).
+//   BULLET    = "●" glyph (U+F06C). Replayed verbatim so a numbered/bulleted
+//   paragraph that references them renders identically to Hancom's own output.
+const NUMBERING_TEMPLATE_HEX = '0c00000000003200ffffffff03005e0031002e000c01000000003200ffffffff03005e0032002e000c00000000003200ffffffff03005e00330029000c01000000003200ffffffff03005e00340029000c00000000003200ffffffff040028005e00350029000c01000000003200ffffffff040028005e00360029002c00000000003200ffffffff02005e0037000100010000000100000001000000010000000100000001000000010000002c01000000003200ffffffff02005e0038000c00000000003200ffffffff00000c00000000003200ffffffff0000010000000100000001000000';
+const BULLET_TEMPLATE_HEX = '0800000000003200ffffffff6cf00000000000000000002000';
 
 const ALIGNMENT_MAP = {
   justify: 0,
@@ -3924,6 +3934,14 @@ function buildParaShapeBody(base, style) {
     if (t == null) throw new Error(`apply_paragraph_style: unknown lineSpacingType "${style.lineSpacingType}"`);
     attr1 = ((attr1 & ~0x03) | t) >>> 0;
   }
+  // 문단 머리 종류 (heading kind) — attr1 bits 23-24: 0=none, 1=outline,
+  // 2=number, 3=bullet. GT-confirmed (a Hancom-authored list: numbered para
+  // attr1 0x01000180 vs plain 0x00000180 = bit 24; bullet 0x01800180 = bits
+  // 23+24). The id ref at offset 30 then points to the matching NUMBERING
+  // (kind 2) or BULLET (kind 3) record.
+  if (style.headingKind != null) {
+    attr1 = ((attr1 & ~(0x3 << 23)) | ((style.headingKind & 0x3) << 23)) >>> 0;
+  }
   buf.writeUInt32LE(attr1 >>> 0, 0);
 
   if (style.marginLeft != null) buf.writeInt32LE(Math.round(style.marginLeft), 4);
@@ -3938,6 +3956,11 @@ function buildParaShapeBody(base, style) {
   }
   if (style.borderFillId != null) {
     buf.writeUInt16LE(style.borderFillId & 0xFFFF, 32);
+  }
+  // numbering_id / bullet_id share this u16 (which one is decided by the
+  // heading kind in attr1 above).
+  if (style.headingId != null) {
+    buf.writeUInt16LE(style.headingId & 0xFFFF, 30);
   }
   return buf;
 }
@@ -3986,6 +4009,221 @@ function appendParaShapeToDocInfo(diRaw, body) {
   const oldCount = newDi.readUInt32LE(off);
   newDi.writeUInt32LE(oldCount + 1, off);
   return { newDi, newPsId: psCount };
+}
+
+// Append a NUMBERING (tag 23) or BULLET (tag 24) record (built from a native
+// template) into DocInfo, keeping the tag-ascending record order, and bump the
+// matching HWPTAG_ID_MAPPINGS count. Returns { newDi, newId } with newId 1-based
+// (paragraph numbering/bullet id refs are 1-based, like BorderFill).
+function appendHeadingRecordToDocInfo(diRaw, tag, body, idMappingsOffset) {
+  let count = 0;
+  let lastSameTagEnd = -1;
+  let lastLowerTagEnd = -1;   // fallback insert point: after the last record whose tag < target (but ≥ ID_MAPPINGS)
+  let idMappingsDataOff = -1;
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === tag) { count++; lastSameTagEnd = r.dataOff + r.size; }
+    else if (r.tag >= 17 && r.tag < tag) lastLowerTagEnd = r.dataOff + r.size;
+    if (r.tag === 17) idMappingsDataOff = r.dataOff;
+  }
+  if (idMappingsDataOff < 0) {
+    throw new Error('HWPTAG_ID_MAPPINGS not found in DocInfo — file looks malformed');
+  }
+  const insertAt = lastSameTagEnd >= 0 ? lastSameTagEnd
+    : (lastLowerTagEnd >= 0 ? lastLowerTagEnd : diRaw.length);
+  const header = buildRecordHeader(tag, 0, body.length);
+  const newRec = Buffer.concat([header, body]);
+  const newDi = Buffer.concat([diRaw.slice(0, insertAt), newRec, diRaw.slice(insertAt)]);
+  const off = idMappingsDataOff + idMappingsOffset;
+  if (off + 4 > newDi.length) {
+    throw new Error('ID_MAPPINGS body too short to hold numbering/bullet count');
+  }
+  newDi.writeUInt32LE(newDi.readUInt32LE(off) + 1, off);
+  return { newDi, newId: count + 1 };
+}
+function appendNumberingToDocInfo(diRaw) {
+  return appendHeadingRecordToDocInfo(diRaw, TAG_NUMBERING, Buffer.from(NUMBERING_TEMPLATE_HEX, 'hex'), ID_MAPPINGS_NUMBERING_OFFSET);
+}
+function appendBulletToDocInfo(diRaw) {
+  return appendHeadingRecordToDocInfo(diRaw, TAG_BULLET, Buffer.from(BULLET_TEMPLATE_HEX, 'hex'), ID_MAPPINGS_BULLET_OFFSET);
+}
+
+/**
+ * Apply list formatting (numbered / bulleted) to existing `.hwp` paragraphs via
+ * raw-patch. Ops: `set_numbered_list` / `set_bullet_list`, each targeting one
+ * body paragraph by `target` (string, first paragraph containing it) or `index`
+ * (0-based level-0 paragraph in Section0) — same addressing apply_paragraph_style
+ * uses.
+ *
+ * Mechanism (GT-confirmed): HWP renders a paragraph's number/bullet purely from
+ * its PARA_SHAPE — attr1 heading-kind bits (2=number, 3=bullet) + a NUMBERING /
+ * BULLET id ref at offset 30; NO inline text control char is needed. We append a
+ * native NUMBERING (or BULLET) record to DocInfo ONCE per call (so multiple items
+ * share one id and number continuously), then for each target clone its
+ * PARA_SHAPE with the heading kind + id set, dedup/append, and repoint the
+ * PARA_HEADER. Section0 only.
+ */
+export async function applyListInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', listed_count: 0 });
+  }
+  for (const op of ops) {
+    const hasTarget = typeof op.target === 'string' && op.target.length > 0;
+    const hasIdx = Number.isInteger(op.index) && op.index >= 0;
+    if (!hasTarget && !hasIdx) {
+      throw new Error(`${op.type}: 'target' (string) or 'index' (non-negative integer) is required`);
+    }
+    if (op.type !== 'set_numbered_list' && op.type !== 'set_bullet_list') {
+      throw new Error(`applyListInPlace: unsupported op type "${op.type}"`);
+    }
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const diEntry = findStreamEntry(entries, ['DocInfo']);
+  const diInMini = diEntry.size < 4096;
+  let diChain, diCompressed;
+  if (diInMini) {
+    const rc = ensureRootChain();
+    diChain = walkChain(minifat, diEntry.start);
+    diCompressed = readMiniChainBytes(buf, diChain, rc, ssz, mssz, diEntry.size);
+  } else {
+    diChain = walkChain(fat, diEntry.start);
+    diCompressed = readChainBytes(buf, diChain, ssz, diEntry.size);
+  }
+  let diRaw = Buffer.from(inflateRawSync(diCompressed));
+
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  // One shared NUMBERING / BULLET record per call → continuous numbering.
+  let sharedNumberingId = null, sharedBulletId = null;
+  const summary = [];
+  for (const op of ops) {
+    const kind = op.type === 'set_numbered_list' ? 2 : 3;
+    let hit;
+    if (typeof op.target === 'string' && op.target.length > 0) {
+      hit = findTextRangeInSection(secRaw, op.target);
+      if (!hit) throw new Error(`${op.type}: target "${op.target}" not found in body`);
+      hit.start = 0; hit.end = hit.textLength;
+    } else {
+      hit = findParagraphByIndexInSection(secRaw, op.index);
+      if (!hit) throw new Error(`${op.type}: index ${op.index} not found in section`);
+    }
+    if (hit.paraHeaderRec.size < 10) {
+      throw new Error(`${op.type}: PARA_HEADER body too short to read paraShapeId`);
+    }
+    const basePsId = secRaw.readUInt16LE(hit.paraHeaderRec.dataOff + 8);
+    const psBodies = readParaShapeBodies(diRaw);
+    if (basePsId >= psBodies.length) {
+      throw new Error(`${op.type}: basePsId ${basePsId} out of range (have ${psBodies.length})`);
+    }
+    const base = psBodies[basePsId];
+
+    let headingId;
+    if (kind === 2) {
+      if (sharedNumberingId == null) { const r = appendNumberingToDocInfo(diRaw); diRaw = r.newDi; sharedNumberingId = r.newId; }
+      headingId = sharedNumberingId;
+    } else {
+      if (sharedBulletId == null) { const r = appendBulletToDocInfo(diRaw); diRaw = r.newDi; sharedBulletId = r.newId; }
+      headingId = sharedBulletId;
+    }
+
+    const newPsBody = buildParaShapeBody(base, { headingKind: kind, headingId });
+    let newPsId = readParaShapeBodies(diRaw).findIndex((b) => b.equals(newPsBody));
+    if (newPsId < 0) {
+      const psRes = appendParaShapeToDocInfo(diRaw, newPsBody);
+      diRaw = psRes.newDi;
+      newPsId = psRes.newPsId;
+    }
+    secRaw = setParaHeaderShapeId(secRaw, hit.paraHeaderRec, newPsId);
+
+    summary.push({ op: op.type, target: op.target, index: op.index, paraIdx: hit.paraIdx, basePsId, newPsId, headingId });
+  }
+
+  // Deflate + write DocInfo (mirror applyParagraphStyleInPlace).
+  {
+    const inMini = diInMini;
+    const capacity = inMini ? diChain.length * mssz : diChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        diRaw, diChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        diChain = ext.newRegularChain;
+        writeChainBytes(buf, diChain, ssz, ext.compressed);
+        buf.writeInt32LE(diChain[0], diEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        diChain = ext.miniChain;
+        writeMiniChainBytes(buf, diChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(diRaw, capacity, ssz, fat, fatAddrs, diChain, buf, false);
+      buf = ext.buf; fat = ext.fat; diChain = ext.chain;
+      writeChainBytes(buf, diChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    }
+  }
+  // Deflate + write Section0.
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', listed_count: summary.length });
 }
 
 // Build a 53-byte BORDER_FILL body with a solid background fill at the
