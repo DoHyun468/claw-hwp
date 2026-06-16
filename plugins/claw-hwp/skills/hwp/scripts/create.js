@@ -2233,6 +2233,10 @@ async function readStdin() {
   // top-left cell's span, deletes the absorbed cell clusters, fixes the TABLE
   // row-size array). See cell-patch.js mergeCellsInPlace.
   const MERGE_OPS = new Set(['merge_cells']);
+  // Table structure: delete a whole row (raw-patch — TABLE rows−1 + row-size
+  // entry removed, the row's cells deleted, cells below renumbered). See
+  // cell-patch.js deleteTableRowInPlace.
+  const DELROW_OPS = new Set(['delete_table_row']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2262,7 +2266,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2469,6 +2473,13 @@ async function readStdin() {
         const mgSummary = await mergeCellsInPlace(outPath, mergeOps);
         subModes.push(`merge:${mgSummary.mode || 'in-place'}`);
         for (const e of mgSummary) allEdits.push({ kind: 'merge', ...e });
+      }
+      const delRowOps = ops.filter((o) => DELROW_OPS.has(o.type));
+      if (delRowOps.length > 0) {
+        const { deleteTableRowInPlace } = await import('./cell-patch.js');
+        const drSummary = await deleteTableRowInPlace(outPath, delRowOps);
+        subModes.push(`delrow:${drSummary.mode || 'in-place'}`);
+        for (const e of drSummary) allEdits.push({ kind: 'delete_row', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

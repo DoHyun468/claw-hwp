@@ -4674,6 +4674,155 @@ function cellClusterByteRange(records, secRaw, sectionParaIdx, controlIdx, cellI
   return { startByte, endByte };
 }
 
+// Enumerate every cell of the table at (paraIdx, ctrlIdx): its grid address
+// (col@8, row@10, colSpan@12, rowSpan@14), the LIST_HEADER body offset, and the
+// cluster byte range [startByte, endByte) (LIST_HEADER + the cell's paragraphs).
+function tableCellRecords(records, secRaw, sectionParaIdx, controlIdx) {
+  let para = -1, start = -1;
+  for (let i = 0; i < records.length; i++) {
+    if (records[i].tag === TAG_PARA_HEADER && records[i].level === 0) { para++; if (para === sectionParaIdx) { start = i; break; } }
+  }
+  if (start < 0) throw new Error(`paragraph ${sectionParaIdx} not found`);
+  let ctrl = -1, tStart = -1;
+  for (let i = start + 1; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_PARA_HEADER && r.level === 0) break;
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1) { ctrl++; if (ctrl === controlIdx) { tStart = i; break; } }
+  }
+  if (tStart < 0) throw new Error(`control ${controlIdx} not found in paragraph ${sectionParaIdx}`);
+  // table end = next level-0 PARA_HEADER or level-1 CTRL_HEADER
+  let tEnd = records.length;
+  for (let i = tStart + 1; i < records.length; i++) {
+    const r = records[i];
+    if ((r.tag === TAG_PARA_HEADER && r.level === 0) || (r.tag === TAG_CTRL_HEADER && r.level === 1)) { tEnd = i; break; }
+  }
+  const lhIdxs = [];
+  for (let i = tStart + 1; i < tEnd; i++) if (records[i].tag === TAG_LIST_HEADER && records[i].level === 2) lhIdxs.push(i);
+  return lhIdxs.map((recIdx, k) => {
+    const r = records[recIdx];
+    const nextHead = k + 1 < lhIdxs.length ? records[lhIdxs[k + 1]].headOff : (tEnd < records.length ? records[tEnd].headOff : secRaw.length);
+    return {
+      recIdx, lhDataOff: r.dataOff,
+      col: secRaw.readUInt16LE(r.dataOff + 8), row: secRaw.readUInt16LE(r.dataOff + 10),
+      colSpan: secRaw.readUInt16LE(r.dataOff + 12), rowSpan: secRaw.readUInt16LE(r.dataOff + 14),
+      startByte: r.headOff, endByte: nextHead,
+    };
+  });
+}
+
+/**
+ * Delete a whole table row (`delete_table_row`) from an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, row }`. GT-confirmed: TABLE
+ * rows−1 + its row-size array entry for `row` removed (record shrinks), the
+ * row's cell clusters deleted, every cell below renumbered (row−1), and any
+ * cell vertically spanning across the deleted row has its rowSpan−1. A cell
+ * that *starts* in the deleted row with rowSpan>1 is rejected (unmerge first).
+ * Section 0 only.
+ */
+export async function deleteTableRowInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', deleted_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`delete_table_row: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row)) throw new Error("delete_table_row: 'row' (integer) is required");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0, delRow = op.row;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    if (delRow < 0 || delRow >= rows) throw new Error(`delete_table_row: row ${delRow} out of range (table has ${rows} rows)`);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    const removeRanges = [];
+    for (const c of cells) {
+      if (c.row === delRow) {
+        if (c.rowSpan > 1) throw new Error(`delete_table_row: cell (${c.row},${c.col}) spans down (rowSpan ${c.rowSpan}) through row ${delRow} — unmerge first`);
+        removeRanges.push({ startByte: c.startByte, endByte: c.endByte });
+      } else if (c.row < delRow && c.row + c.rowSpan > delRow) {
+        secRaw.writeUInt16LE((c.rowSpan - 1) & 0xFFFF, c.lhDataOff + 14); // spans across → rowSpan−1
+      } else if (c.row > delRow) {
+        secRaw.writeUInt16LE((c.row - 1) & 0xFFFF, c.lhDataOff + 10);     // below → row−1
+      }
+    }
+
+    // Rebuild the TABLE record: rows−1, drop the deleted row's row-size entry.
+    const oldBody = secRaw.slice(tableRec.dataOff, tableRec.dataOff + tableRec.size);
+    const cut = 18 + delRow * 2;
+    const newBody = Buffer.concat([oldBody.slice(0, cut), oldBody.slice(cut + 2)]);
+    newBody.writeUInt16LE((rows - 1) & 0xFFFF, 4);
+    const newTableRec = Buffer.concat([buildRecordHeader(TAG_TABLE, 2, newBody.length), newBody]);
+
+    // Apply all splices high→low so earlier offsets stay valid (TABLE record is
+    // at the lowest offset, so it's applied last). Renumber writes above were
+    // in-place on survivor cells (preserved through the concats).
+    const splices = [
+      { start: tableRec.headOff, end: tableRec.dataOff + tableRec.size, repl: newTableRec },
+      ...removeRanges.map((r) => ({ start: r.startByte, end: r.endByte, repl: Buffer.alloc(0) })),
+    ].sort((a, b) => b.start - a.start);
+    for (const s of splices) secRaw = Buffer.concat([secRaw.slice(0, s.start), s.repl, secRaw.slice(s.end)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, row: delRow, removed: removeRanges.length });
+  }
+  return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
+}
+
 /**
  * Merge a rectangular block of table cells into one, in `.hwp`, via raw-patch.
  *
