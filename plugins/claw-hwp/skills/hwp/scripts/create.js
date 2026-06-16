@@ -2226,6 +2226,9 @@ async function readStdin() {
   // NUMBERING/BULLET id ref (records appended to DocInfo). See cell-patch.js
   // applyListInPlace.
   const LIST_OPS = new Set(['set_numbered_list', 'set_bullet_list']);
+  // Table-cell properties (valign / size / margins) via raw-patch — patches the
+  // cell LIST_HEADER directly (no DocInfo change). See applyCellPropertyInPlace.
+  const CELL_PROP_OPS = new Set(['set_cell_property']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2255,7 +2258,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2448,6 +2451,13 @@ async function readStdin() {
         const lsSummary = await applyListInPlace(outPath, listOps);
         subModes.push(`list:${lsSummary.mode || 'in-place'}`);
         for (const e of lsSummary) allEdits.push({ kind: 'list', ...e });
+      }
+      const cellPropOps = ops.filter((o) => CELL_PROP_OPS.has(o.type));
+      if (cellPropOps.length > 0) {
+        const { applyCellPropertyInPlace } = await import('./cell-patch.js');
+        const cpSummary = await applyCellPropertyInPlace(outPath, cellPropOps);
+        subModes.push(`cell_prop:${cpSummary.mode || 'in-place'}`);
+        for (const e of cpSummary) allEdits.push({ kind: 'cell_prop', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

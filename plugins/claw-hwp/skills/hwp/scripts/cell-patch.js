@@ -4514,6 +4514,126 @@ function resolveBackgroundColor(op) {
   return v;
 }
 
+const HWPUNIT_PER_MM = 283.46;
+// Cell vertical alignment — LIST_HEADER attribute(u32 @ offset 2) bits 21-22.
+// GT-confirmed: h22 cells default to middle (0x00200000); valign bottom →
+// 0x00400000; the merged top cells sit at 0x00000000 (top). So top=0/middle=1/
+// bottom=2 in those 2 bits.
+const CELL_VALIGN = { top: 0, middle: 1, center: 1, bottom: 2 };
+
+/**
+ * Apply table-cell properties (vertical align / height / width / inner margins)
+ * to existing `.hwp` cells via raw-patch. Patches the cell's LIST_HEADER body
+ * directly in Section0 — NO DocInfo change.
+ *
+ * Op `set_cell_property`: `{ section?, para?, control?, row, col, valign?,
+ *   height_mm?, width_mm?, margin_mm? | margins?:[l,r,t,b] }`. Addressing matches
+ *   set_cell_text. LIST_HEADER layout (GT-confirmed): attr@2 (valign bits 21-22),
+ *   width@16 / height@20 (u32 HWPUNIT = mm×283.46), margins L/R/T/B@24/26/28/30
+ *   (u16 HWPUNIT). Section 0 only.
+ */
+export async function applyCellPropertyInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) {
+      throw new Error(`set_cell_property: only section 0 is supported (got section ${op.section})`);
+    }
+    const has = op.valign != null || op.height_mm != null || op.width_mm != null || op.margin_mm != null || Array.isArray(op.margins);
+    if (!has) throw new Error('set_cell_property: at least one of valign / height_mm / width_mm / margin_mm is required');
+    if (op.valign != null && CELL_VALIGN[String(op.valign).toLowerCase()] == null) {
+      throw new Error(`set_cell_property: valign must be top / middle / bottom (got "${op.valign}")`);
+    }
+  }
+  const resolved = await resolveCellIndexes(filePath, ops);
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const mm = (v) => Math.round(v * HWPUNIT_PER_MM);
+  const summary = [];
+  for (const e of resolved) {
+    const para = e.para ?? 0, ctrl = e.control ?? 0;
+    const records = parseRecords(secRaw);
+    const loc = locateCell(records, para, ctrl, e.cellIndex);
+    const o = records[loc.listHeaderRec].dataOff;
+    // Self-check the cell-attr layout (col@8 / row@10) before patching.
+    if (secRaw.readUInt16LE(o + 8) !== e.col || secRaw.readUInt16LE(o + 10) !== e.row) {
+      throw new Error(`set_cell_property: cell-attr layout mismatch at (${e.row},${e.col}) — refusing to patch`);
+    }
+    if (e.valign != null) {
+      const v = CELL_VALIGN[String(e.valign).toLowerCase()];
+      const attr = secRaw.readUInt32LE(o + 2);
+      secRaw.writeUInt32LE(((attr & ~(0x3 << 21)) | (v << 21)) >>> 0, o + 2);
+    }
+    if (e.width_mm != null) secRaw.writeUInt32LE(mm(e.width_mm) >>> 0, o + 16);
+    if (e.height_mm != null) secRaw.writeUInt32LE(mm(e.height_mm) >>> 0, o + 20);
+    const margins = Array.isArray(e.margins) ? e.margins
+      : (e.margin_mm != null ? [e.margin_mm, e.margin_mm, e.margin_mm, e.margin_mm] : null);
+    if (margins) for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + 24 + i * 2);
+    summary.push({ op: e.type, para, control: ctrl, cellIndex: e.cellIndex, row: e.row, col: e.col,
+      valign: e.valign ?? null, height_mm: e.height_mm ?? null, width_mm: e.width_mm ?? null });
+  }
+
+  // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
+}
+
 /**
  * Apply cell-level styling (background / border / diagonal) to existing `.hwp`
  * table cells via raw-patch (no rhwp round-trip, Hancom-Docs-safe).
