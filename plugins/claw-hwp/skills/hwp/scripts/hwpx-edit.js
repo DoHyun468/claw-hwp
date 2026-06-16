@@ -36,7 +36,7 @@
 //   set_bullet_list       { index, char?, level? }                        // bullet (• default; char="▶"|"◯"|"□"|"★" etc. registers a new bullet entry)
 //   set_number_list       { index, level?, style? }                        // numbered list — `style: "korean"` → 1./가./1)/가); `style: "decimal"` → 1./1.1./1.1.1.; omit → use doc's existing numbering id=1 (varies by template)
 //   clear_list            { index }                                        // removes list formatting
-//   apply_text_style      { target, color?, bold?, italic?, underline?, size?, highlight?, strikethrough?, supscript?, subscript?, fontFace? }
+//   apply_text_style      { target, color?, bold?, italic?, underline?, size_pt? (points; or raw size? in HWP units), highlight?, strikethrough?, supscript?, subscript?, fontFace?, letter_spacing? (자간 %), char_ratio? (장평 %) }
 //   apply_paragraph_style { index, align?, indent?, lineSpacing? }
 //   insert_image          { source, ext?, width_mm?, height_mm? (or raw width?/height? in HWPUNIT) }
 //   replace_image         { target, source }
@@ -1834,7 +1834,7 @@ function opApplyTextStyle(doc, target, style) {
   if (style.highlight !== undefined) {
     highlightOut = applyHighlight(doc, target, style.highlight);
   }
-  const charPrKeys = ['color', 'bold', 'italic', 'underline', 'size', 'strikethrough', 'supscript', 'subscript', 'fontFace', 'letter_spacing', 'char_ratio'];
+  const charPrKeys = ['color', 'bold', 'italic', 'underline', 'size', 'size_pt', 'strikethrough', 'supscript', 'subscript', 'fontFace', 'letter_spacing', 'char_ratio'];
   const wantsCharPr = charPrKeys.some((k) => style[k] !== undefined);
   if (!wantsCharPr) {
     return highlightOut ? { target, ...highlightOut } : { target, retargeted: 0 };
@@ -1870,7 +1870,11 @@ function opApplyTextStyle(doc, target, style) {
 
   let attrs = base.attrs.replace(/\s*id="\d+"/, ` id="${useId}"`);
   let inner = base.inner;
-  if (style.size) attrs = setOrAddAttr(attrs, 'height', String(style.size));
+  // Font size: `size_pt` is points (the intuitive unit) → ×100 to HWP char-height
+  // units (10pt = 1000). Raw `size` stays HWP units for back-compat — but note a
+  // value like 22 there is 0.22pt (invisible), so prefer size_pt.
+  if (style.size_pt != null) attrs = setOrAddAttr(attrs, 'height', String(Math.round(Number(style.size_pt) * 100)));
+  else if (style.size) attrs = setOrAddAttr(attrs, 'height', String(style.size));
   if (style.color) attrs = setOrAddAttr(attrs, 'textColor', `#${String(style.color).replace(/^#/, '')}`);
   if (style.bold !== undefined) inner = toggleChild(inner, 'hh:bold', style.bold);
   if (style.italic !== undefined) inner = toggleChild(inner, 'hh:italic', style.italic);
