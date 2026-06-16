@@ -2256,6 +2256,10 @@ async function readStdin() {
   // anchor text). Functional link; not auto-styled blue/underline (layer
   // apply_text_style for that). See cell-patch.js insertHyperlinkInPlace.
   const HYPERLINK_OPS = new Set(['insert_hyperlink']);
+  // 각주 (raw-patch — inline footnote-ref char + a nested footnote-content
+  // cluster; resolves the doc's standard "Footnote" style, no DocInfo write).
+  // See cell-patch.js insertFootnoteInPlace.
+  const FOOTNOTE_OPS = new Set(['insert_footnote']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2285,7 +2289,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2548,6 +2552,13 @@ async function readStdin() {
         const hlSummary = await insertHyperlinkInPlace(outPath, hyperlinkOps);
         subModes.push(`hyperlink:${hlSummary.mode || 'in-place'}`);
         for (const e of hlSummary) allEdits.push({ kind: 'hyperlink', ...e });
+      }
+      const footnoteOps = ops.filter((o) => FOOTNOTE_OPS.has(o.type));
+      if (footnoteOps.length > 0) {
+        const { insertFootnoteInPlace } = await import('./cell-patch.js');
+        const fnSummary = await insertFootnoteInPlace(outPath, footnoteOps);
+        subModes.push(`footnote:${fnSummary.mode || 'in-place'}`);
+        for (const e of fnSummary) allEdits.push({ kind: 'footnote', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

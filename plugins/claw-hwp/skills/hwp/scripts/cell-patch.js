@@ -2951,6 +2951,227 @@ export async function insertHyperlinkInPlace(filePath, ops) {
 }
 
 
+// ── 각주 (footnote) raw-patch ──────────────────────────────────────────────
+//
+// GT-first (footnote_native.hwp, captured from Hancom's 입력 › 주석 › 각주):
+//   - Main paragraph: an inline footnote-reference char (0x0011, ctrl id
+//     "fn  ") is inserted at the anchor; PARA_HEADER char_count += 8 and
+//     control_mask |= (1<<0x11)=0x20000.
+//   - The footnote content is appended as a nested cluster on the same
+//     paragraph (after its other controls):
+//       CTRL_HEADER "fn  "  (lvl1)
+//       LIST_HEADER         (lvl2, nParas=1)
+//       PARA_HEADER         (lvl2) — style = the doc's "Footnote" style index,
+//                                    para_shape/char_shape = that style's refs
+//       PARA_TEXT           (lvl3) — auto-number ctrl (0x0012 "onta") + " " +
+//                                    footnote text + EOP
+//       PARA_CHAR_SHAPE     (lvl3)
+//       CTRL_HEADER "onta"  (lvl3) — the auto-number control
+//
+// DocInfo is only READ, never written: every HWP doc ships a standard
+// "Footnote" style, and the footnote separator line + numbering are rendered
+// by Hancom from the always-present FOOTNOTE_SHAPE records. So this is a
+// resolution (not synthesis) op — self-contained writes stay in Section0.
+const FN_REF_CHAR_HEX   = '110020206e6600000000000000001100'; // 0x0011 + 'fn  ' + 0x0011
+const FN_CTRL_ID        = Buffer.from('20206e66', 'hex');      // '  nf' (= 'fn  ' reversed)
+const FN_LIST_HEADER_HEX = '01000000000000000000000000000000'; // nParas=1
+const FN_AUTONUM_HEX    = '12006f6e746100000000000000001200'; // 0x0012 + 'onta' + 0x0012
+const FN_ONTA_CTRL_HEX  = '6f6e7461010000000100000000002900'; // auto-number CTRL_HEADER
+
+const TAG_STYLE_DI = 0x1a;  // HWPTAG_STYLE in DocInfo
+
+// Read the doc's "Footnote" style: its index (0-based among STYLE records)
+// plus the para_shape and char_shape ids it references.
+function resolveFootnoteStyle(buf) {
+  const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
+  let sidx = 0;
+  for (const r of parseRecords(di)) {
+    if (r.tag !== TAG_STYLE_DI) continue;
+    const sb = di.slice(r.dataOff, r.dataOff + r.size);
+    const nlen = sb.readUInt16LE(0);
+    let off = 2 + nlen * 2;
+    const elen = sb.readUInt16LE(off); off += 2;
+    const eng = sb.slice(off, off + elen * 2).toString('utf16le'); off += elen * 2;
+    // off → prop(u8) next(u8) lang(u16) paraShape(u16) charShape(u16)
+    if (eng === 'Footnote') {
+      return { index: sidx, paraShape: sb.readUInt16LE(off + 4), charShape: sb.readUInt16LE(off + 6) };
+    }
+    sidx++;
+  }
+  // Fallback: no named Footnote style (very unusual) — use style 0 / shape 0.
+  return { index: 0, paraShape: 0, charShape: 0 };
+}
+
+// Build the footnote content cluster (6 records) for the given footnote text.
+function buildFootnoteCluster(text, style, fnInstanceId) {
+  // CTRL_HEADER "fn  " (20B): ctrlId + 01000000 + 00002900 + 00000000 + instanceId
+  const ctrlBody = Buffer.concat([
+    FN_CTRL_ID,
+    Buffer.from('010000000000290000000000', 'hex'),
+    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(fnInstanceId >>> 0, 0); return b; })(),
+  ]);
+  const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, ctrlBody.length), ctrlBody]);
+
+  const listHeader = Buffer.concat([
+    buildRecordHeader(TAG_LIST_HEADER, 2, 16), Buffer.from(FN_LIST_HEADER_HEX, 'hex'),
+  ]);
+
+  // PARA_TEXT (lvl3): auto-number ctrl + " " + text + EOP
+  const ptBody = Buffer.concat([
+    Buffer.from(FN_AUTONUM_HEX, 'hex'), Buffer.from(' ' + text + PARA_TEXT_EOP, 'utf16le'),
+  ]);
+  const charCount = 8 + 1 + text.length + 1; // autonum(8u) + space + text + EOP
+
+  // PARA_HEADER (lvl2, 24B): last-para flag set; style/para_shape resolved.
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(((0x80000000 | (charCount & 0x7FFFFFFF)) >>> 0), 0);
+  ph.writeUInt32LE(0x40000, 4);             // control_mask: char 0x12 (auto-number) present
+  ph.writeUInt16LE(style.paraShape & 0xFFFF, 8);
+  ph.writeUInt8(style.index & 0xFF, 10);    // style id = Footnote style index
+  ph.writeUInt8(0, 11);
+  ph.writeUInt16LE(1, 12);                  // num_char_shapes
+  ph.writeUInt16LE(0, 14);
+  ph.writeUInt16LE(0, 16);                  // line_segs_count
+  ph.writeUInt32LE(0, 18);
+  const paraHeader = Buffer.concat([buildRecordHeader(TAG_PARA_HEADER, 2, 24), ph]);
+
+  const paraText = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 3, ptBody.length), ptBody]);
+
+  const csBody = Buffer.alloc(8);
+  csBody.writeUInt32LE(0, 0);
+  csBody.writeUInt32LE(style.charShape >>> 0, 4);
+  const charShape = Buffer.concat([buildRecordHeader(TAG_PARA_CHAR_SHAPE, 3, 8), csBody]);
+
+  const onta = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 3, 16), Buffer.from(FN_ONTA_CTRL_HEX, 'hex')]);
+
+  return Buffer.concat([ctrl, listHeader, paraHeader, paraText, charShape, onta]);
+}
+
+// Insert a footnote anchored to text. Each op:
+//   { anchor: string, text: string }
+//   - anchor: text the footnote mark goes right after (level-1 PARA_TEXT of a
+//             top-level paragraph)
+//   - text:   the footnote content shown at the bottom of the page
+export async function insertFootnoteInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const fnStyle = resolveFootnoteStyle(buf);
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('footnote: an "anchor" string is required');
+    const text = (typeof op.text === 'string') ? op.text : '';
+    const records = parseRecords(raw);
+
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorEnd = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const body = raw.slice(r.dataOff, r.dataOff + r.size);
+        const at = body.indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorEnd = at + anchorBuf.length; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`footnote: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const fnInstanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Insert the footnote-reference char after the anchor in PARA_TEXT.
+    const refChar = Buffer.from(FN_REF_CHAR_HEX, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const newBody = Buffer.concat([oldBody.slice(0, anchorEnd), refChar, oldBody.slice(anchorEnd)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Footnote content cluster appended at the end of the paragraph's records.
+    const fnCluster = buildFootnoteCluster(text, fnStyle, fnInstanceId);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x20000 (char 0x11).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x20000) >>> 0, phOff + 4);
+
+    // Splice high→low: content cluster at cluster end, then PARA_TEXT replace.
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), fnCluster, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor, text });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's
