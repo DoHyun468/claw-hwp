@@ -51,6 +51,7 @@
 //   insert_hyperlink      { index, url, text } // appends a clickable URL link to paragraph `index`
 //   insert_bookmark       { index, name }      // anchors a named bookmark at the start of paragraph `index`'s first run
 //   insert_equation       { script, index? }   // inserts a Hancom equation (script = equation-syntax); new paragraph after index, else appended
+//   set_columns           { count, gap_mm? }    // multi-column (단) layout; count=1 resets to single, count>=2 = newspaper columns
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2230,6 +2231,34 @@ function opInsertEquation(doc, script, index) {
   return { inserted: true, appended: true, script: scriptText };
 }
 
+// Multi-column (단) layout. Each section's <hp:secPr> carries one
+// <hp:colPr type="NEWSPAPER" colCount="N" sameSz="1" sameGap="G"/>; every plain
+// hwpx ships with colCount="1". Setting colCount=N makes body text flow
+// newspaper-style across N equal columns — verified by capture (the colCount
+// attribute alone drives it; no <hp:colSz> children needed when sameSz="1").
+// `count`=1 resets to single column. `gap_mm` is the inter-column gap.
+function opSetColumns(doc, count, gapMm) {
+  const n = Number(count);
+  if (!Number.isInteger(n) || n < 1) throw new Error('set_columns: count must be an integer >= 1');
+  const gap = n > 1 ? (gapMm != null ? Math.round(Number(gapMm) * 283.46) : 1134) : 0; // mm -> HWPUNIT, default ~4mm
+  let sectionsChanged = 0;
+  for (const name of doc.sectionNames()) {
+    const xml = doc.read(name);
+    const m = xml.match(/<hp:colPr\b[^>]*\/>/);
+    if (!m) continue;
+    let colPr = m[0]
+      .replace(/\bcolCount="\d+"/, `colCount="${n}"`)
+      .replace(/\bsameSz="\d+"/, 'sameSz="1"');
+    colPr = /\bsameGap="\d+"/.test(colPr)
+      ? colPr.replace(/\bsameGap="\d+"/, `sameGap="${gap}"`)
+      : colPr.replace(/\s*\/>$/, ` sameGap="${gap}"/>`);
+    doc.write(name, xml.replace(m[0], colPr));
+    sectionsChanged++;
+  }
+  if (!sectionsChanged) throw new Error('set_columns: no <hp:colPr> found (unexpected for a valid .hwpx)');
+  return { count: n, gapHwpUnit: gap, sectionsChanged };
+}
+
 function applyOp(doc, op) {
   switch (op.type) {
     case 'replace_text': return opReplaceText(doc, op.find, op.replace);
@@ -2268,6 +2297,7 @@ function applyOp(doc, op) {
     case 'insert_hyperlink': return opInsertHyperlink(doc, op.index, op.url, op.text);
     case 'insert_bookmark': return opInsertBookmark(doc, op.index, op.name);
     case 'insert_equation': return opInsertEquation(doc, op.script, op.index);
+    case 'set_columns': return opSetColumns(doc, op.count, op.gap_mm);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }

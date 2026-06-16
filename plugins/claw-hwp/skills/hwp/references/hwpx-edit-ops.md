@@ -214,6 +214,16 @@ A = LEFT [ matrix{1 & 0 # 0 & 1} RIGHT ]  → 행렬
 
 `<` `>` `&` in a script are XML-escaped automatically — write them as-is.
 
+### Columns (다단)
+
+Multi-column layout lives on each section's `<hp:secPr>` as
+`<hp:colPr type="NEWSPAPER" colCount="N" sameSz="1" sameGap="G"/>`; every plain
+hwpx ships with `colCount="1"`.
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `set_columns` | `count`, `gap_mm?` | Sets newspaper-style multi-column layout on **every** section. `count` = number of equal columns (`1` resets to single column; `2`+ makes body text flow top-to-bottom down one column then into the next). `gap_mm` = inter-column gap in mm (default ~4 mm). Renders on Hancom Docs web and desktop. Note: you need enough body text to actually fill column 1 before the flow into column 2 is visible. |
+
 ## Examples
 
 Template fill + a cell edit + a styled run, saved in place:
