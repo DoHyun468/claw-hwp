@@ -2784,6 +2784,173 @@ export async function insertFieldInPlace(filePath, ops) {
 }
 
 
+// ── 하이퍼링크 (hyperlink) raw-patch ───────────────────────────────────────
+//
+// GT-first (hyperlink_native.hwp, captured from Hancom's 입력 › 하이퍼링크):
+// a hyperlink is the same HWP field mechanism as 누름틀 (insertFieldInPlace),
+// except it WRAPS existing anchor text instead of inserting guide text, uses
+// ctrl id '%hlk' (stored reversed as "klh%"), carries a different field
+// command string, and has no 0x57 data record:
+//
+//   PARA_TEXT: … [FIELD_BEGIN 8u] <anchor text> [FIELD_END 8u] …
+//   PARA_HEADER: char_count += 16; control_mask |= 0x18 (chars 0x03 & 0x04)
+//   + CTRL_HEADER '%hlk' (lvl1) with command  "<url>;1;0;0;"  (':' → '\:')
+//
+// v1 ships a FUNCTIONAL link (correct URL, clickable) but does NOT recolor
+// the anchor text blue/underline — Hancom stores that as extra char-shape
+// ranges referencing DocInfo char shapes, which would need DocInfo synthesis.
+// Callers wanting the blue underline can layer apply_text_style on the same
+// anchor text. Self-contained in Section0 — no DocInfo change.
+const HLINK_BEGIN_HEX = '03006b6c682500000000000000000300'; // 0x0003 + '%hlk' + 0x0003
+const HLINK_END_HEX   = '04006b6c680000000000000000000400'; // 0x0004 + '%hlk' + 0x0004
+const HLINK_CTRL_ID   = Buffer.from('6b6c6825', 'hex');      // 'klh%' (= '%hlk' reversed)
+// 5-byte property prefix between ctrlId and the command length (GT verbatim).
+const HLINK_CTRL_PREFIX = Buffer.from([0x00, 0x28, 0x00, 0x00, 0x00]);
+
+function buildHyperlinkCommand(url) {
+  // Hancom escapes ':' as '\:' in the field command (':' is its separator).
+  return `${String(url).replace(/:/g, '\\:')};1;0;0;`;
+}
+
+function buildHyperlinkCtrlRecord(url, instanceId) {
+  const cmd = buildHyperlinkCommand(url);
+  const cmdBuf = Buffer.from(cmd, 'utf16le');
+  const lenBuf = Buffer.alloc(2); lenBuf.writeUInt16LE(cmd.length, 0);
+  const instBuf = Buffer.alloc(4); instBuf.writeUInt32LE(instanceId >>> 0, 0);
+  const body = Buffer.concat([
+    HLINK_CTRL_ID, HLINK_CTRL_PREFIX, lenBuf, cmdBuf, instBuf, Buffer.from([0, 0, 0, 0]),
+  ]);
+  return Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, body.length), body]);
+}
+
+// Turn existing anchor text into a hyperlink. Each op:
+//   { anchor: string, url: string }
+//   - anchor must be plain text in a level-1 PARA_TEXT of a top-level paragraph
+export async function insertHyperlinkInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('hyperlink: an "anchor" string is required');
+    if (!op.url || typeof op.url !== 'string') throw new Error('hyperlink: a "url" string is required');
+    const records = parseRecords(raw);
+
+    // Locate the anchor text inside a level-1 PARA_TEXT of a top-level paragraph.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorStart = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const body = raw.slice(r.dataOff, r.dataOff + r.size);
+        const at = body.indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorStart = at; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`hyperlink: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const instanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Wrap the anchor text: FIELD_BEGIN before it, FIELD_END after it.
+    const fieldBegin = Buffer.from(HLINK_BEGIN_HEX, 'hex');
+    const fieldEnd = Buffer.from(HLINK_END_HEX, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const anchorEnd = anchorStart + anchorBuf.length;
+    const newBody = Buffer.concat([
+      oldBody.slice(0, anchorStart), fieldBegin,
+      oldBody.slice(anchorStart, anchorEnd), fieldEnd,
+      oldBody.slice(anchorEnd),
+    ]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) CTRL_HEADER '%hlk' appended at the end of the paragraph's controls.
+    const ctrlRec = buildHyperlinkCtrlRecord(op.url, instanceId);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 16 (begin+end), control_mask |= 0x18.
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 16)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x18) >>> 0, phOff + 4);
+
+    // Splice high→low: CTRL at cluster end first, then PARA_TEXT replacement.
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), ctrlRec, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor, url: op.url });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's

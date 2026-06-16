@@ -2252,6 +2252,10 @@ async function readStdin() {
   // end chars + a '%clk' CTRL_HEADER command string). Self-contained in
   // Section0; no DocInfo change. See cell-patch.js insertFieldInPlace.
   const FIELD_OPS = new Set(['insert_field']);
+  // 하이퍼링크 (raw-patch — same HWP field mechanism, '%hlk', wraps existing
+  // anchor text). Functional link; not auto-styled blue/underline (layer
+  // apply_text_style for that). See cell-patch.js insertHyperlinkInPlace.
+  const HYPERLINK_OPS = new Set(['insert_hyperlink']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2281,7 +2285,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2537,6 +2541,13 @@ async function readStdin() {
         const fSummary = await insertFieldInPlace(outPath, fieldOps);
         subModes.push(`field:${fSummary.mode || 'in-place'}`);
         for (const e of fSummary) allEdits.push({ kind: 'field', ...e });
+      }
+      const hyperlinkOps = ops.filter((o) => HYPERLINK_OPS.has(o.type));
+      if (hyperlinkOps.length > 0) {
+        const { insertHyperlinkInPlace } = await import('./cell-patch.js');
+        const hlSummary = await insertHyperlinkInPlace(outPath, hyperlinkOps);
+        subModes.push(`hyperlink:${hlSummary.mode || 'in-place'}`);
+        for (const e of hlSummary) allEdits.push({ kind: 'hyperlink', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');
