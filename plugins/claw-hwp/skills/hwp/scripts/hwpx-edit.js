@@ -1934,9 +1934,69 @@ function opApplyTextStyle(doc, target, style) {
   };
 }
 
+// Web-safe paragraph alignment. A cloned-and-mutated paraPr is normalized away
+// by Hancom Docs web (align reverts to LEFT + a spurious number appears) — but a
+// paraPr that reuses an existing clean native one, or is injected from the
+// Hancom-native stub, survives (verified by Hancom-web render + round-trip; same
+// reason injected list paraPrs render). Returns a paraPr id to retarget to, or
+// null if no stub is available (caller falls back to the clone path).
+const ALIGN_VALUES = new Set(['LEFT', 'RIGHT', 'CENTER', 'JUSTIFY', 'DISTRIBUTE', 'BOTH']);
+function paraPrIsPlain(inner) {
+  const vals = [...inner.matchAll(/<h[hc]:(intent|left|right|prev|next)\b[^>]*\bvalue="(-?\d+)"/g)].map((m) => Number(m[2]));
+  return vals.length > 0 && vals.every((v) => v === 0);
+}
+function ensureCleanAlignParaPr(doc, align) {
+  const al = String(align || '').toUpperCase();
+  if (!ALIGN_VALUES.has(al)) throw new Error(`apply_paragraph_style: align must be one of ${[...ALIGN_VALUES].join('/')}`);
+  const headerName = doc.headerName();
+  if (!headerName) return null;
+  let header = doc.read(headerName);
+  // 1. Reuse an existing clean (heading NONE, default margins) paraPr with this align.
+  for (const pp of scanTopLevel(header, 'hh:paraPr')) {
+    const h = (pp.inner.match(/<hh:heading\s+type="([^"]+)"/) || [])[1];
+    const a = (pp.inner.match(/<hh:align\b[^>]*horizontal="([^"]+)"/) || [])[1];
+    if (h === 'NONE' && a === al && paraPrIsPlain(pp.inner)) return getAttr(pp.attrs, 'id');
+  }
+  // 2. Inject a clean paraPr built from the Hancom-native stub (heading NONE, this align).
+  const stubPath = path.join(__dirname, 'templates', 'hancom_native_stub.hwpx');
+  if (!fs.existsSync(stubPath)) return null;
+  let stubFiles;
+  try { stubFiles = unzipSync(new Uint8Array(fs.readFileSync(stubPath))); } catch { return null; }
+  const stubHeader = strFromU8(stubFiles['Contents/header.xml'] || new Uint8Array());
+  const tmpl = (stubHeader.match(/<hh:paraPr id="2"[^>]*>[\s\S]*?<\/hh:paraPr>/) || [])[0];
+  if (!tmpl) return null;
+  const ids = [...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map((m) => Number(m[1]));
+  const newPpId = String((ids.length ? Math.max(...ids) : 0) + 1);
+  const clean = tmpl
+    .replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${newPpId}"`)
+    .replace(/<hh:heading\s+type="[^"]*"\s+idRef="[^"]*"\s+level="[^"]*"\/>/, '<hh:heading type="NONE" idRef="0" level="0"/>')
+    .replace(/<hh:align\b[^>]*\/>/, `<hh:align horizontal="${al}" vertical="BASELINE"/>`);
+  header = header.replace('</hh:paraProperties>', clean + '</hh:paraProperties>');
+  header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + 1) + b);
+  if (!/<hh:head[^>]*xmlns:hwpunitchar=/.test(header)) {
+    header = header.replace(/(<hh:head[^>]*?xmlns:ooxmlchart="[^"]+")/, '$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"');
+  }
+  doc.write(headerName, header);
+  return newPpId;
+}
+
 function opApplyParagraphStyle(doc, index, style) {
   const headerName = doc.headerName();
   if (!headerName) throw new Error('apply_paragraph_style: Contents/header.xml missing');
+  // Web-safe fast path: a plain alignment change (no indent/lineSpacing/spacing).
+  // Reuse/inject a clean native-structured aligned paraPr so Hancom web keeps it.
+  if (style.align && style.indent === undefined && style.lineSpacing === undefined) {
+    const pprId = ensureCleanAlignParaPr(doc, style.align);
+    if (pprId != null) {
+      const paras0 = doc.paragraphs();
+      if (index < 0 || index >= paras0.length) throw new Error(`apply_paragraph_style: index ${index} out of range`);
+      const { section, el } = paras0[index];
+      const newOpen = el.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${pprId}"`);
+      doc.write(section, spliceEl(doc.read(section), el, `<hp:p${newOpen}>${dropLinesegs(el.inner)}</hp:p>`));
+      return { index, paraPrId: pprId, align: String(style.align).toUpperCase(), webSafe: true };
+    }
+    // no stub available → fall through to the clone path
+  }
   let header = doc.read(headerName);
   const paraPrs = scanTopLevel(header, 'hh:paraPr');
   if (!paraPrs.length) throw new Error('apply_paragraph_style: no <hh:paraPr> in header.xml');
