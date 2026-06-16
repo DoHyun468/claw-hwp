@@ -55,6 +55,7 @@
 //   set_page_setup        { size?, orientation?, width_mm?, height_mm?, margin_mm? }  // 편집 용지 (paper size/orientation/margins)
 //   insert_chart          { chart_type?, cat?, series? }  // chart: col/bar/line/area/pie (or 0-19); series=[{name,values:[]}], cat=[labels]
 //   insert_shape          { shape, index?, width_mm?, height_mm?, fill_color?, line_color? }  // 도형: rect | ellipse | line
+//   set_column_break      { index, on? }    // 단 나누기 (column break before paragraph index)
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -964,6 +965,20 @@ function opSetPageBreak(doc, index, on) {
   return { index, pageBreak: want === '1' };
 }
 
+// Column break (단 나누기) — like set_page_break but the <hp:p columnBreak="1">
+// flag, which pushes the paragraph to the next column in a multi-column layout.
+function opSetColumnBreak(doc, index, on) {
+  const paras = doc.paragraphs();
+  if (index < 0 || index >= paras.length) throw new Error(`set_column_break: index ${index} out of range (0..${paras.length - 1})`);
+  const { section, el } = paras[index];
+  const want = on === false ? '0' : '1';
+  const newAttrs = /columnBreak="\d"/.test(el.attrs)
+    ? el.attrs.replace(/columnBreak="\d"/, `columnBreak="${want}"`)
+    : el.attrs + ` columnBreak="${want}"`;
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:p${newAttrs}>${el.inner}</hp:p>`));
+  return { index, columnBreak: want === '1' };
+}
+
 // Look up a <hh:bullet> by its `char` attribute, or append a new one to
 // <hh:bullets> and return its id. char="▶" / "◯" / "□" / "★" all work —
 // Hancom Docs reads the char and renders it. When `char` is empty/missing,
@@ -1597,7 +1612,7 @@ function opApplyTextStyle(doc, target, style) {
   if (style.highlight !== undefined) {
     highlightOut = applyHighlight(doc, target, style.highlight);
   }
-  const charPrKeys = ['color', 'bold', 'italic', 'underline', 'size', 'strikethrough', 'supscript', 'subscript', 'fontFace'];
+  const charPrKeys = ['color', 'bold', 'italic', 'underline', 'size', 'strikethrough', 'supscript', 'subscript', 'fontFace', 'letter_spacing', 'char_ratio'];
   const wantsCharPr = charPrKeys.some((k) => style[k] !== undefined);
   if (!wantsCharPr) {
     return highlightOut ? { target, ...highlightOut } : { target, retargeted: 0 };
@@ -1654,6 +1669,17 @@ function opApplyTextStyle(doc, target, style) {
     inner = inner.replace(/<hh:supscript\b[^>]*\/>/g, '').replace(/<hh:subscript\b[^>]*\/>/g, '');
     if (style.supscript) inner = inner + '<hh:supscript/>';
     else if (style.subscript) inner = inner + '<hh:subscript/>';
+  }
+  // 장평(char width %) lives in <hh:ratio>, 자간(letter spacing %) in
+  // <hh:spacing> — one value per language script. Every charPr has both, so
+  // replace the existing element in place.
+  if (style.char_ratio !== undefined) {
+    const r = Number(style.char_ratio);
+    inner = inner.replace(/<hh:ratio\b[^>]*\/>/, `<hh:ratio hangul="${r}" latin="${r}" hanja="${r}" japanese="${r}" other="${r}" symbol="${r}" user="${r}"/>`);
+  }
+  if (style.letter_spacing !== undefined) {
+    const sp = Number(style.letter_spacing);
+    inner = inner.replace(/<hh:spacing\b[^>]*\/>/, `<hh:spacing hangul="${sp}" latin="${sp}" hanja="${sp}" japanese="${sp}" other="${sp}" symbol="${sp}" user="${sp}"/>`);
   }
   // fontFace: rewrite every lang slot of <hh:fontRef> to the font's id, the
   // way Hancom Docs stores 폰트 변경.
@@ -2546,6 +2572,7 @@ function applyOp(doc, op) {
     case 'set_page_setup': return opSetPageSetup(doc, op);
     case 'insert_chart': return opInsertChart(doc, op);
     case 'insert_shape': return opInsertShape(doc, op);
+    case 'set_column_break': return opSetColumnBreak(doc, op.index, op.on);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
