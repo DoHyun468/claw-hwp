@@ -4823,6 +4823,126 @@ export async function deleteTableRowInPlace(filePath, ops) {
   return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
 }
 
+/**
+ * Split one table cell into N stacked rows (`split_cell`) in an existing
+ * `.hwp` via raw-patch. Op: `{ section?, para?, control?, row, col, into_rows? }`
+ * (into_rows default 2). GT-confirmed (Hancom 셀 나누기, 3 samples): the cell
+ * keeps its content as the top piece; N−1 new blank cells appear below it in
+ * the same column; every OTHER cell in the row grows rowSpan by N−1 to keep the
+ * grid rectangular; the table gains N−1 rows (each new row-size entry = 1, since
+ * only the split column has a fresh cell there); cells below are renumbered.
+ * Only a plain 1×1 cell can be split. Section 0 only. (Vertical split only —
+ * the Hancom tool emits this regardless of its row/col args.)
+ */
+export async function splitCellInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', split_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`split_cell: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row) || !Number.isInteger(op.col)) throw new Error("split_cell: 'row' and 'col' (integers) are required");
+    if (op.into_rows != null && (!Number.isInteger(op.into_rows) || op.into_rows < 2)) throw new Error('split_cell: into_rows must be an integer ≥ 2');
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0, R = op.row, C = op.col, N = op.into_rows ?? 2;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+    const target = cells.find((c) => c.row === R && c.col === C);
+    if (!target) throw new Error(`split_cell: cell (${R},${C}) not found`);
+    if (target.colSpan > 1 || target.rowSpan > 1) throw new Error(`split_cell: cell (${R},${C}) is merged (${target.colSpan}×${target.rowSpan}) — only a plain 1×1 cell can be split`);
+
+    // other cells in the same row grow rowSpan by N−1 (keep grid rectangular)
+    for (const c of cells) if (c.row === R && c.col !== C) secRaw.writeUInt16LE((c.rowSpan + N - 1) & 0xFFFF, c.lhDataOff + 14);
+    // cells below shift down
+    for (const c of cells) if (c.row > R) secRaw.writeUInt16LE((c.row + N - 1) & 0xFFFF, c.lhDataOff + 10);
+
+    // N−1 new blank cells at (R+1..R+N−1, C), cloned from an empty cell in col C
+    const tmpl = cells.find((c) => c.col === C && c.colSpan === 1 && c.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(c.startByte, c.endByte)))
+      || cells.find((c) => c.colSpan === 1 && c.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(c.startByte, c.endByte)));
+    if (!tmpl) throw new Error(`split_cell: no empty 1×1 cell to clone for the new cell(s)`);
+    const newCells = [];
+    for (let k = 1; k < N; k++) newCells.push(cloneCellCluster(secRaw.slice(tmpl.startByte, tmpl.endByte), R + k, C));
+    const newCellsBuf = Buffer.concat(newCells);
+    let insOff = null;
+    for (const c of cells) { if (c.row >= R + 1) { insOff = c.startByte; break; } }
+    if (insOff == null) insOff = cells.length ? cells[cells.length - 1].endByte : (tableRec.dataOff + tableRec.size);
+
+    // TABLE: rows + (N−1); insert (N−1) row-size entries (=1) at index R+1
+    const oldBody = secRaw.slice(tableRec.dataOff, tableRec.dataOff + tableRec.size);
+    const insAt = 18 + (R + 1) * 2;
+    const rsEntries = Buffer.alloc((N - 1) * 2); for (let k = 0; k < N - 1; k++) rsEntries.writeUInt16LE(1, k * 2);
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), rsEntries, oldBody.slice(insAt)]);
+    newBody.writeUInt16LE((rows + N - 1) & 0xFFFF, 4);
+    const newTableRec = Buffer.concat([buildRecordHeader(TAG_TABLE, 2, newBody.length), newBody]);
+
+    const splices = [
+      { start: insOff, end: insOff, repl: newCellsBuf },
+      { start: tableRec.headOff, end: tableRec.dataOff + tableRec.size, repl: newTableRec },
+    ].sort((a, b) => b.start - a.start);
+    for (const s of splices) secRaw = Buffer.concat([secRaw.slice(0, s.start), s.repl, secRaw.slice(s.end)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, row: R, col: C, into_rows: N });
+  }
+  return Object.assign(summary, { mode: 'in-place', split_count: summary.length });
+}
+
 // True if a cell cluster holds just an empty paragraph (PARA_HEADER text_count
 // ≤ 1 = the EOP terminator only) — safe to clone as a fresh blank cell.
 function isEmptyCellCluster(clusterBytes) {
