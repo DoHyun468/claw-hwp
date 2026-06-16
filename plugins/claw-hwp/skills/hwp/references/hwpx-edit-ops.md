@@ -224,6 +224,12 @@ hwpx ships with `colCount="1"`.
 |--------|------|-------|
 | `set_columns` | `count`, `gap_mm?` | Sets newspaper-style multi-column layout on **every** section. `count` = number of equal columns (`1` resets to single column; `2`+ makes body text flow top-to-bottom down one column then into the next). `gap_mm` = inter-column gap in mm (default ~4 mm). Renders on Hancom Docs web and desktop. Note: you need enough body text to actually fill column 1 before the flow into column 2 is visible. |
 
+### Page setup (편집 용지)
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `set_page_setup` | `size?`, `orientation?`, `width_mm?`, `height_mm?`, `margin_mm?` | Rewrites every section's `<hp:pagePr>` (paper size) + `<hp:margin>`. `size` preset: `a3`/`a4`/`a5`/`b4`/`b5`/`letter`/`legal`. `orientation`: `portrait` / `landscape` (swaps width↔height — landscape = width > height; the pagePr `landscape` enum is a separate binding hint, left as-is). `width_mm` / `height_mm` set an exact size instead of a preset. `margin_mm` sets all four page margins (mm). Renders on Hancom Docs web (landscape capture-verified). |
+
 ## Examples
 
 Template fill + a cell edit + a styled run, saved in place:

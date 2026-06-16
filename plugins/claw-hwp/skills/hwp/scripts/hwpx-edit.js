@@ -52,6 +52,7 @@
 //   insert_bookmark       { index, name }      // anchors a named bookmark at the start of paragraph `index`'s first run
 //   insert_equation       { script, index? }   // inserts a Hancom equation (script = equation-syntax); new paragraph after index, else appended
 //   set_columns           { count, gap_mm? }    // multi-column (단) layout; count=1 resets to single, count>=2 = newspaper columns
+//   set_page_setup        { size?, orientation?, width_mm?, height_mm?, margin_mm? }  // 편집 용지 (paper size/orientation/margins)
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2259,6 +2260,46 @@ function opSetColumns(doc, count, gapMm) {
   return { count: n, gapHwpUnit: gap, sectionsChanged };
 }
 
+// Page setup (편집 용지) — paper size, orientation, margins. Each section's
+// <hp:secPr> holds <hp:pagePr width="W" height="H"> (HWPUNIT; A4 portrait =
+// 59528 x 84186) and <hp:margin top/bottom/left/right/header/footer/gutter>.
+// Orientation follows width-vs-height (W>H = landscape); the pagePr `landscape`
+// enum is a separate binding hint we leave alone. Applies to every section.
+const PAGE_SIZES_MM = { a3: [297, 420], a4: [210, 297], a5: [148, 210], b4: [257, 364], b5: [176, 250], letter: [215.9, 279.4], legal: [215.9, 355.6] };
+function opSetPageSetup(doc, opts) {
+  opts = opts || {};
+  const toHu = (mm) => Math.round(Number(mm) * 283.46);
+  let sectionsChanged = 0;
+  for (const name of doc.sectionNames()) {
+    let xml = doc.read(name);
+    const pm = xml.match(/<hp:pagePr\b[^>]*?>/);
+    if (!pm) continue;
+    let pagePr = pm[0];
+    let w = Number((pagePr.match(/\bwidth="(\d+)"/) || [])[1] || 59528);
+    let h = Number((pagePr.match(/\bheight="(\d+)"/) || [])[1] || 84186);
+    const preset = opts.size && PAGE_SIZES_MM[String(opts.size).toLowerCase()];
+    if (preset) { w = toHu(preset[0]); h = toHu(preset[1]); }
+    if (opts.width_mm != null) w = toHu(opts.width_mm);
+    if (opts.height_mm != null) h = toHu(opts.height_mm);
+    if (opts.orientation) {
+      const land = String(opts.orientation).toLowerCase() === 'landscape';
+      if ((land && w < h) || (!land && w > h)) [w, h] = [h, w];
+    }
+    pagePr = pagePr.replace(/\bwidth="\d+"/, `width="${w}"`).replace(/\bheight="\d+"/, `height="${h}"`);
+    xml = xml.replace(pm[0], pagePr);
+    if (opts.margin_mm != null) {
+      const g = toHu(opts.margin_mm);
+      xml = xml.replace(/<hp:margin\b[^>]*?\/>/, (m) =>
+        m.replace(/\bleft="\d+"/, `left="${g}"`).replace(/\bright="\d+"/, `right="${g}"`)
+         .replace(/\btop="\d+"/, `top="${g}"`).replace(/\bbottom="\d+"/, `bottom="${g}"`));
+    }
+    doc.write(name, xml);
+    sectionsChanged++;
+  }
+  if (!sectionsChanged) throw new Error('set_page_setup: no <hp:pagePr> found (unexpected for a valid .hwpx)');
+  return { sectionsChanged };
+}
+
 function applyOp(doc, op) {
   switch (op.type) {
     case 'replace_text': return opReplaceText(doc, op.find, op.replace);
@@ -2298,6 +2339,7 @@ function applyOp(doc, op) {
     case 'insert_bookmark': return opInsertBookmark(doc, op.index, op.name);
     case 'insert_equation': return opInsertEquation(doc, op.script, op.index);
     case 'set_columns': return opSetColumns(doc, op.count, op.gap_mm);
+    case 'set_page_setup': return opSetPageSetup(doc, op);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
