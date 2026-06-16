@@ -2216,6 +2216,11 @@ async function readStdin() {
   // for the PARA_SHAPE body, HWPTAG_ID_MAPPINGS counter bumps, and
   // PARA_HEADER paraShapeId handling.
   const APPLY_PARAGRAPH_STYLE_OPS = new Set(['apply_paragraph_style']);
+  // Cell styling via raw-patch — background shading, borders, diagonals.
+  // Each merges its change into the cell's EXISTING BorderFill (preserving the
+  // parts it doesn't touch) and repoints just that cell's LIST_HEADER
+  // borderFillId. See cell-patch.js applyCellStyleInPlace.
+  const CELL_STYLE_OPS = new Set(['set_cell_background', 'set_cell_border', 'set_cell_diagonal']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2245,7 +2250,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2424,6 +2429,13 @@ async function readStdin() {
         const psSummary = await applyParagraphStyleInPlace(outPath, paraStyleOps);
         subModes.push(`paragraph_style:${psSummary.mode || 'in-place'}`);
         for (const e of psSummary) allEdits.push({ kind: 'paragraph_style', ...e });
+      }
+      const cellStyleOps = ops.filter((o) => CELL_STYLE_OPS.has(o.type));
+      if (cellStyleOps.length > 0) {
+        const { applyCellStyleInPlace } = await import('./cell-patch.js');
+        const csSummary = await applyCellStyleInPlace(outPath, cellStyleOps);
+        subModes.push(`cell_style:${csSummary.mode || 'in-place'}`);
+        for (const e of csSummary) allEdits.push({ kind: 'cell_style', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

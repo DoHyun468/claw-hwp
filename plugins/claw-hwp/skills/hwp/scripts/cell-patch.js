@@ -4054,6 +4054,120 @@ function appendBorderFillToDocInfo(diRaw, body) {
   return { newDi, newBfId: bfCount + 1 };
 }
 
+// Read every HWPTAG_BORDER_FILL body in DocInfo, in document order. The
+// array is 0-indexed; a cell/paragraph's 1-based borderFillId references
+// element (id - 1). Mirrors readParaShapeBodies.
+function readBorderFillBodies(diRaw) {
+  const out = [];
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === TAG_BORDER_FILL) {
+      out.push(diRaw.slice(r.dataOff, r.dataOff + r.size));
+    }
+  }
+  return out;
+}
+
+// Merge a solid background fill into an EXISTING BorderFill body, preserving
+// that body's border + diagonal styling. This is what makes cell shading
+// safe: a table cell already references a BorderFill that draws its 4
+// borders, so we must keep those bytes and only (re)write the fill block —
+// otherwise the cell loses its borders and becomes a bare colored box.
+//
+// Layout: the border + diagonal block is a FIXED 32 bytes regardless of
+// fill type —
+//   [0-1]   attribute u16
+//   [2-7]   left border    (type, width, COLORREF)
+//   [8-13]  right border
+//   [14-19] top border
+//   [20-25] bottom border
+//   [26-31] diagonal       (type, width, COLORREF)
+// The fill block starts at offset 32 and its length depends on fill_type,
+// so a cell with NO current fill has a shorter body. We therefore rebuild a
+// full 53-byte body: copy [0..31] from the base, then append the same solid
+// fill block buildBorderFillSolidBody emits (which the paragraph-shading
+// path has verified renders in Hancom Docs).
+function mergeSolidFillIntoBorderFillBody(baseBody, hexColor, pattern = 'rhwp') {
+  const out = Buffer.alloc(53);
+  // Preserve borders + diagonal. A valid BorderFill body is always >= 32
+  // bytes (all four borders + diagonal are present even when "none"); the
+  // Math.min guard is purely defensive against a malformed short record.
+  baseBody.copy(out, 0, 0, Math.min(32, baseBody.length));
+  // Solid fill block — identical to buildBorderFillSolidBody, EXCEPT we do
+  // not touch the diagonal-type byte at offset 26 (that belongs to the
+  // preserved border block above; the 'hancom' size_marker variant only
+  // differs in offset 48).
+  if (pattern !== 'hancom') {
+    out.writeUInt32LE(1, 48);           // size_marker (rhwp pattern)
+  }
+  out.writeUInt32LE(1, 32);             // fill_type = solid
+  out.writeUInt32LE(parseColorBGR(hexColor) >>> 0, 36);
+  out.writeUInt32LE(0x00999999, 40);    // pattern_color = #999999
+  out.writeInt32LE(-1, 44);             // pattern_type = -1
+  return out;
+}
+
+// HWP border/diagonal line "종류" (type) enum. 0=none, 1=solid, then dashed/
+// dotted/double. We expose the common few; others fall back to solid.
+const LINE_TYPE = { none: 0, solid: 1, dash: 2, dashed: 2, dot: 3, dotted: 3, double: 4 };
+// Byte offset of each border side inside a BorderFill body. Each side is 6
+// bytes: type[+0], width[+1], color COLORREF[+2..+5].
+const BORDER_SIDE_OFF = { left: 2, right: 8, top: 14, bottom: 20 };
+
+// Set one or more cell borders, PRESERVING the body's fill + diagonal + the
+// other sides. `sides` = 'all' or an array of 'left'|'right'|'top'|'bottom'.
+// Default is a thin solid black line — the exact encoding existing Hancom
+// table cells use for their visible grid (type=1, width=1, color=#000000).
+function mergeBordersIntoBorderFillBody(baseBody, sides, hexColor = '#000000', lineType = 1, width = 1) {
+  const out = Buffer.alloc(Math.max(baseBody.length, 32)); // ensure full border block
+  baseBody.copy(out, 0);
+  const color = parseColorBGR(hexColor) >>> 0;
+  const list = (sides === 'all' || (Array.isArray(sides) && sides.includes('all')))
+    ? ['left', 'right', 'top', 'bottom']
+    : (Array.isArray(sides) ? sides : [sides]);
+  for (const side of list) {
+    const o = BORDER_SIDE_OFF[side];
+    if (o == null) throw new Error(`set_cell_border: unknown side "${side}" (use left/right/top/bottom/all)`);
+    out.writeUInt8(lineType & 0xFF, o);
+    out.writeUInt8(width & 0xFF, o + 1);
+    out.writeUInt32LE(color, o + 2);
+  }
+  return out;
+}
+
+// Diagonal direction → BorderFill attribute(u16) bits. The attribute carries
+// two 3-bit diagonal fields (value 1 = basic straight diagonal) at bits 3-5
+// and 6-8. Mapped here by the GLYPH each value actually RENDERS (capture-
+// verified 2026-06-16), which is what users expect:
+//   slash ／  (bottom-left→top-right)  → bit 3 = 0x08
+//   backslash ＼ (top-left→bottom-right) → bit 6 = 0x40
+//   x ╳ (both)                          → 0x48
+// NOTE the field/glyph naming is counter-intuitive: 0x08 lives in the byte
+// the HWP spec labels "BackSlash" yet Hancom draws it as ／, and the Hancom
+// web `cell-style --diagonal backslash` likewise emits 0x08 (= ／). We name
+// by rendered glyph, not the spec/tool label. The diagonal LINE at [26-31]
+// (type/width/color via parseColorBGR) matches Hancom rendering byte-for-byte.
+const DIAG_ATTR = { slash: 1 << 3, backslash: 1 << 6, x: (1 << 3) | (1 << 6), both: (1 << 3) | (1 << 6) };
+
+// Set a cell diagonal (대각선), PRESERVING fill + borders. Writes the diagonal
+// line at [26-31] (type/width/color) AND OR-s the direction bits into the
+// attribute u16 [0-1]. `kind` = 'slash'(／) | 'backslash'(＼) | 'x'(╳).
+function mergeDiagonalIntoBorderFillBody(baseBody, kind, hexColor = '#000000', lineType = 1, width = 1) {
+  const out = Buffer.alloc(Math.max(baseBody.length, 32));
+  baseBody.copy(out, 0);
+  const bits = DIAG_ATTR[kind];
+  if (bits == null) throw new Error(`set_cell_diagonal: unknown direction "${kind}" (use slash/backslash/x)`);
+  out.writeUInt16LE((out.readUInt16LE(0) | bits) & 0xFFFF, 0); // attribute direction bits
+  out.writeUInt8(lineType & 0xFF, 26);                          // diagonal line type
+  out.writeUInt8(width & 0xFF, 27);                             // diagonal width
+  // Diagonal color = standard COLORREF 0x00BBGGRR, SAME as the border/fill
+  // fields (parseColorBGR). Capture-verified: #ff0000 must render red, which
+  // needs 0x000000ff (BGR), not 0x00ff0000. (The Hancom-web cell-style GT
+  // happens to store it straight-RGB = its own R↔B quirk that renders the
+  // wrong color; we don't copy that — we store what renders correctly.)
+  out.writeUInt32LE(parseColorBGR(hexColor) >>> 0, 28);         // diagonal color (BGR)
+  return out;
+}
+
 // Rewrite PARA_HEADER body offset 8-9 (u16) with `newPsId`. Returns updated
 // section buffer.
 function setParaHeaderShapeId(secRaw, paraHeaderRec, newPsId) {
@@ -4160,6 +4274,242 @@ function resolveBackgroundColor(op) {
   if (v == null || v === false) return null;
   if (v === true) return '#ffff00';
   return v;
+}
+
+/**
+ * Apply cell-level styling (background / border / diagonal) to existing `.hwp`
+ * table cells via raw-patch (no rhwp round-trip, Hancom-Docs-safe).
+ *
+ * Ops (by `type`):
+ *   - `set_cell_background` — `{ section?, para?, control?, row, col, background_color }`
+ *   - `set_cell_border`     — `{ ..., sides, color?, width?, line_type? }`
+ *   - `set_cell_diagonal`   — `{ ..., direction, color?, width?, line_type? }`
+ *       direction = 'slash' ／ | 'backslash' ＼ | 'x' ╳ (GT/capture-verified).
+ *   section/para/control default to 0 (first table on the first body paragraph
+ *   of Section0). row/col are 0-based; resolveCellIndexes maps them to a flat
+ *   cell index via rhwp — the same addressing set_cell_text uses.
+ *
+ * Mechanism: a cell's styling all lives in ONE BorderFill that its LIST_HEADER
+ * references (the borderFillID u16 at a FIXED offset 32 in the level-2
+ * LIST_HEADER body — NOT the last u16; see locateCell usage below). For each
+ * op we read the cell's current BorderFill body, MERGE only the requested
+ * change while preserving the rest (background keeps borders+diagonal; border
+ * keeps fill+diagonal; diagonal keeps fill+borders), append the result to
+ * DocInfo (or reuse an identical existing one), and repoint just this cell.
+ * Sibling cells keep their own BorderFill, so only the targeted cell changes.
+ *
+ * First cut: Section0 only (matching applyParagraphStyleInPlace). A non-zero
+ * section throws a clear error.
+ */
+export async function applyCellStyleInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) {
+      throw new Error(`${op.type}: only section 0 is supported in the raw-patch path (got section ${op.section})`);
+    }
+    if (op.type === 'set_cell_background' && !resolveBackgroundColor(op)) {
+      throw new Error('set_cell_background: background_color is required (e.g. "#dfe6f0")');
+    }
+    if (op.type === 'set_cell_border' && !op.sides) {
+      throw new Error('set_cell_border: sides is required ("all" or ["top","bottom","left","right"])');
+    }
+    if (op.type === 'set_cell_diagonal' && !(op.direction || op.kind)) {
+      throw new Error('set_cell_diagonal: direction is required (slash / backslash / x)');
+    }
+  }
+
+  // Resolve (row,col) → flat cellIndex via rhwp (same as set_cell_text).
+  const resolved = await resolveCellIndexes(filePath, ops);
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const diEntry = findStreamEntry(entries, ['DocInfo']);
+  const diInMini = diEntry.size < 4096;
+  let diChain, diCompressed;
+  if (diInMini) {
+    const rc = ensureRootChain();
+    diChain = walkChain(minifat, diEntry.start);
+    diCompressed = readMiniChainBytes(buf, diChain, rc, ssz, mssz, diEntry.size);
+  } else {
+    diChain = walkChain(fat, diEntry.start);
+    diCompressed = readChainBytes(buf, diChain, ssz, diEntry.size);
+  }
+  let diRaw = Buffer.from(inflateRawSync(diCompressed));
+
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const summary = [];
+  for (const e of resolved) {
+    const para = e.para ?? 0;
+    const ctrl = e.control ?? 0;
+    const bg = resolveBackgroundColor(e);
+
+    // Re-parse per op: the only secRaw mutation below is a 2-byte in-place
+    // borderFillId write, which doesn't shift record offsets, so a fresh
+    // parse stays valid across ops.
+    const records = parseRecords(secRaw);
+    const loc = locateCell(records, para, ctrl, e.cellIndex);
+    const listRec = records[loc.listHeaderRec];
+    // A table-cell LIST_HEADER body lays out (after an 8-byte generic list
+    // header): col@8, row@10, colSpan@12, rowSpan@14, width@16, height@20,
+    // margins L/R/T/B @24/26/28/30, then borderFillID @32. The borderFillID
+    // is at a FIXED offset 32 — NOT the last u16. (rhwp emits exactly-34-byte
+    // cell bodies so size-2 lands on 32 by coincidence, but real-form cell
+    // bodies carry trailing bytes after the borderFillID; remapCluster's
+    // size-2 trick only works on rhwp's synthesized clusters.)
+    const CELL_BFID_OFFSET = 32;
+    if (listRec.size < CELL_BFID_OFFSET + 2) {
+      throw new Error(`set_cell_background: LIST_HEADER body too short (${listRec.size}b) for a table-cell borderFillID`);
+    }
+    // Self-check the layout: col@8 / row@10 must match the resolved cell, or
+    // the fixed offset assumption is wrong for this file — fail loudly rather
+    // than corrupt an unrelated u16.
+    const bodyCol = secRaw.readUInt16LE(listRec.dataOff + 8);
+    const bodyRow = secRaw.readUInt16LE(listRec.dataOff + 10);
+    if (bodyCol !== e.col || bodyRow !== e.row) {
+      throw new Error(`set_cell_background: cell-attr layout mismatch (body col/row ${bodyCol}/${bodyRow} != requested ${e.col}/${e.row}); borderFillID offset unreliable for this file`);
+    }
+    const bfRefOff = listRec.dataOff + CELL_BFID_OFFSET;
+    const curBfId = secRaw.readUInt16LE(bfRefOff);
+
+    // Base body to merge onto: the cell's current BorderFill (1-based;
+    // 0 = "no fill" sentinel → start from a full all-zero body, which carries
+    // the border+diagonal block and an explicit fill_type=0).
+    const bfBodies = readBorderFillBodies(diRaw);
+    const baseBody = (curBfId >= 1 && curBfId - 1 < bfBodies.length)
+      ? bfBodies[curBfId - 1]
+      : Buffer.alloc(53);
+
+    // Read-merge-write per op type — each preserves the parts it doesn't touch
+    // (background keeps borders/diagonal; border keeps fill/diagonal; diagonal
+    // keeps fill/borders).
+    let newBody;
+    if (e.type === 'set_cell_border') {
+      newBody = mergeBordersIntoBorderFillBody(
+        baseBody, e.sides ?? 'all',
+        e.color ?? e.border_color ?? '#000000',
+        LINE_TYPE[String(e.line_type ?? 'solid').toLowerCase()] ?? 1,
+        Number(e.width ?? 1));
+    } else if (e.type === 'set_cell_diagonal') {
+      newBody = mergeDiagonalIntoBorderFillBody(
+        baseBody, String(e.direction ?? e.kind).toLowerCase(),
+        e.color ?? e.diagonal_color ?? '#000000',
+        LINE_TYPE[String(e.line_type ?? 'solid').toLowerCase()] ?? 1,
+        Number(e.width ?? 1));
+    } else {
+      newBody = mergeSolidFillIntoBorderFillBody(baseBody, bg, e._bfPattern || 'rhwp');
+    }
+
+    // Dedup: reuse an identical existing BorderFill if present (1-based; 0
+    // means "not found" → append).
+    let newBfId = bfBodies.findIndex((b) => b.equals(newBody)) + 1;
+    if (newBfId === 0) {
+      const bfRes = appendBorderFillToDocInfo(diRaw, newBody);
+      diRaw = bfRes.newDi;
+      newBfId = bfRes.newBfId;
+    }
+
+    // Repoint just this cell.
+    secRaw.writeUInt16LE(newBfId & 0xFFFF, bfRefOff);
+
+    summary.push({
+      op: e.type, para, control: ctrl, cellIndex: e.cellIndex,
+      row: e.row, col: e.col,
+      background_color: bg, sides: e.sides ?? null, diagonal: e.direction ?? e.kind ?? null,
+      oldBfId: curBfId, newBfId,
+    });
+  }
+
+  // Deflate + write DocInfo (BorderFill run grew). Same mini/regular and
+  // mini→regular promotion handling as applyParagraphStyleInPlace.
+  {
+    const inMini = diInMini;
+    const capacity = inMini ? diChain.length * mssz : diChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        diRaw, diChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        diChain = ext.newRegularChain;
+        writeChainBytes(buf, diChain, ssz, ext.compressed);
+        buf.writeInt32LE(diChain[0], diEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        diChain = ext.miniChain;
+        writeMiniChainBytes(buf, diChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(diRaw, capacity, ssz, fat, fatAddrs, diChain, buf, false);
+      buf = ext.buf; fat = ext.fat; diChain = ext.chain;
+      writeChainBytes(buf, diChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  // Deflate + write Section0 (only cell borderFillId u16s changed, so size
+  // is unchanged — written back through the same path for uniformity).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
 }
 
 /**
