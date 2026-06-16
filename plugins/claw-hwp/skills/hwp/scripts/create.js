@@ -2229,6 +2229,10 @@ async function readStdin() {
   // Table-cell properties (valign / size / margins) via raw-patch — patches the
   // cell LIST_HEADER directly (no DocInfo change). See applyCellPropertyInPlace.
   const CELL_PROP_OPS = new Set(['set_cell_property']);
+  // Table structure: merge a rectangular block of cells (raw-patch — sets the
+  // top-left cell's span, deletes the absorbed cell clusters, fixes the TABLE
+  // row-size array). See cell-patch.js mergeCellsInPlace.
+  const MERGE_OPS = new Set(['merge_cells']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2258,7 +2262,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2458,6 +2462,13 @@ async function readStdin() {
         const cpSummary = await applyCellPropertyInPlace(outPath, cellPropOps);
         subModes.push(`cell_prop:${cpSummary.mode || 'in-place'}`);
         for (const e of cpSummary) allEdits.push({ kind: 'cell_prop', ...e });
+      }
+      const mergeOps = ops.filter((o) => MERGE_OPS.has(o.type));
+      if (mergeOps.length > 0) {
+        const { mergeCellsInPlace } = await import('./cell-patch.js');
+        const mgSummary = await mergeCellsInPlace(outPath, mergeOps);
+        subModes.push(`merge:${mgSummary.mode || 'in-place'}`);
+        for (const e of mgSummary) allEdits.push({ kind: 'merge', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

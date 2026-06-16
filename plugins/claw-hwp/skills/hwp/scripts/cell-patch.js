@@ -4634,6 +4634,164 @@ export async function applyCellPropertyInPlace(filePath, ops) {
   return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
 }
 
+// The TAG_TABLE record (table grid: rows, cols, and the per-row cell-count
+// array at body offset 18) for the table at (sectionParaIdx, controlIdx).
+function findTableRecord(records, sectionParaIdx, controlIdx) {
+  let para = -1, start = -1;
+  for (let i = 0; i < records.length; i++) {
+    if (records[i].tag === TAG_PARA_HEADER && records[i].level === 0) { para++; if (para === sectionParaIdx) { start = i; break; } }
+  }
+  if (start < 0) throw new Error(`merge_cells: paragraph ${sectionParaIdx} not found`);
+  let ctrl = -1, tStart = -1;
+  for (let i = start + 1; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_PARA_HEADER && r.level === 0) break;
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1) { ctrl++; if (ctrl === controlIdx) { tStart = i; break; } }
+  }
+  if (tStart < 0) throw new Error(`merge_cells: control ${controlIdx} not found`);
+  for (let i = tStart + 1; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_PARA_HEADER && r.level === 0) break;
+    if (r.tag === TAG_TABLE && r.level === 2) return r;
+  }
+  throw new Error('merge_cells: TABLE record not found');
+}
+
+// Byte range [startByte, endByte) of one cell's whole cluster (its level-2
+// LIST_HEADER record + the cell's paragraphs) — i.e. up to the next cell's
+// LIST_HEADER, or the end of the table.
+function cellClusterByteRange(records, secRaw, sectionParaIdx, controlIdx, cellIndex) {
+  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex);
+  const lhIdx = loc.listHeaderRec;
+  const startByte = records[lhIdx].headOff;
+  let endByte = secRaw.length;
+  for (let i = lhIdx + 1; i < records.length; i++) {
+    const r = records[i];
+    if ((r.tag === TAG_PARA_HEADER && r.level === 0) ||
+        (r.tag === TAG_CTRL_HEADER && r.level === 1) ||
+        (r.tag === TAG_LIST_HEADER && r.level === 2)) { endByte = r.headOff; break; }
+  }
+  return { startByte, endByte };
+}
+
+/**
+ * Merge a rectangular block of table cells into one, in `.hwp`, via raw-patch.
+ *
+ * Op `merge_cells`: `{ section?, para?, control?, from_row, from_col, to_row,
+ * to_col }`. GT-confirmed mechanism (diff of a Hancom table-op merge):
+ *   1. the top-left cell's LIST_HEADER gets colSpan = cols, rowSpan = rows;
+ *   2. every other cell in the block has its whole cluster (LIST_HEADER +
+ *      paragraphs) deleted — remaining cells keep their original col/row
+ *      addresses (no renumber);
+ *   3. the TABLE record's per-row cell-count array (body offset 18, one u16
+ *      per row) is decremented once per removed cell's row.
+ * Section 0 only.
+ */
+export async function mergeCellsInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', merged_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`merge_cells: only section 0 is supported (got section ${op.section})`);
+    for (const k of ['from_row', 'from_col', 'to_row', 'to_col']) {
+      if (!Number.isInteger(op[k])) throw new Error(`merge_cells: '${k}' (integer) is required`);
+    }
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    const r0 = Math.min(op.from_row, op.to_row), r1 = Math.max(op.from_row, op.to_row);
+    const c0 = Math.min(op.from_col, op.to_col), c1 = Math.max(op.from_col, op.to_col);
+    if (r0 === r1 && c0 === c1) throw new Error('merge_cells: region must span more than one cell');
+
+    const region = [];
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) region.push({ section: 0, para, control: ctrl, row: r, col: c });
+    const resolved = await resolveCellIndexes(filePath, region);
+
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    // 1. top-left cell → colSpan / rowSpan
+    const tl = resolved.find((e) => e.row === r0 && e.col === c0);
+    if (!tl) throw new Error(`merge_cells: top-left cell (${r0},${c0}) not resolved`);
+    const tlOff = records[locateCell(records, para, ctrl, tl.cellIndex).listHeaderRec].dataOff;
+    if (secRaw.readUInt16LE(tlOff + 8) !== c0 || secRaw.readUInt16LE(tlOff + 10) !== r0) {
+      throw new Error(`merge_cells: top-left cell-attr layout mismatch at (${r0},${c0})`);
+    }
+    secRaw.writeUInt16LE((c1 - c0 + 1) & 0xFFFF, tlOff + 12);  // colSpan
+    secRaw.writeUInt16LE((r1 - r0 + 1) & 0xFFFF, tlOff + 14);  // rowSpan
+
+    // 2/3. compute clusters to delete + decrement TABLE row-size (in-place,
+    // before any deletion — all offsets below are still original).
+    const tableRec = findTableRecord(records, para, ctrl);
+    const toRemove = resolved.filter((e) => !(e.row === r0 && e.col === c0));
+    const ranges = toRemove.map((e) => ({ row: e.row, ...cellClusterByteRange(records, secRaw, para, ctrl, e.cellIndex) }));
+    for (const rng of ranges) {
+      const off = tableRec.dataOff + 18 + rng.row * 2;
+      secRaw.writeUInt16LE(Math.max(0, secRaw.readUInt16LE(off) - 1), off);
+    }
+    // delete clusters high→low so earlier byte offsets stay valid.
+    ranges.sort((a, b) => b.startByte - a.startByte);
+    for (const rng of ranges) secRaw = Buffer.concat([secRaw.slice(0, rng.startByte), secRaw.slice(rng.endByte)]);
+
+    // writeback Section0 (length shrank).
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, from: [r0, c0], to: [r1, c1], removed: toRemove.length });
+  }
+  return Object.assign(summary, { mode: 'in-place', merged_count: summary.length });
+}
+
 /**
  * Apply cell-level styling (background / border / diagonal) to existing `.hwp`
  * table cells via raw-patch (no rhwp round-trip, Hancom-Docs-safe).
