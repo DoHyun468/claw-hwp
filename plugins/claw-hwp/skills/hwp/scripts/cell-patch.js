@@ -2590,6 +2590,200 @@ export async function insertParaLineInPlace(filePath, ops) {
 }
 
 
+// ── 누름틀 / 입력 필드 (form field) raw-patch ──────────────────────────────
+//
+// GT-first (field_native.hwp, captured from Hancom's 입력 › 필드/누름틀): a
+// 누름틀 is the HWP "field" mechanism — an inline field-begin char (0x0003)
+// and field-end char (0x0004) wrapping the guide text, plus a CTRL_HEADER
+// ('%clk', stored reversed as "klc%") carrying the field command string, and
+// a small 0x57 field-data record. Self-contained in Section0 — no DocInfo
+// change (it reuses existing char shapes).
+//
+//   PARA_TEXT: <existing text up to anchor> [FIELD_BEGIN 8u] <guide> [FIELD_END 8u] …
+//   PARA_HEADER: char_count += 16 (begin+end) + guide.length;
+//                control_mask |= 0x18  (control-char bitmask: chars 0x03 & 0x04 now present)
+//   + CTRL_HEADER '%clk' (lvl1) at the end of the paragraph's controls
+//   + 0x57 field-data record (lvl2)
+//
+// control_mask is a bitmask of which control-char codes (0..31) appear in the
+// paragraph, so OR-ing in (1<<3)|(1<<4) is correct for any document.
+//
+// The same field mechanism backs hyperlinks (0x0003/0x0004 + a CTRL command
+// string), so this is also the anchor-based path to hyperlinks that avoids
+// the cloud editor's fragile drag-select.
+const FIELD_BEGIN_HEX = '03006b6c632500000000000000000300'; // 0x0003 + '%clk' + 0x0003 (8 units)
+const FIELD_END_HEX   = '04006b6c630901000000000000000400'; // 0x0004 + '%clk' + 0x0004 (8 units)
+const FIELD_CTRL_ID   = Buffer.from('6b6c6325', 'hex');      // 'klc%' (= '%clk' reversed)
+// 0x57 field-data record body (18 bytes) — reproduced from GT verbatim.
+const FIELD_DATA_HEX  = '1b020100000000400100030085c725b880b7';
+const TAG_FIELD_DATA  = 0x57;
+
+// Build the field command string Hancom stores in the '%clk' CTRL_HEADER.
+function buildFieldCommand(guide) {
+  return `Clickhere:set:56:Direction:wstring:${guide.length}:${guide} HelpState:wstring:0:  `;
+}
+
+// CTRL_HEADER '%clk' body: ctrlId + 01000000 + 09 + u16 cmdLen + cmd(UTF16) + u32 instanceId + 00000000
+function buildFieldCtrlRecord(guide, instanceId) {
+  const cmd = buildFieldCommand(guide);
+  const cmdBuf = Buffer.from(cmd, 'utf16le');
+  const body = Buffer.concat([
+    FIELD_CTRL_ID,
+    Buffer.from([0x01, 0x00, 0x00, 0x00, 0x09]),
+    (() => { const b = Buffer.alloc(2); b.writeUInt16LE(cmd.length, 0); return b; })(),
+    cmdBuf,
+    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(instanceId >>> 0, 0); return b; })(),
+    Buffer.from([0x00, 0x00, 0x00, 0x00]),
+  ]);
+  return Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, body.length), body]);
+}
+
+function buildFieldDataRecord() {
+  const body = Buffer.from(FIELD_DATA_HEX, 'hex');
+  return Buffer.concat([buildRecordHeader(TAG_FIELD_DATA, 2, body.length), body]);
+}
+
+// Insert a 누름틀 form field after the anchor text. Each op:
+//   { anchor: string, guide?: string, field_name?: string }
+//   - anchor: text to place the field right after (must be plain text in a
+//             level-1 PARA_TEXT of a top-level paragraph)
+//   - guide:  the placeholder/guide text shown in the field (default '입력')
+export async function insertFieldInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') {
+      throw new Error('insert_field: an "anchor" string is required');
+    }
+    const guide = (typeof op.guide === 'string' && op.guide) ? op.guide : '입력';
+    const records = parseRecords(raw);
+
+    // Locate the top-level paragraph cluster containing the anchor, and the
+    // level-1 PARA_TEXT record holding the anchor text.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorByteOff = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const body = raw.slice(r.dataOff, r.dataOff + r.size);
+        const at = body.indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorByteOff = at + anchorBuf.length; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`insert_field: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const instanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Build the new PARA_TEXT body: insert FIELD_BEGIN + guide + FIELD_END
+    //    right after the anchor text.
+    const fieldBegin = Buffer.from(FIELD_BEGIN_HEX, 'hex');
+    const fieldEnd = Buffer.from(FIELD_END_HEX, 'hex');
+    const guideBuf = Buffer.from(guide, 'utf16le');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const newBody = Buffer.concat([
+      oldBody.slice(0, anchorByteOff), fieldBegin, guideBuf, fieldEnd, oldBody.slice(anchorByteOff),
+    ]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Field control records appended at the end of the paragraph's cluster.
+    const ctrlRec = buildFieldCtrlRecord(guide, instanceId);
+    const dataRec = buildFieldDataRecord();
+    const fieldCtrlBlock = Buffer.concat([ctrlRec, dataRec]);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch (length-preserving): char_count += (16 + guide.len),
+    //    control_mask |= 0x18 (chars 0x03 & 0x04 now present).
+    const addedUnits = 8 + guide.length + 8; // begin(8u) + guide + end(8u)
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    const newCount = ((flag | ((curCount & 0x7FFFFFFF) + addedUnits)) >>> 0);
+    const newMask = (raw.readUInt32LE(phOff + 4) | 0x18) >>> 0;
+
+    // Apply: header edit in place, then splice high→low (cluster-end first,
+    // then PARA_TEXT replacement) so earlier offsets stay valid.
+    raw.writeUInt32LE(newCount, phOff);
+    raw.writeUInt32LE(newMask, phOff + 4);
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), fieldCtrlBlock, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([
+      raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size),
+    ]);
+
+    summary.push({ section: 0, anchor: op.anchor, guide, field_name: op.field_name ?? null });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's
