@@ -2244,6 +2244,10 @@ async function readStdin() {
   // Table structure: split one cell into N stacked rows (raw-patch). See
   // cell-patch.js splitCellInPlace.
   const SPLIT_OPS = new Set(['split_cell']);
+  // 문단 띠 / horizontal divider line (raw-patch — inserts a new paragraph
+  // holding a gso rectangle the width of the text column). Self-contained in
+  // Section0; no DocInfo change. See cell-patch.js insertParaLineInPlace.
+  const PARALINE_OPS = new Set(['insert_para_line']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2273,7 +2277,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2515,6 +2519,13 @@ async function readStdin() {
         const spSummary = await splitCellInPlace(outPath, splitOps);
         subModes.push(`split:${spSummary.mode || 'in-place'}`);
         for (const e of spSummary) allEdits.push({ kind: 'split', ...e });
+      }
+      const paraLineOps = ops.filter((o) => PARALINE_OPS.has(o.type));
+      if (paraLineOps.length > 0) {
+        const { insertParaLineInPlace } = await import('./cell-patch.js');
+        const plSummary = await insertParaLineInPlace(outPath, paraLineOps);
+        subModes.push(`para_line:${plSummary.mode || 'in-place'}`);
+        for (const e of plSummary) allEdits.push({ kind: 'para_line', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

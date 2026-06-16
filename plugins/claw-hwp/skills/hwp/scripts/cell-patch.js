@@ -2361,6 +2361,235 @@ export async function appendParagraphInPlace(filePath, ops) {
 }
 
 
+// ── 문단 띠 / 가로 구분선 (para-line horizontal divider) raw-patch ──────────
+//
+// GT-first (paraline_native.hwp, captured from Hancom's "문단 띠"): Hancom
+// inserts a NEW paragraph whose only content is a gso (drawing object)
+// holding a thin, full-text-width rectangle — i.e. a horizontal divider
+// line. The cluster is self-contained in BodyText/Section0: the line's fill
+// color lives inline in SHAPE_COMPONENT and a vector rectangle needs no
+// BinData stream, so DocInfo is left untouched (no new BorderFill/style).
+//
+// Cluster shape (6 records, verbatim from GT except the noted patches):
+//   PARA_HEADER  lvl0  control_mask=0x800 (has-gso), 9 chars, line_segs=0
+//   PARA_TEXT    lvl1  inline extended gso ctrl char (8 code units) + EOP
+//   PARA_CHAR_SHAPE lvl1  charPos0 / charShape0
+//   CTRL_HEADER  lvl1  'gso ' CommonObjAttr — instance_id refreshed
+//   SHAPE_COMPONENT lvl2 '$rec' — width scaled to page text-width
+//   SHAPE_COMPONENT_RECTANGLE lvl3 — 4 corner points, width scaled
+//
+// GT rectangle width 0xa618 (42520) == its page text-width (paperW −
+// marginL − marginR). For A4 docs this equals 42520, so the emitted bytes
+// match GT exactly; for other page widths we scale the SHAPE_COMPONENT and
+// rectangle extents. Hancom itself leaves the CommonObjAttr width nominal
+// (10000) — the SHAPE_COMPONENT extent governs the rendered line — so we
+// keep CTRL_HEADER verbatim aside from the instance_id refresh.
+const PARALINE_GSO_CTRL_HEX  = '206f736710a329100000000000000000102700002c010000000000000000000000000000e0169142000000000d0038bbe8b260b75cb82000acc001ac15d6200085c7c8b2e4b22e00';
+const PARALINE_SHAPE_HEX     = '636572246365722400000000000000000000010018a600002c01000018a600002c01000000000b00000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000000000000000000000000000c000010000000000000000000000ffffffff000000000000000000b2b2b2000000000000000000e11691020000';
+const PARALINE_RECT_HEX      = '00000000000000000018a600000000000018a600002c010000000000002c010000';
+const PARALINE_GT_TEXT_WIDTH = 42520; // 0xa618 — GT base doc's page text-width
+
+const TAG_SHAPE_COMPONENT = 0x4c;
+const TAG_SHAPE_COMPONENT_RECTANGLE = 0x4f;
+
+function buildParaLineCluster(textWidth, paraInstanceId, gsoInstanceId) {
+  // PARA_HEADER (24B — the change-tracking-aware form Hancom emits in the GT;
+  // trailing 2 bytes = change_tracking_state, left 0). The last-paragraph flag
+  // (MSB of char_count) is left clear here and normalized across the section
+  // after the splice.
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(9, 0);              // char_count = 9 (gso 8 units + EOP)
+  ph.writeUInt32LE(0x800, 4);         // control_mask: has-gso bit
+  ph.writeUInt16LE(0, 8);             // para_shape_id 0
+  ph.writeUInt8(0, 10);               // style_id
+  ph.writeUInt8(0, 11);               // break_val
+  ph.writeUInt16LE(1, 12);            // num_char_shapes
+  ph.writeUInt16LE(0, 14);            // range_tags_count
+  ph.writeUInt16LE(0, 16);            // line_segs_count = 0 (GT; Hancom relays out)
+  ph.writeUInt32LE(paraInstanceId >>> 0, 18);
+  // bytes 22..23: change_tracking_state = 0
+
+  // PARA_TEXT (18B): inline extended gso ctrl char (8 code units) + EOP.
+  const pt = Buffer.alloc(18);
+  pt.writeUInt16LE(0x000b, 0);
+  pt[2] = 0x20; pt[3] = 0x6f; pt[4] = 0x73; pt[5] = 0x67; // 'gso '
+  pt.writeUInt16LE(0x000b, 14);
+  pt.writeUInt16LE(0x000d, 16);        // EOP
+
+  const cs = Buffer.alloc(8);          // PARA_CHAR_SHAPE: charPos 0, charShape 0
+
+  const ch = Buffer.from(PARALINE_GSO_CTRL_HEX, 'hex');
+  ch.writeUInt32LE(gsoInstanceId >>> 0, 36); // refresh gso instance_id (CommonObjAttr@36)
+
+  const sc = Buffer.from(PARALINE_SHAPE_HEX, 'hex');
+  const rc = Buffer.from(PARALINE_RECT_HEX, 'hex');
+  if (textWidth !== PARALINE_GT_TEXT_WIDTH) {
+    sc.writeUInt32LE(textWidth >>> 0, 20); // SHAPE_COMPONENT curWidth
+    sc.writeUInt32LE(textWidth >>> 0, 28); // SHAPE_COMPONENT initWidth
+    rc.writeUInt32LE(textWidth >>> 0, 9);  // rectangle x of points 1,2 (right edge)
+    rc.writeUInt32LE(textWidth >>> 0, 17);
+  }
+
+  const parts = [
+    [TAG_PARA_HEADER, 0, ph],
+    [TAG_PARA_TEXT, 1, pt],
+    [TAG_PARA_CHAR_SHAPE, 1, cs],
+    [TAG_CTRL_HEADER, 1, ch],
+    [TAG_SHAPE_COMPONENT, 2, sc],
+    [TAG_SHAPE_COMPONENT_RECTANGLE, 3, rc],
+  ];
+  const chunks = [];
+  for (const [tag, lvl, body] of parts) {
+    chunks.push(buildRecordHeader(tag, lvl, body.length), body);
+  }
+  return Buffer.concat(chunks);
+}
+
+// Ensure exactly the last level-0 PARA_HEADER carries the last-paragraph
+// flag (MSB of char_count). Length-preserving in-place edit on `raw`.
+// Hancom moves this flag onto a newly-inserted trailing paragraph, and
+// rejects sections where it is absent or duplicated.
+function normalizeLastParaFlag(raw) {
+  const records = parseRecords(raw);
+  let lastIdx = -1;
+  for (let i = 0; i < records.length; i++) {
+    if (records[i].tag === TAG_PARA_HEADER && records[i].level === 0) lastIdx = i;
+  }
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag !== TAG_PARA_HEADER || r.level !== 0 || r.size < 4) continue;
+    const low = raw.readUInt32LE(r.dataOff) & 0x7FFFFFFF;
+    raw.writeUInt32LE(((i === lastIdx ? 0x80000000 : 0) | low) >>> 0, r.dataOff);
+  }
+}
+
+// Page text-width (HWPUNIT) = paper width − left margin − right margin,
+// read from the section's PAGE_DEF. Falls back to the GT A4 text-width.
+function readTextWidthFromPageDef(records, raw) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= 16) {
+      const tw = raw.readUInt32LE(r.dataOff) - raw.readUInt32LE(r.dataOff + 8) - raw.readUInt32LE(r.dataOff + 12);
+      if (tw > 0) return tw >>> 0;
+    }
+  }
+  return PARALINE_GT_TEXT_WIDTH;
+}
+
+// Insert a horizontal divider line (문단 띠) as a new paragraph. Each op:
+//   { anchor?: string }   — insert right after the paragraph whose text
+//                           contains `anchor`; if omitted, after the last
+//                           simple body paragraph.
+export async function insertParaLineInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const records = parseRecords(raw);
+    const textWidth = readTextWidthFromPageDef(records, raw);
+
+    // Insertion point.
+    let insertAt;
+    let anchorUsed = null;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const clusters = findClusterBoundaries(records);
+      let found = null;
+      for (const c of clusters) {
+        // Scan PARA_TEXT at ANY level inside the cluster: in fully
+        // table-based forms the anchor text lives in cell paragraphs
+        // (level 3+), not the top-level body. We insert the divider after
+        // the whole top-level cluster that contains the match.
+        let text = '';
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT) {
+            text += raw.slice(r.dataOff, r.dataOff + r.size).toString('utf16le');
+          }
+        }
+        if (text.includes(op.anchor)) { found = c; break; }
+      }
+      if (!found) throw new Error(`insert_para_line: anchor not found: ${JSON.stringify(op.anchor)}`);
+      insertAt = found.endIdx < records.length ? records[found.endIdx].headOff : raw.length;
+      anchorUsed = op.anchor;
+    } else {
+      const template = findLastSimpleBodyParagraph(records);
+      insertAt = template.endIdx < records.length ? records[template.endIdx].headOff : raw.length;
+    }
+
+    const paraInstanceId = pickFreshInstanceId(records, raw);
+    const gsoInstanceId = (paraInstanceId + 0x100) >>> 0;
+    const cluster = buildParaLineCluster(textWidth, paraInstanceId, gsoInstanceId);
+    raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+    normalizeLastParaFlag(raw);
+    summary.push({ section: 0, anchor: anchorUsed, text_width: textWidth });
+  }
+
+  // Deflate + write back (same infrastructure as appendParagraphInPlace).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's
