@@ -230,6 +230,23 @@ hwpx ships with `colCount="1"`.
 |--------|------|-------|
 | `set_page_setup` | `size?`, `orientation?`, `width_mm?`, `height_mm?`, `margin_mm?` | Rewrites every section's `<hp:pagePr>` (paper size) + `<hp:margin>`. `size` preset: `a3`/`a4`/`a5`/`b4`/`b5`/`letter`/`legal`. `orientation`: `portrait` / `landscape` (swaps width↔height — landscape = width > height; the pagePr `landscape` enum is a separate binding hint, left as-is). `width_mm` / `height_mm` set an exact size instead of a preset. `margin_mm` sets all four page margins (mm). Renders on Hancom Docs web (landscape capture-verified). |
 
+### Chart (차트)
+
+A chart is a floating object — `<hp:chart chartIDRef="Chart/chartN.xml">` in the
+body plus a generated OOXML `<c:chartSpace>` part. Hancom renders from that OOXML
+part (no OLE binary needed).
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `insert_chart` | `chart_type?`, `cat?`, `series?` | Appends a chart at the end of the last section. `chart_type`: `column` (default) / `bar` / `line` / `area` / `pie` (also accepts the numeric 0–19 from Hancom's type list — mapped to the family). `cat` = category labels, e.g. `["1월","2월","3월"]`. `series` = `[{ "name": "매출", "values": [120,135,150] }, …]` (pie uses the first series only; values map to the categories in order). The OOXML chart part is generated from this data; renders on Hancom Docs web and desktop (verified — column + pie). |
+
+```json
+{"type":"insert_chart","chart_type":"column",
+ "cat":["1월","2월","3월"],
+ "series":[{"name":"매출","values":[120,135,150]},{"name":"비용","values":[80,75,90]}]}
+{"type":"insert_chart","chart_type":"pie","cat":["A","B","C","D"],"series":[{"name":"점유율","values":[40,30,20,10]}]}
+```
+
 ## Examples
 
 Template fill + a cell edit + a styled run, saved in place:

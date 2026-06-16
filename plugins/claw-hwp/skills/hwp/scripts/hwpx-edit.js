@@ -53,6 +53,7 @@
 //   insert_equation       { script, index? }   // inserts a Hancom equation (script = equation-syntax); new paragraph after index, else appended
 //   set_columns           { count, gap_mm? }    // multi-column (단) layout; count=1 resets to single, count>=2 = newspaper columns
 //   set_page_setup        { size?, orientation?, width_mm?, height_mm?, margin_mm? }  // 편집 용지 (paper size/orientation/margins)
+//   insert_chart          { chart_type?, cat?, series? }  // chart: col/bar/line/area/pie (or 0-19); series=[{name,values:[]}], cat=[labels]
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2300,6 +2301,85 @@ function opSetPageSetup(doc, opts) {
   return { sectionsChanged };
 }
 
+// Insert a chart. Hancom renders a chart from its OOXML <c:chartSpace> part
+// (Chart/chartN.xml) — the BinData OLE that Hancom Docs also writes is NOT
+// needed for rendering (verified: a chart renders with the OLE removed). So we
+// emit <hp:chart chartIDRef="Chart/chartN.xml"> + generate the chartSpace from
+// {type, cat, series}. Standard families (column/bar/line/area) carry cat+val
+// axes; pie is single-series with no axes.
+const CHART_FAMILY = { column: 'col', col: 'col', bar: 'bar', line: 'line', area: 'area', pie: 'pie',
+  0: 'col', 1: 'col', 2: 'line', 3: 'bar', 4: 'bar', 6: 'pie', 7: 'pie', 8: 'pie', 9: 'area', 10: 'area', 12: 'col', 13: 'col', 14: 'bar', 15: 'bar', 16: 'pie', 17: 'pie', 18: 'area', 19: 'area' };
+function colLetter(i) { return String.fromCharCode(66 + i); } // 0->B
+function chartSer(idx, name, cat, values) {
+  const catPts = cat.map((c, i) => `<c:pt idx="${i}"><c:v>${xmlEscape(c)}</c:v></c:pt>`).join('');
+  const valPts = values.map((v, i) => `<c:pt idx="${i}"><c:v>${Number(v) || 0}</c:v></c:pt>`).join('');
+  const cl = colLetter(idx);
+  return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>`
+    + `<c:tx><c:strRef><c:f>Sheet1!$${cl}$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>${xmlEscape(name)}</c:v></c:pt></c:strCache></c:strRef></c:tx>`
+    + `<c:spPr/><c:invertIfNegative val="0"/>`
+    + `<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$${cat.length + 1}</c:f><c:strCache><c:ptCount val="${cat.length}"/>${catPts}</c:strCache></c:strRef></c:cat>`
+    + `<c:val><c:numRef><c:f>Sheet1!$${cl}$2:$${cl}$${values.length + 1}</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="${values.length}"/>${valPts}</c:numCache></c:numRef></c:val>`
+    + `</c:ser>`;
+}
+function buildChartSpace(family, cat, series) {
+  const NS = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"';
+  const axId1 = '111111111', axId2 = '222222222';
+  let plot;
+  if (family === 'pie') {
+    plot = `<c:pieChart><c:varyColors val="1"/>${chartSer(0, series[0].name, cat, series[0].values)}<c:firstSliceAng val="0"/></c:pieChart>`;
+  } else {
+    const sers = series.map((s, i) => chartSer(i, s.name, cat, s.values)).join('');
+    const horiz = family === 'bar';
+    let typeEl;
+    if (family === 'line') typeEl = `<c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>${sers}<c:marker val="1"/><c:axId val="${axId1}"/><c:axId val="${axId2}"/></c:lineChart>`;
+    else if (family === 'area') typeEl = `<c:areaChart><c:grouping val="standard"/><c:varyColors val="0"/>${sers}<c:axId val="${axId1}"/><c:axId val="${axId2}"/></c:areaChart>`;
+    else typeEl = `<c:barChart><c:barDir val="${horiz ? 'bar' : 'col'}"/><c:grouping val="clustered"/><c:varyColors val="0"/>${sers}<c:gapWidth val="150"/><c:overlap val="0"/><c:axId val="${axId1}"/><c:axId val="${axId2}"/></c:barChart>`;
+    const catAxPos = horiz ? 'l' : 'b', valAxPos = horiz ? 'b' : 'l';
+    const catAx = `<c:catAx><c:axId val="${axId1}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:axPos val="${catAxPos}"/><c:crossAx val="${axId2}"/><c:delete val="0"/><c:majorTickMark val="out"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>`;
+    const valAx = `<c:valAx><c:axId val="${axId2}"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:axPos val="${valAxPos}"/><c:majorGridlines/><c:numFmt formatCode="General" sourceLinked="1"/><c:crossAx val="${axId1}"/><c:delete val="0"/><c:majorTickMark val="out"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crosses val="autoZero"/><c:crossBetween val="between"/></c:valAx>`;
+    plot = typeEl + catAx + valAx;
+  }
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>`
+    + `<c:chartSpace ${NS}><c:date1904 val="0"/><c:roundedCorners val="0"/>`
+    + `<c:chart><c:autoTitleDeleted val="0"/><c:plotArea><c:layout/>${plot}</c:plotArea>`
+    + `<c:legend><c:legendPos val="r"/><c:overlay val="0"/></c:legend>`
+    + `<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>`;
+}
+function opInsertChart(doc, op) {
+  const family = CHART_FAMILY[op.chart_type] || 'col';
+  const cat = Array.isArray(op.cat) ? op.cat.map(String) : ['항목 1', '항목 2', '항목 3'];
+  let series = Array.isArray(op.series) && op.series.length ? op.series : [{ name: '계열 1', values: cat.map(() => 0) }];
+  series = series.map((s, i) => ({ name: s.name != null ? String(s.name) : `계열 ${i + 1}`, values: Array.isArray(s.values) ? s.values : [] }));
+  if (family === 'pie') series = [series[0]];
+  // unique Chart/ part name
+  let n = 1;
+  while (doc.files[`Chart/chart${n}.xml`]) n++;
+  const partName = `Chart/chart${n}.xml`;
+  doc.files[partName] = strToU8(buildChartSpace(family, cat, series));
+  // manifest entry
+  const hpf = doc.hpfName();
+  if (hpf) {
+    let s = doc.read(hpf);
+    if (!s.includes(`href="${partName}"`)) {
+      s = s.replace(/<\/opf:manifest>/, `<opf:item id="chart${n}" href="${partName}" media-type="application/xml"/></opf:manifest>`);
+      doc.write(hpf, s);
+    }
+  }
+  const chart = `<hp:chart id="${freshId()}" zOrder="0" numberingType="PICTURE" textWrap="SQUARE" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" chartIDRef="${partName}">`
+    + `<hp:sz width="32250" widthRelTo="ABSOLUTE" height="18750" heightRelTo="ABSOLUTE" protect="0"/>`
+    + `<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`
+    + `<hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:chart>`;
+  const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
+  const names = doc.sectionNames();
+  const last = names[names.length - 1];
+  let xml = doc.read(last);
+  const charPrId = (scanTopLevel(xml, 'hp:p').slice(-1)[0]?.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+  const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${chart}</hp:run></hp:p>`;
+  xml = /<\/hs:sec>\s*$/.test(xml) ? xml.replace(/<\/hs:sec>\s*$/, para + '</hs:sec>') : xml + para;
+  doc.write(last, xml);
+  return { inserted: true, part: partName, family, series: series.length, cats: cat.length };
+}
+
 function applyOp(doc, op) {
   switch (op.type) {
     case 'replace_text': return opReplaceText(doc, op.find, op.replace);
@@ -2340,6 +2420,7 @@ function applyOp(doc, op) {
     case 'insert_equation': return opInsertEquation(doc, op.script, op.index);
     case 'set_columns': return opSetColumns(doc, op.count, op.gap_mm);
     case 'set_page_setup': return opSetPageSetup(doc, op);
+    case 'insert_chart': return opInsertChart(doc, op);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }

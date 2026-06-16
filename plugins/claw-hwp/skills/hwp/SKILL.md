@@ -249,7 +249,7 @@ exist yet.
 
 | Input | Use | What's available |
 |-------|-----|------------------|
-| `.hwpx` | **`hwpx-edit.js`** | text · paragraph · table (`insert_table`, cell content/background/border/diagonal/align/size, row/column, merge) · image (insert/replace/delete) · char & paragraph styling · header/footer · page break · bullet/number lists (style: korean/decimal, custom bullet glyph) · footnote/endnote · hyperlink · equation (math formula) · columns (다단) · page setup (편집 용지) |
+| `.hwpx` | **`hwpx-edit.js`** | text · paragraph · table (`insert_table`, cell content/background/border/diagonal/align/size, row/column, merge) · image (insert/replace/delete) · char & paragraph styling · header/footer · page break · bullet/number lists (style: korean/decimal, custom bullet glyph) · footnote/endnote · hyperlink · equation (math formula) · columns (다단) · page setup (편집 용지) · chart (차트) |
 | `.hwp` | **`create.js`** (raw-patch via `cell-patch.js`) | set_cell_text · replace_text · append_paragraph/heading/table/list/break · setup_document · apply_text_style · apply_paragraph_style |
 
 Detect format by reading the first two bytes — `PK` = HWPX (treat as `.hwpx` regardless of extension).
@@ -274,7 +274,7 @@ echo '{
 
 Returns JSON `{ ok, output, results: [...] }`. The whole batch is **atomic** — if any op errors, nothing is saved and the error names the failing op index. `output` defaults to `<input>_edited.hwpx`; pass `"output": "<same path>"` to overwrite in place.
 
-The full operation vocabulary (text · paragraph · table including `insert_table` + cell content/background/border/diagonal/align/size + row/column + merge · char/paragraph styling · image insert/replace/delete · header/footer · page break · bullet/number lists · footnote/endnote · hyperlink · field · equation · columns · page setup) is documented in **`references/hwpx-edit-ops.md`** — read it before composing a payload. Table/paragraph indices are **document-order, 0-based**; discover them with `extract_text.js --inspect` and `--format markdown`.
+The full operation vocabulary (text · paragraph · table including `insert_table` + cell content/background/border/diagonal/align/size + row/column + merge · char/paragraph styling · image insert/replace/delete · header/footer · page break · bullet/number lists · footnote/endnote · hyperlink · field · equation · columns · page setup · chart) is documented in **`references/hwpx-edit-ops.md`** — read it before composing a payload. Table/paragraph indices are **document-order, 0-based**; discover them with `extract_text.js --inspect` and `--format markdown`.
 
 Notes:
 - `hwpx-edit.js` is **`.hwpx` only** — it rejects `.hwp` with a clear error. Use the `.hwp` path (next section) for `.hwp` input.
