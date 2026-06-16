@@ -64,6 +64,7 @@
 //   split_cell            { table, row, col, rows?, cols? }  // 셀 나누기 — split one cell into rows×cols
 //   set_caption           { target?, index?, text, side?, gap_mm? }  // 캡션 — target: image|chart|shape|table
 //   apply_style           { index, style }   // 스타일 적용 — style: name ("개요 1"/"본문") or id
+//   para_line             { index, fill_color?, border_color?, border_width_mm?, sides? }  // 문단 띠 (테두리·배경)
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2005,6 +2006,53 @@ function opApplyStyle(doc, index, style) {
   return { index, style: getAttr(hit.attrs, 'name'), styleId, paraPrId: ppr, charPrId: cpr };
 }
 
+// Paragraph band (문단 띠 — 강조 띠/콜아웃). A paragraph border/background set on
+// the paraPr does NOT survive Hancom Docs web: it silently strips the border+fill
+// AND adds spurious numbering (the documented paraPr-normalization trap — same
+// root cause as the BULLET list-strip; verified by round-trip). The robust way to
+// get a full-width coloured band that DOES survive Hancom web is a 1×1 table whose
+// single cell carries the fill + border via cellzones (the proven cell-styling
+// path). So para_line replaces the target paragraph with a 1-cell callout table:
+// extract its text → delete it → insert a 1×1 table in its place → fill + border
+// the cell with the existing (Hancom-verified) cell ops.
+const PARA_SIDE_SETS = {
+  all: ['left', 'right', 'top', 'bottom'], 'top-bottom': ['top', 'bottom'],
+  'left-right': ['left', 'right'], top: ['top'], bottom: ['bottom'], left: ['left'], right: ['right'], none: [],
+};
+function opParaLine(doc, index, opts) {
+  opts = opts || {};
+  const fillColor = opts.fill_color ? normHex(opts.fill_color) : null;
+  const wantBorder = !!(opts.border || opts.border_color || opts.border_width_mm != null || (opts.sides && String(opts.sides).toLowerCase() !== 'none'));
+  if (!fillColor && !wantBorder) throw new Error('para_line: need fill_color and/or a border (border_color / sides)');
+  const paras = doc.paragraphs();
+  if (index < 0 || index >= paras.length) throw new Error(`para_line: index ${index} out of range (0..${paras.length - 1})`);
+  // 1. Extract the paragraph's visible text (its <hp:t> runs, un-escaped).
+  const text = [...paras[index].el.inner.matchAll(/<hp:t>([\s\S]*?)<\/hp:t>/g)].map((m) => m[1]).join('')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  // 2. Remove the original paragraph, then 3. drop a 1×1 table into its slot
+  //    (insert_table inserts AFTER its index, so index-1; -1 prepends).
+  opDeleteParagraph(doc, index);
+  opInsertTable(doc, index === 0 ? -1 : index - 1, 1, 1, [[text]]);
+  // 4. Find the table that now occupies body slot `index`.
+  const bodyP = doc.paragraphs()[index];
+  const tbls = doc.tables();
+  let tblIdx = tbls.findIndex((t) => t.section === bodyP.section && t.el.start >= bodyP.el.start && t.el.end <= bodyP.el.end);
+  if (tblIdx < 0) tblIdx = tbls.length - 1;
+  // 4b. Widen the single cell to the table's full content width — the fallback
+  //     1×1 cell is otherwise narrow and the text wraps to a tall sliver.
+  const tszW = (tbls[tblIdx].el.inner.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/) || [])[1];
+  if (tszW) opSetCellSize(doc, tblIdx, 0, 0, Number(tszW), undefined);
+  // 5. Fill (cellzone + char shade, so the colour shows on Hancom web) + border.
+  if (fillColor) opSetCellBackground(doc, tblIdx, 0, 0, fillColor, 'both');
+  if (wantBorder) {
+    const bColor = opts.border_color ? normHex(opts.border_color) : '#000000';
+    const w = opts.border_width_mm != null ? `${Number(opts.border_width_mm)} mm` : '0.4 mm';
+    const sideSet = PARA_SIDE_SETS[String(opts.sides || 'all').toLowerCase()] || PARA_SIDE_SETS.all;
+    opSetCellBorder(doc, tblIdx, 0, 0, bColor, w, sideSet.map((s) => s.toUpperCase()));
+  }
+  return { index, table: tblIdx, fill: fillColor, bordered: wantBorder, text };
+}
+
 // Increment itemCnt="N" on the named OWPML list wrapper (e.g. hh:charPrList),
 // so Hancom's strict reader doesn't ignore an appended definition.
 function bumpListCount(header, listTag, delta) {
@@ -2924,6 +2972,7 @@ function applyOp(doc, op) {
     case 'split_cell': return opSplitCell(doc, op.table, op.row, op.col, op.rows, op.cols);
     case 'set_caption': return opSetCaption(doc, op.target, op.index, op.text, op.side, op.gap_mm);
     case 'apply_style': return opApplyStyle(doc, op.index, op.style);
+    case 'para_line': return opParaLine(doc, op.index, op);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
