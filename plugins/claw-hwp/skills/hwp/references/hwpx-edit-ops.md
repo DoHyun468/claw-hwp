@@ -238,7 +238,7 @@ part (no OLE binary needed).
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `insert_chart` | `chart_type?`, `cat?`, `series?` | Appends a chart at the end of the last section. `chart_type`: `column` (default) / `bar` / `line` / `area` / `pie` (also accepts the numeric 0–19 from Hancom's type list — mapped to the family). `cat` = category labels, e.g. `["1월","2월","3월"]`. `series` = `[{ "name": "매출", "values": [120,135,150] }, …]` (pie uses the first series only; values map to the categories in order). The OOXML chart part is generated from this data; renders on Hancom Docs web and desktop (verified — column + pie). |
+| `insert_chart` | `chart_type?`, `cat?`, `series?` | Appends a chart at the end of the last section. `chart_type` accepts a **name** — `column` (default) / `bar` / `line` / `area` / `pie` / `doughnut` / `scatter` / `radar` — **or a numeric 0–19** covering Hancom's full type list (incl. stacked, 3D, exploded pie): 0 col · 1 col-stacked · 2 line · 3 bar · 4 bar-stacked · 5 scatter · 6 pie · 7 pie-exploded · 8 doughnut · 9 area · 10 area-stacked · 11 radar · 12–15 3D bar · 16–17 3D pie · 18–19 3D area. `cat` = category labels `["1월","2월","3월"]` (for `scatter`, numeric X values). `series` = `[{ "name": "매출", "values": [120,135,150] }, …]` (pie/doughnut use the first series only; values map to categories in order). The OOXML chart part is generated from this data; **all 20 types verified rendering on Hancom Docs web** (clustered/stacked bar, line, area, pie/doughnut/exploded, scatter, radar, 3D). |
 
 ```json
 {"type":"insert_chart","chart_type":"column",
