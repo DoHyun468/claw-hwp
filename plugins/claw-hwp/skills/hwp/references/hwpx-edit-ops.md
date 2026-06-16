@@ -175,6 +175,24 @@ A Hancom equation is an inline shape (`<hp:equation>`) whose math is written in
 Hancom's equation-script syntax inside `<hp:script>`. Hancom renders it from the
 script on open **and recomputes its size**, so you don't supply dimensions.
 
+> ⚠️ **Hancom equation-script is NOT LaTeX.** It looks similar but has no
+> backslash commands — writing LaTeX renders as literal text, not math. Map the
+> common ones:
+>
+> | want | LaTeX (✗) | Hancom-script (✓) |
+> |---|---|---|
+> | fraction | `\frac{a}{b}` | `{a} over {b}` |
+> | square root | `\sqrt{x}` | `sqrt{x}` |
+> | n-th root | `\sqrt[3]{x}` | `root 3 of x` |
+> | Greek | `\alpha` `\pi` | `alpha` `pi` (bare; caps `PI`) |
+> | times / ± | `\times` `\pm` | `TIMES` `+-` |
+> | ≤ ≠ → ∞ | `\leq` `\neq` `\to` `\infty` | `<=` `!=` `rightarrow` (or `->`) `INF` |
+> | sum / integral | `\sum_{i=1}^{n}` `\int_0^\infty` | `sum from {i=1} to n` `int _0 ^inf` |
+> | vector / bar | `\vec{a}` `\bar{x}` | `vec{a}` `bar{x}` |
+>
+> Same as LaTeX: superscript `a^b`, subscript `a_b`, and `{ }` grouping. Everything
+> else is bare words, never `\commands`.
+
 | `type` | Args | Notes |
 |--------|------|-------|
 | `insert_equation` | `script`, `index?` | Inserts an equation as its own new plain paragraph (never inherits a neighbouring list's bullet/number). `script` is Hancom equation-script. With `index`, the equation paragraph goes right **after** paragraph `index`; without it, it's appended to the last section. Renders on both Hancom Docs web and desktop (verified). |
