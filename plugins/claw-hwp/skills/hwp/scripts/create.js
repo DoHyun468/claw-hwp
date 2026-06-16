@@ -2237,6 +2237,10 @@ async function readStdin() {
   // entry removed, the row's cells deleted, cells below renumbered). See
   // cell-patch.js deleteTableRowInPlace.
   const DELROW_OPS = new Set(['delete_table_row', 'delete_table_col']);
+  // Table structure: insert a blank row (raw-patch — TABLE rows+1, new row-size
+  // entry, blank cells cloned from empty cells, cells below renumbered). See
+  // cell-patch.js insertTableRowInPlace.
+  const INSROW_OPS = new Set(['insert_table_row']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2266,7 +2270,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2487,6 +2491,13 @@ async function readStdin() {
         const dcSummary = await deleteTableColInPlace(outPath, delColOps);
         subModes.push(`delcol:${dcSummary.mode || 'in-place'}`);
         for (const e of dcSummary) allEdits.push({ kind: 'delete_col', ...e });
+      }
+      const insRowOps = ops.filter((o) => INSROW_OPS.has(o.type));
+      if (insRowOps.length > 0) {
+        const { insertTableRowInPlace } = await import('./cell-patch.js');
+        const irSummary = await insertTableRowInPlace(outPath, insRowOps);
+        subModes.push(`insrow:${irSummary.mode || 'in-place'}`);
+        for (const e of irSummary) allEdits.push({ kind: 'insert_row', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

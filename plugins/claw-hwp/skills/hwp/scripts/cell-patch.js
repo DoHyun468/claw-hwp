@@ -4823,6 +4823,148 @@ export async function deleteTableRowInPlace(filePath, ops) {
   return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
 }
 
+// True if a cell cluster holds just an empty paragraph (PARA_HEADER text_count
+// ≤ 1 = the EOP terminator only) — safe to clone as a fresh blank cell.
+function isEmptyCellCluster(clusterBytes) {
+  for (const r of parseRecords(clusterBytes)) {
+    if (r.tag === TAG_PARA_HEADER && r.level === 2) {
+      return (clusterBytes.readUInt32LE(r.dataOff) & 0x7FFFFFFF) <= 1;
+    }
+  }
+  return false;
+}
+
+// Clone a cell cluster, overwriting its LIST_HEADER grid address (col@8, row@10).
+function cloneCellCluster(clusterBytes, newRow, newCol) {
+  const out = Buffer.from(clusterBytes);
+  const lh = parseRecords(out).find((r) => r.tag === TAG_LIST_HEADER && r.level === 2);
+  if (!lh) throw new Error('cloneCellCluster: no LIST_HEADER in cluster');
+  out.writeUInt16LE(newCol & 0xFFFF, lh.dataOff + 8);
+  out.writeUInt16LE(newRow & 0xFFFF, lh.dataOff + 10);
+  return out;
+}
+
+/**
+ * Insert a blank table row (`insert_table_row`) into an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, row, position? }` where
+ * `position` = 'below' (default) or 'above' relative to `row`. GT-confirmed:
+ * TABLE rows+1 with a new row-size entry (value = cols) inserted at the new
+ * row's index (record grows), every cell at/after the new row renumbered
+ * (row+1), and `cols` blank cell clusters synthesized and spliced in. Each
+ * blank cell is cloned from an existing EMPTY 1×1 cell in that column (so it
+ * inherits the right width/border), with its address rewritten — no record
+ * field surgery. A column with no empty 1×1 cell to clone is rejected. Sec 0.
+ */
+export async function insertTableRowInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`insert_table_row: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row)) throw new Error("insert_table_row: 'row' (integer) is required");
+    if (op.position && op.position !== 'above' && op.position !== 'below') throw new Error("insert_table_row: position must be 'above' or 'below'");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cols = secRaw.readUInt16LE(tableRec.dataOff + 6);
+    if (op.row < 0 || op.row >= rows) throw new Error(`insert_table_row: row ${op.row} out of range (table has ${rows} rows)`);
+    const insertRow = (op.position ?? 'below') === 'below' ? op.row + 1 : op.row;
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    // synthesize the new row's blank cells (clone an empty 1×1 cell per column)
+    const newClusters = [];
+    for (let c = 0; c < cols; c++) {
+      const tmpl = cells.find((cc) => cc.col === c && cc.colSpan === 1 && cc.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(cc.startByte, cc.endByte)));
+      if (!tmpl) throw new Error(`insert_table_row: no empty 1×1 cell in column ${c} to clone as the new cell`);
+      newClusters.push(cloneCellCluster(secRaw.slice(tmpl.startByte, tmpl.endByte), insertRow, c));
+    }
+    const newCellsBuf = Buffer.concat(newClusters);
+
+    // document insertion point: before the first cell at/after the new row.
+    let insOff = null;
+    for (const cc of cells) { if (cc.row >= insertRow) { insOff = cc.startByte; break; } }
+    if (insOff == null) insOff = cells.length ? cells[cells.length - 1].endByte : (tableRec.dataOff + tableRec.size);
+
+    // renumber cells at/after the new row (in-place, before splicing)
+    for (const cc of cells) if (cc.row >= insertRow) secRaw.writeUInt16LE((cc.row + 1) & 0xFFFF, cc.lhDataOff + 10);
+
+    // TABLE record: rows+1 and a new row-size entry (cols) at index insertRow.
+    const oldBody = secRaw.slice(tableRec.dataOff, tableRec.dataOff + tableRec.size);
+    const insAt = 18 + insertRow * 2;
+    const entry = Buffer.alloc(2); entry.writeUInt16LE(cols, 0);
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), entry, oldBody.slice(insAt)]);
+    newBody.writeUInt16LE((rows + 1) & 0xFFFF, 4);
+    const newTableRec = Buffer.concat([buildRecordHeader(TAG_TABLE, 2, newBody.length), newBody]);
+
+    const splices = [
+      { start: insOff, end: insOff, repl: newCellsBuf },
+      { start: tableRec.headOff, end: tableRec.dataOff + tableRec.size, repl: newTableRec },
+    ].sort((a, b) => b.start - a.start);
+    for (const s of splices) secRaw = Buffer.concat([secRaw.slice(0, s.start), s.repl, secRaw.slice(s.end)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, insertRow, added: cols });
+  }
+  return Object.assign(summary, { mode: 'in-place', inserted_count: summary.length });
+}
+
 /**
  * Delete a whole table column (`delete_table_col`) from an existing `.hwp` via
  * raw-patch. Op: `{ section?, para?, control?, col }`. GT-confirmed: TABLE
