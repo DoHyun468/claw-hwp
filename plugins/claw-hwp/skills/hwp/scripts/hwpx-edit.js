@@ -2517,8 +2517,15 @@ function buildChartSpace(spec, cat, series) {
     + `<c:legend><c:legendPos val="r"/><c:overlay val="0"/></c:legend>`
     + `<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>`;
 }
+// Object wrap (배치): how text flows around a floating object.
+const OBJ_WRAP = { inline: 'INLINE', square: 'SQUARE', 어울림: 'SQUARE', topbottom: 'TOP_AND_BOTTOM', 자리차지: 'TOP_AND_BOTTOM', front: 'IN_FRONT_OF_TEXT', behind: 'BEHIND_TEXT' };
+function wrapVal(w, def) { return OBJ_WRAP[String(w == null ? '' : w).toLowerCase()] || def; }
 function opInsertChart(doc, op) {
   const spec = chartSpec(op.chart_type);
+  const toHu = (mm) => Math.round(Number(mm) * 283.46);
+  const cw = op.width_mm != null ? toHu(op.width_mm) : 32250;
+  const ch = op.height_mm != null ? toHu(op.height_mm) : 18750;
+  const wrap = wrapVal(op.wrap, 'SQUARE');
   const cat = Array.isArray(op.cat) ? op.cat.map(String) : ['항목 1', '항목 2', '항목 3'];
   let series = Array.isArray(op.series) && op.series.length ? op.series : [{ name: '계열 1', values: cat.map(() => 0) }];
   series = series.map((s, i) => ({ name: s.name != null ? String(s.name) : `계열 ${i + 1}`, values: Array.isArray(s.values) ? s.values : [] }));
@@ -2537,8 +2544,8 @@ function opInsertChart(doc, op) {
       doc.write(hpf, s);
     }
   }
-  const chart = `<hp:chart id="${freshId()}" zOrder="0" numberingType="PICTURE" textWrap="SQUARE" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" chartIDRef="${partName}">`
-    + `<hp:sz width="32250" widthRelTo="ABSOLUTE" height="18750" heightRelTo="ABSOLUTE" protect="0"/>`
+  const chart = `<hp:chart id="${freshId()}" zOrder="0" numberingType="PICTURE" textWrap="${wrap}" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" chartIDRef="${partName}">`
+    + `<hp:sz width="${cw}" widthRelTo="ABSOLUTE" height="${ch}" heightRelTo="ABSOLUTE" protect="0"/>`
     + `<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`
     + `<hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:chart>`;
   const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
@@ -2557,19 +2564,21 @@ function opInsertChart(doc, op) {
 // renderingInfo matrices, lineShape (border) + fillBrush (rect/ellipse) and the
 // shape-specific geometry (rect = pt0..pt3, ellipse = center/ax, line =
 // startPt/endPt). Placed floating relative to its paragraph (PARA/COLUMN).
-function buildShape(shape, w, h, fillColor, lineColor) {
+function buildShape(shape, w, h, fillColor, lineColor, lineWidth, wrap) {
   const id = freshId(), inst = freshId();
+  const lw = lineWidth || 33;
+  const tw = wrap || 'IN_FRONT_OF_TEXT';
   const hw = Math.round(w / 2), hh = Math.round(h / 2);
   const common = `<hp:offset x="0" y="0"/><hp:orgSz width="${w}" height="${h}"/><hp:curSz width="0" height="0"/>`
     + `<hp:flip horizontal="0" vertical="0"/><hp:rotationInfo angle="0" centerX="0" centerY="0" rotateimage="1"/>`
     + `<hp:renderingInfo><hc:transMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:scaMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/></hp:renderingInfo>`
-    + `<hp:lineShape color="${lineColor}" width="33" style="SOLID" endCap="FLAT" headStyle="NORMAL" tailStyle="NORMAL" headfill="1" tailfill="1" headSz="SMALL_SMALL" tailSz="SMALL_SMALL" outlineStyle="NORMAL" alpha="0"/>`;
+    + `<hp:lineShape color="${lineColor}" width="${lw}" style="SOLID" endCap="FLAT" headStyle="NORMAL" tailStyle="NORMAL" headfill="1" tailfill="1" headSz="SMALL_SMALL" tailSz="SMALL_SMALL" outlineStyle="NORMAL" alpha="0"/>`;
   const fill = `<hc:fillBrush><hc:winBrush faceColor="${fillColor}" hatchColor="#000000" alpha="0"/></hc:fillBrush>`;
   const shadow = `<hp:shadow type="NONE" color="#B2B2B2" offsetX="0" offsetY="0" alpha="0"/>`;
   const tail = `<hp:sz width="${w}" widthRelTo="ABSOLUTE" height="${h}" heightRelTo="ABSOLUTE" protect="0"/>`
     + `<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="0" allowOverlap="1" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`
     + `<hp:outMargin left="0" right="0" top="0" bottom="0"/>`;
-  const open = (extra) => `<hp:${shape} id="${id}" zOrder="0" numberingType="PICTURE" textWrap="IN_FRONT_OF_TEXT" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="${inst}"${extra}>`;
+  const open = (extra) => `<hp:${shape} id="${id}" zOrder="0" numberingType="PICTURE" textWrap="${tw}" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="${inst}"${extra}>`;
   if (shape === 'line') {
     return open(' isReverseHV="0"') + common + shadow
       + `<hc:startPt x="0" y="0"/><hc:endPt x="${w}" y="${h}"/>` + tail + `<hp:shapeComment>선</hp:shapeComment></hp:line>`;
@@ -2591,7 +2600,8 @@ function opInsertShape(doc, op) {
   const h = op.height_mm != null ? toHu(op.height_mm) : 6750;
   const fill = op.fill_color ? normHex(op.fill_color) : '#FFFFFF';
   const line = op.line_color ? normHex(op.line_color) : '#000000';
-  const el = buildShape(shape, w, h, fill, line);
+  const lw = op.line_width_mm != null ? Math.round(Number(op.line_width_mm) * 283.46) : undefined;
+  const el = buildShape(shape, w, h, fill, line, lw, wrapVal(op.wrap));
   const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
   const index = op.index;
   if (index != null) {
@@ -2624,7 +2634,8 @@ function opInsertTextbox(doc, op) {
   const fill = op.fill_color ? normHex(op.fill_color) : '#FFFFFF';
   const line = op.line_color ? normHex(op.line_color) : '#000000';
   const drawText = `<hp:drawText lastWidth="4294967295" name="" editable="0"><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0"><hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run></hp:p></hp:subList></hp:drawText>`;
-  const el = buildShape('rect', w, h, fill, line)
+  const lw = op.line_width_mm != null ? Math.round(Number(op.line_width_mm) * 283.46) : undefined;
+  const el = buildShape('rect', w, h, fill, line, lw, wrapVal(op.wrap, 'SQUARE'))
     .replace('<hc:pt0 x="0" y="0"/>', drawText + '<hc:pt0 x="0" y="0"/>')
     .replace('<hp:shapeComment>사각형</hp:shapeComment>', '<hp:shapeComment>글상자</hp:shapeComment>');
   const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
