@@ -2236,7 +2236,7 @@ async function readStdin() {
   // Table structure: delete a whole row (raw-patch — TABLE rows−1 + row-size
   // entry removed, the row's cells deleted, cells below renumbered). See
   // cell-patch.js deleteTableRowInPlace.
-  const DELROW_OPS = new Set(['delete_table_row']);
+  const DELROW_OPS = new Set(['delete_table_row', 'delete_table_col']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2474,12 +2474,19 @@ async function readStdin() {
         subModes.push(`merge:${mgSummary.mode || 'in-place'}`);
         for (const e of mgSummary) allEdits.push({ kind: 'merge', ...e });
       }
-      const delRowOps = ops.filter((o) => DELROW_OPS.has(o.type));
+      const delRowOps = ops.filter((o) => o.type === 'delete_table_row');
       if (delRowOps.length > 0) {
         const { deleteTableRowInPlace } = await import('./cell-patch.js');
         const drSummary = await deleteTableRowInPlace(outPath, delRowOps);
         subModes.push(`delrow:${drSummary.mode || 'in-place'}`);
         for (const e of drSummary) allEdits.push({ kind: 'delete_row', ...e });
+      }
+      const delColOps = ops.filter((o) => o.type === 'delete_table_col');
+      if (delColOps.length > 0) {
+        const { deleteTableColInPlace } = await import('./cell-patch.js');
+        const dcSummary = await deleteTableColInPlace(outPath, delColOps);
+        subModes.push(`delcol:${dcSummary.mode || 'in-place'}`);
+        for (const e of dcSummary) allEdits.push({ kind: 'delete_col', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');
