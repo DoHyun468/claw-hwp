@@ -61,6 +61,7 @@
 //   distribute_table      { table, mode? }    // 높이/너비 같게 — mode: width | height | both
 //   insert_textbox        { text, index?, width_mm?, height_mm?, fill_color?, line_color? }  // 글상자 (rect + drawText)
 //   set_page_number       { where?, align? }   // 쪽 번호 — where: footer|header, align: LEFT|CENTER|RIGHT
+//   split_cell            { table, row, col, rows?, cols? }  // 셀 나누기 — split one cell into rows×cols
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -549,6 +550,91 @@ function opMergeCells(doc, tableIndex, mode, opts) {
   const newTbl = `<hp:tbl${el.attrs}>${dropLinesegs(tbl)}</hp:tbl>`;
   doc.write(section, spliceEl(doc.read(section), el, newTbl));
   return { table: tableIndex, mode, merged: opts.count };
+}
+
+// Read/write the numeric attr of a tc's <hp:cellAddr|cellSpan|cellSz> child.
+function tcTagAttr(inner, tag, name) {
+  const m = inner.match(new RegExp(`<hp:${tag}\\b([^>]*?)/?>`));
+  const v = m ? getAttr(m[1], name) : null;
+  return v == null ? null : Number(v);
+}
+function setTcTagAttr(inner, tag, name, val) {
+  return inner.replace(new RegExp(`(<hp:${tag}\\b[^>]*?\\b${name}=")\\d+(")`), `$1${val}$2`);
+}
+
+// Split one table cell into nRows × nCols sub-cells (셀 나누기). Grid model
+// verified against Hancom-native ground truth (claw-hancomdocs split → download):
+// splitting a 1×1 cell inserts (nCols-1) grid columns and/or (nRows-1) grid rows
+// at the cell's position; every other cell that SPANS the split axis grows its
+// span to keep covering it, and cells past the split shift their addr. The target
+// becomes an N×M block of fresh 1×1 cells (top-left keeps the text, rest empty).
+function opSplitCell(doc, tableIndex, row, col, nRows, nCols) {
+  nRows = Math.max(1, Number(nRows) || 1);
+  nCols = Math.max(1, Number(nCols) || 1);
+  if (nRows < 2 && nCols < 2) throw new Error('split_cell: need rows>=2 or cols>=2');
+  const { section, el } = getTable(doc, tableIndex);
+  const rowsEls = scanTopLevel(el.inner, 'hp:tr');
+  // Locate the target cell by its (colAddr, rowAddr) grid address.
+  let targetTrIdx = -1, target = null;
+  for (let r = 0; r < rowsEls.length; r++) {
+    const hit = scanTopLevel(rowsEls[r].inner, 'hp:tc').find(
+      (tc) => tcTagAttr(tc.inner, 'cellAddr', 'colAddr') === col && tcTagAttr(tc.inner, 'cellAddr', 'rowAddr') === row);
+    if (hit) { targetTrIdx = r; target = hit; break; }
+  }
+  if (!target) throw new Error(`split_cell: cell (row ${row}, col ${col}) not found in table ${tableIndex}`);
+  if ((tcTagAttr(target.inner, 'cellSpan', 'colSpan') || 1) !== 1 || (tcTagAttr(target.inner, 'cellSpan', 'rowSpan') || 1) !== 1)
+    throw new Error('split_cell: target is a merged cell — unmerge (merge boundaries) before splitting');
+  const tW = tcTagAttr(target.inner, 'cellSz', 'width') || 1, tH = tcTagAttr(target.inner, 'cellSz', 'height') || 1;
+  const subW = Math.max(1, Math.round(tW / nCols)), subH = Math.max(1, Math.round(tH / nRows));
+  const dM = nCols - 1, dN = nRows - 1;
+
+  // Build one fresh 1×1 sub-cell from the target template at grid (c, r).
+  const subCell = (c, r, empty) => {
+    let inner = target.inner;
+    inner = setTcTagAttr(setTcTagAttr(inner, 'cellAddr', 'colAddr', c), 'cellAddr', 'rowAddr', r);
+    inner = setTcTagAttr(setTcTagAttr(inner, 'cellSpan', 'colSpan', 1), 'cellSpan', 'rowSpan', 1);
+    inner = setTcTagAttr(setTcTagAttr(inner, 'cellSz', 'width', subW), 'cellSz', 'height', subH);
+    if (empty) inner = setCellInner(inner, '');
+    return freshenIds(`<hp:tc${target.attrs}>${inner}</hp:tc>`);
+  };
+
+  const newRows = [];
+  for (let r = 0; r < rowsEls.length; r++) {
+    const rowEl = rowsEls[r];
+    const pieces = [];
+    for (const tc of scanTopLevel(rowEl.inner, 'hp:tc')) {
+      const ca = tcTagAttr(tc.inner, 'cellAddr', 'colAddr'), ra = tcTagAttr(tc.inner, 'cellAddr', 'rowAddr');
+      const cs = tcTagAttr(tc.inner, 'cellSpan', 'colSpan') || 1, rs = tcTagAttr(tc.inner, 'cellSpan', 'rowSpan') || 1;
+      if (r === targetTrIdx && ca === col && ra === row) {
+        // Target's own (top) band: M sub-cells across, top-left keeps content.
+        for (let dc = 0; dc < nCols; dc++) pieces.push(subCell(col + dc, row, dc !== 0));
+        continue;
+      }
+      let inner = tc.inner, nca = ca, nra = ra, ncs = cs, nrs = rs;
+      if (ca > col) nca = ca + dM;                              // shift cells right of the split
+      else if (ca <= col && ca + cs - 1 >= col) ncs = cs + dM;  // grow cells spanning the split column
+      if (ra > row) nra = ra + dN;                             // shift cells below the split
+      else if (ra <= row && ra + rs - 1 >= row) nrs = rs + dN;  // grow cells spanning the split row
+      inner = setTcTagAttr(setTcTagAttr(inner, 'cellAddr', 'colAddr', nca), 'cellAddr', 'rowAddr', nra);
+      inner = setTcTagAttr(setTcTagAttr(inner, 'cellSpan', 'colSpan', ncs), 'cellSpan', 'rowSpan', nrs);
+      pieces.push(`<hp:tc${tc.attrs}>${inner}</hp:tc>`);
+    }
+    newRows.push(`<hp:tr${rowEl.attrs}>${pieces.join('')}</hp:tr>`);
+    // After the target's row, insert dN new grid rows, each holding only the M
+    // target sub-cells (other columns are covered by the rowSpan-extended cells).
+    if (r === targetTrIdx && dN > 0) {
+      for (let dr = 1; dr <= dN; dr++) {
+        const cells = [];
+        for (let dc = 0; dc < nCols; dc++) cells.push(subCell(col + dc, row + dr, true));
+        newRows.push(`<hp:tr${rowEl.attrs}>${cells.join('')}</hp:tr>`);
+      }
+    }
+  }
+  let newAttrs = el.attrs;
+  if (dM) newAttrs = bumpColCnt(newAttrs, dM);
+  if (dN) newAttrs = bumpRowCnt(newAttrs, dN);
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${newAttrs}>${dropLinesegs(newRows.join(''))}</hp:tbl>`));
+  return { table: tableIndex, row, col, intoRows: nRows, intoCols: nCols };
 }
 
 // Insert a brand-new table (rows × cols) as a fresh paragraph at `index`.
@@ -2748,6 +2834,7 @@ function applyOp(doc, op) {
     case 'distribute_table': return opDistributeTable(doc, op.table, op.mode);
     case 'insert_textbox': return opInsertTextbox(doc, op);
     case 'set_page_number': return opSetPageNumber(doc, op.where, op.align);
+    case 'split_cell': return opSplitCell(doc, op.table, op.row, op.col, op.rows, op.cols);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
