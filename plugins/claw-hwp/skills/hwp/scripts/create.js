@@ -2240,7 +2240,7 @@ async function readStdin() {
   // Table structure: insert a blank row (raw-patch — TABLE rows+1, new row-size
   // entry, blank cells cloned from empty cells, cells below renumbered). See
   // cell-patch.js insertTableRowInPlace.
-  const INSROW_OPS = new Set(['insert_table_row']);
+  const INSROW_OPS = new Set(['insert_table_row', 'insert_table_col']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2492,12 +2492,19 @@ async function readStdin() {
         subModes.push(`delcol:${dcSummary.mode || 'in-place'}`);
         for (const e of dcSummary) allEdits.push({ kind: 'delete_col', ...e });
       }
-      const insRowOps = ops.filter((o) => INSROW_OPS.has(o.type));
+      const insRowOps = ops.filter((o) => o.type === 'insert_table_row');
       if (insRowOps.length > 0) {
         const { insertTableRowInPlace } = await import('./cell-patch.js');
         const irSummary = await insertTableRowInPlace(outPath, insRowOps);
         subModes.push(`insrow:${irSummary.mode || 'in-place'}`);
         for (const e of irSummary) allEdits.push({ kind: 'insert_row', ...e });
+      }
+      const insColOps = ops.filter((o) => o.type === 'insert_table_col');
+      if (insColOps.length > 0) {
+        const { insertTableColInPlace } = await import('./cell-patch.js');
+        const icSummary = await insertTableColInPlace(outPath, insColOps);
+        subModes.push(`inscol:${icSummary.mode || 'in-place'}`);
+        for (const e of icSummary) allEdits.push({ kind: 'insert_col', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

@@ -4966,6 +4966,130 @@ export async function insertTableRowInPlace(filePath, ops) {
 }
 
 /**
+ * Insert a blank table column (`insert_table_col`) into an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, col, position? }` where
+ * `position` = 'right' (default) or 'left' relative to `col`. GT-confirmed:
+ * TABLE cols+1, every cell to the right renumbered (col+1), a cell SPANNING
+ * across the new column gets colSpan+1 (so a merged title cell grows and that
+ * row gets no separate new cell), and every other row gets one blank cell
+ * cloned at the new column. Blank cells are cloned from an existing empty 1×1
+ * cell; a table with none is rejected. Section 0 only.
+ */
+export async function insertTableColInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`insert_table_col: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.col)) throw new Error("insert_table_col: 'col' (integer) is required");
+    if (op.position && op.position !== 'left' && op.position !== 'right') throw new Error("insert_table_col: position must be 'left' or 'right'");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cols = secRaw.readUInt16LE(tableRec.dataOff + 6);
+    if (op.col < 0 || op.col >= cols) throw new Error(`insert_table_col: col ${op.col} out of range (table has ${cols} cols)`);
+    const newCol = (op.position ?? 'right') === 'right' ? op.col + 1 : op.col;
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    // expand cells spanning across the new column; track which rows they cover.
+    const covered = new Set();
+    for (const c of cells) {
+      if (c.col < newCol && c.col + c.colSpan > newCol) {
+        secRaw.writeUInt16LE((c.colSpan + 1) & 0xFFFF, c.lhDataOff + 12);
+        for (let rr = c.row; rr < c.row + c.rowSpan; rr++) covered.add(rr);
+      }
+    }
+    // renumber cells to the right of the new column (in-place).
+    for (const c of cells) if (c.col >= newCol) secRaw.writeUInt16LE((c.col + 1) & 0xFFFF, c.lhDataOff + 8);
+
+    // one blank cell per uncovered row, at the new column.
+    const inserts = [];
+    for (let r = 0; r < rows; r++) {
+      if (covered.has(r)) continue;
+      // prefer an empty cell from the REFERENCE column (op.col) so the new
+      // column inherits a sensible width, then the same row, then any.
+      const empty1x1 = (cc) => cc.colSpan === 1 && cc.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(cc.startByte, cc.endByte));
+      let tmpl = cells.find((cc) => cc.col === op.col && empty1x1(cc))
+        || cells.find((cc) => cc.row === r && empty1x1(cc))
+        || cells.find((cc) => empty1x1(cc));
+      if (!tmpl) throw new Error(`insert_table_col: no empty 1×1 cell to clone for row ${r}`);
+      const cluster = cloneCellCluster(secRaw.slice(tmpl.startByte, tmpl.endByte), r, newCol);
+      let off = null;
+      for (const cc of cells) { if (cc.row === r && cc.col >= newCol) { off = cc.startByte; break; } }
+      if (off == null) { const rc = cells.filter((cc) => cc.row === r); off = rc.length ? rc[rc.length - 1].endByte : (tableRec.dataOff + tableRec.size); }
+      inserts.push({ off, cluster });
+      const rsOff = tableRec.dataOff + 18 + r * 2;
+      secRaw.writeUInt16LE((secRaw.readUInt16LE(rsOff) + 1) & 0xFFFF, rsOff);
+    }
+    secRaw.writeUInt16LE((cols + 1) & 0xFFFF, tableRec.dataOff + 6); // TABLE cols+1 (in place)
+
+    inserts.sort((a, b) => b.off - a.off);
+    for (const ins of inserts) secRaw = Buffer.concat([secRaw.slice(0, ins.off), ins.cluster, secRaw.slice(ins.off)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, newCol, added: inserts.length });
+  }
+  return Object.assign(summary, { mode: 'in-place', inserted_count: summary.length });
+}
+
+/**
  * Delete a whole table column (`delete_table_col`) from an existing `.hwp` via
  * raw-patch. Op: `{ section?, para?, control?, col }`. GT-confirmed: TABLE
  * cols−1 (in place — no record resize, unlike row delete), each affected row's
