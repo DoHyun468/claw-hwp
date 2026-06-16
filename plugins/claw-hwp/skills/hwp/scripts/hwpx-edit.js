@@ -38,7 +38,7 @@
 //   clear_list            { index }                                        // removes list formatting
 //   apply_text_style      { target, color?, bold?, italic?, underline?, size?, highlight?, strikethrough?, supscript?, subscript?, fontFace? }
 //   apply_paragraph_style { index, align?, indent?, lineSpacing? }
-//   insert_image          { source, ext?, width?, height? }
+//   insert_image          { source, ext?, width_mm?, height_mm? (or raw width?/height? in HWPUNIT) }
 //   replace_image         { target, source }
 //   delete_image          { target }
 //   set_field_value       { name, value }
@@ -2946,7 +2946,9 @@ function applyOp(doc, op) {
     case 'clear_list': return opSetParagraphList(doc, op.index, 'NONE', 0);
     case 'apply_text_style': return opApplyTextStyle(doc, op.target, op);
     case 'apply_paragraph_style': return opApplyParagraphStyle(doc, op.index, op);
-    case 'insert_image': return opInsertImage(doc, op.source, op.ext, op.width, op.height);
+    case 'insert_image': return opInsertImage(doc, op.source, op.ext,
+      op.width_mm != null ? Math.round(Number(op.width_mm) * 283.46) : op.width,
+      op.height_mm != null ? Math.round(Number(op.height_mm) * 283.46) : op.height);
     case 'replace_image': return opReplaceImage(doc, op.target, op.source);
     case 'delete_image': return opDeleteImage(doc, op.target);
     case 'set_field_value': return opSetFieldValue(doc, op.name, op.value);
