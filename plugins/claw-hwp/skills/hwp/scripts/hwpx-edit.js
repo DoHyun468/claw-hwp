@@ -60,6 +60,7 @@
 //   insert_table_column   { table, col, where?, cells? }  // 칸 추가 — before/after col index (renumbers colAddr)
 //   distribute_table      { table, mode? }    // 높이/너비 같게 — mode: width | height | both
 //   insert_textbox        { text, index?, width_mm?, height_mm?, fill_color?, line_color? }  // 글상자 (rect + drawText)
+//   set_page_number       { where?, align? }   // 쪽 번호 — where: footer|header, align: LEFT|CENTER|RIGHT
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2088,6 +2089,37 @@ function opSetHeaderFooter(doc, kind, text, applyPageType) {
   return { kind, applyPageType: apply, inserted: true };
 }
 
+// Page number (쪽번호) — a header/footer whose paragraph holds an <hp:autoNum
+// numType="PAGE"> control (Hancom fills the live number). Inserts a new
+// header/footer; `align` (left/center/right) is best-effort: reuse a paraPr that
+// already declares that horizontal align, else fall back to the default (left).
+function opSetPageNumber(doc, where, align) {
+  const kind = String(where || 'footer').toLowerCase() === 'header' ? 'header' : 'footer';
+  const tag = `hp:${kind}`;
+  const al = String(align || 'CENTER').toUpperCase();
+  let pprId = '0';
+  const headerName = doc.headerName();
+  if (headerName && al !== 'LEFT') {
+    const hit = scanTopLevel(doc.read(headerName), 'hh:paraPr').find((pp) => new RegExp(`<hh:align\\b[^>]*horizontal="${al}"`).test(pp.inner));
+    if (hit) pprId = getAttr(hit.attrs, 'id');
+  }
+  const firstSec = doc.sectionNames()[0];
+  if (!firstSec) throw new Error('set_page_number: no Contents/section*.xml found');
+  let xml = doc.read(firstSec);
+  const paras = scanTopLevel(xml, 'hp:p');
+  if (!paras.length) throw new Error('set_page_number: no <hp:p> to anchor insertion');
+  const autoNum = `<hp:ctrl><hp:autoNum num="1" numType="PAGE"><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar="" supscript="0"/></hp:autoNum></hp:ctrl><hp:t/>`;
+  const wrapper =
+    `<hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:ctrl>` +
+      `<${tag} id="0" applyPageType="BOTH"><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="${kind === 'footer' ? 'BOTTOM' : 'TOP'}" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
+        `<hp:p id="0" paraPrIDRef="${pprId}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">${autoNum}</hp:run></hp:p>` +
+      `</hp:subList></${tag}>` +
+    `</hp:ctrl></hp:run></hp:p>`;
+  const at = paras[0].end;
+  doc.write(firstSec, dropLinesegs(xml.slice(0, at) + wrapper + xml.slice(at)));
+  return { where: kind, align: al, paraPrId: pprId, inserted: true };
+}
+
 function opRemoveHeaderFooter(doc, kind) {
   const tag = `hp:${kind}`;
   let removed = 0;
@@ -2715,6 +2747,7 @@ function applyOp(doc, op) {
     case 'insert_table_column': return opInsertTableColumn(doc, op.table, op.col, op.where, op.cells);
     case 'distribute_table': return opDistributeTable(doc, op.table, op.mode);
     case 'insert_textbox': return opInsertTextbox(doc, op);
+    case 'set_page_number': return opSetPageNumber(doc, op.where, op.align);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
