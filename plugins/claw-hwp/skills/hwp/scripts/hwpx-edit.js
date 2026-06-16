@@ -62,6 +62,7 @@
 //   insert_textbox        { text, index?, width_mm?, height_mm?, fill_color?, line_color? }  // 글상자 (rect + drawText)
 //   set_page_number       { where?, align? }   // 쪽 번호 — where: footer|header, align: LEFT|CENTER|RIGHT
 //   split_cell            { table, row, col, rows?, cols? }  // 셀 나누기 — split one cell into rows×cols
+//   set_caption           { target?, index?, text, side?, gap_mm? }  // 캡션 — target: image|chart|shape|table
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -635,6 +636,55 @@ function opSplitCell(doc, tableIndex, row, col, nRows, nCols) {
   if (dN) newAttrs = bumpRowCnt(newAttrs, dN);
   doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${newAttrs}>${dropLinesegs(newRows.join(''))}</hp:tbl>`));
   return { table: tableIndex, row, col, intoRows: nRows, intoCols: nCols };
+}
+
+// Attach a caption (캡션, e.g. "그림 1." / "표 1.") to an object. Structure
+// verified against Hancom-native ground truth (image caption via claw-hancomdocs
+// → download): <hp:caption side= fullSz="0" width= gap= lastWidth="0"> holding a
+// subList>p>run>t, placed as the LAST child of the object element (after
+// shapeComment for pic/shape/chart). Tables carry it right after the shape-header
+// group (sz/pos/outMargin/inMargin), before the rows.
+const CAPTION_SIDES = new Set(['BOTTOM', 'TOP', 'LEFT', 'RIGHT']);
+const CAPTION_TARGETS = { image: ['hp:pic'], chart: ['hp:chart'], shape: ['hp:rect', 'hp:ellipse', 'hp:line'], table: ['hp:tbl'] };
+function opSetCaption(doc, target, index, text, side, gapMm) {
+  target = String(target || 'image').toLowerCase();
+  const tags = CAPTION_TARGETS[target];
+  if (!tags) throw new Error(`set_caption: target must be one of ${Object.keys(CAPTION_TARGETS).join('/')}`);
+  if (text == null || text === '') throw new Error('set_caption: text is required');
+  const idx = Math.max(0, Number(index) || 0);
+  const sd = String(side || 'BOTTOM').toUpperCase();
+  if (!CAPTION_SIDES.has(sd)) throw new Error('set_caption: side must be BOTTOM/TOP/LEFT/RIGHT');
+  const gap = gapMm != null ? Math.max(0, Math.round(Number(gapMm) * 283.46)) : 850; // ~3mm default
+  let seen = 0;
+  for (const name of doc.sectionNames()) {
+    const xml = doc.read(name);
+    const matches = [];
+    for (const tag of tags) for (const el of scanTopLevel(xml, tag)) matches.push({ tag, el });
+    matches.sort((a, b) => a.el.start - b.el.start);
+    for (const { tag, el } of matches) {
+      if (seen++ !== idx) continue;
+      const szM = el.inner.match(/<hp:sz\b[^>]*\bwidth="(\d+)"[^>]*\bheight="(\d+)"/);
+      const ow = szM ? Number(szM[1]) : 14173, oh = szM ? Number(szM[2]) : 8504;
+      const capW = (sd === 'BOTTOM' || sd === 'TOP') ? ow : oh;
+      const caption =
+        `<hp:caption side="${sd}" fullSz="0" width="${capW}" gap="${gap}" lastWidth="0">` +
+          `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
+            `<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run></hp:p>` +
+          `</hp:subList></hp:caption>`;
+      let inner = el.inner.replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, ''); // replace any existing caption
+      let newInner;
+      if (target === 'table') {
+        const anchor = (inner.match(/<hp:inMargin\b[^>]*\/>/) || inner.match(/<hp:outMargin\b[^>]*\/>/) || [null])[0];
+        if (anchor) { const at = inner.indexOf(anchor) + anchor.length; newInner = inner.slice(0, at) + caption + inner.slice(at); }
+        else newInner = caption + inner;
+      } else {
+        newInner = inner + caption; // last child — matches pic ground truth
+      }
+      doc.write(name, spliceEl(xml, el, `<${tag}${el.attrs}>${newInner}</${tag}>`));
+      return { target, index: idx, side: sd, gap, captionWidth: capW };
+    }
+  }
+  throw new Error(`set_caption: no ${target} #${idx} found in document`);
 }
 
 // Insert a brand-new table (rows × cols) as a fresh paragraph at `index`.
@@ -2835,6 +2885,7 @@ function applyOp(doc, op) {
     case 'insert_textbox': return opInsertTextbox(doc, op);
     case 'set_page_number': return opSetPageNumber(doc, op.where, op.align);
     case 'split_cell': return opSplitCell(doc, op.table, op.row, op.col, op.rows, op.cols);
+    case 'set_caption': return opSetCaption(doc, op.target, op.index, op.text, op.side, op.gap_mm);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }

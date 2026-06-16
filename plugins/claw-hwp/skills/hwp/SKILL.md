@@ -249,7 +249,7 @@ exist yet.
 
 | Input | Use | What's available |
 |-------|-----|------------------|
-| `.hwpx` | **`hwpx-edit.js`** | text · paragraph · table (`insert_table`, cell content/background/border/diagonal/align/size, row/column, merge, split (셀 나누기)) · image (insert/replace/delete) · char & paragraph styling · header/footer · page break · bullet/number lists (style: korean/decimal, custom bullet glyph) · footnote/endnote · hyperlink · equation (math formula) · columns (다단) · page setup (편집 용지) · chart (차트) · shape (도형) · textbox (글상자) · page number (쪽 번호) |
+| `.hwpx` | **`hwpx-edit.js`** | text · paragraph · table (`insert_table`, cell content/background/border/diagonal/align/size, row/column, merge, split (셀 나누기)) · image (insert/replace/delete) · char & paragraph styling · header/footer · page break · bullet/number lists (style: korean/decimal, custom bullet glyph) · footnote/endnote · hyperlink · equation (math formula) · columns (다단) · page setup (편집 용지) · chart (차트) · shape (도형) · textbox (글상자) · page number (쪽 번호) · caption (캡션) |
 | `.hwp` | **`create.js`** (raw-patch via `cell-patch.js`) | set_cell_text · replace_text · append_paragraph/heading/table/list/break · setup_document · apply_text_style · apply_paragraph_style |
 
 Detect format by reading the first two bytes — `PK` = HWPX (treat as `.hwpx` regardless of extension).
