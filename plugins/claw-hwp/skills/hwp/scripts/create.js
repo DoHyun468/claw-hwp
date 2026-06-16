@@ -643,6 +643,71 @@ const HANDLERS = {
     log.push(`append_paragraph (${cursor.charOffset} chars)`);
   },
 
+  // Insert a Hancom equation (수식) from a Hancom equation script. rhwp's
+  // insertEquation builds a native HYhwpEQ object — the same equation engine
+  // Hancom's own editor uses — so every token in references/equation-syntax.md
+  // renders identically to the UI editor (verified: 21-case syntax sweep all
+  // embed + render). Routes through the rhwp emit path (NOT raw-patch), so it's
+  // a from-scratch / small-file feature like append_image.
+  append_equation(doc, op, cursor) {
+    const script = String(op.script ?? "").trim();
+    if (!script) throw new Error("append_equation: 'script' (Hancom equation script) is required");
+    startNewParagraph(doc, cursor);
+    const size = Number.isFinite(op.size) ? op.size : 1000;   // HWP units/100 (1000 ≈ 10pt)
+    const color = op.color ?? "#000000";
+    unwrap(
+      doc.insertEquation(cursor.sec, cursor.para, cursor.charOffset, script, size, color),
+      "insertEquation",
+    );
+    // Advance past the equation control so the next op splits after it.
+    try { cursor.charOffset = doc.getParagraphLength(cursor.sec, cursor.para); } catch {}
+    applyParaProps(doc, cursor, {
+      align: op.align,
+      spacingBefore: op.spacing_before ?? 0,
+      spacingAfter: op.spacing_after ?? BODY_SPACING_AFTER,
+    });
+    log.push(`append_equation (${script.length} chars)`);
+  },
+
+  // Header / footer (머리말 / 꼬리말). Document-level, via rhwp createHeaderFooter
+  // + insertTextInHeaderFooter — renders in Hancom (verified). apply_to 0 = both
+  // pages. Doesn't touch the body cursor. from-scratch / rhwp-emit path only.
+  set_header(doc, op, cursor) {
+    const text = String(op.text ?? "");
+    const applyTo = Number.isFinite(op.apply_to) ? op.apply_to : 0;
+    unwrap(doc.createHeaderFooter(cursor.sec, true, applyTo), "createHeaderFooter(header)");
+    if (text) unwrap(doc.insertTextInHeaderFooter(cursor.sec, true, applyTo, 0, 0, text), "insertTextInHeaderFooter(header)");
+    log.push(`set_header ("${truncForLog(text)}")`);
+  },
+  set_footer(doc, op, cursor) {
+    const text = String(op.text ?? "");
+    const applyTo = Number.isFinite(op.apply_to) ? op.apply_to : 0;
+    unwrap(doc.createHeaderFooter(cursor.sec, false, applyTo), "createHeaderFooter(footer)");
+    if (text) unwrap(doc.insertTextInHeaderFooter(cursor.sec, false, applyTo, 0, 0, text), "insertTextInHeaderFooter(footer)");
+    log.push(`set_footer ("${truncForLog(text)}")`);
+  },
+
+  // Footnote (각주). Attaches a footnote to the END of the current paragraph
+  // (the cursor) — add it right after the append_paragraph it should annotate.
+  // rhwp insertFootnote + insertTextInFootnote, renders in Hancom (verified).
+  append_footnote(doc, op, cursor) {
+    const text = String(op.text ?? "");
+    if (!text) throw new Error("append_footnote: 'text' is required");
+    const r = unwrap(doc.insertFootnote(cursor.sec, cursor.para, cursor.charOffset), "insertFootnote");
+    const ctrl = (r && typeof r.controlIdx === "number") ? r.controlIdx : 0;
+    unwrap(doc.insertTextInFootnote(cursor.sec, cursor.para, ctrl, 0, 0, text), "insertTextInFootnote");
+    try { cursor.charOffset = doc.getParagraphLength(cursor.sec, cursor.para); } catch {}
+    log.push(`append_footnote ("${truncForLog(text)}")`);
+  },
+
+  // Bookmark (책갈피) at the cursor — invisible nav/reference mark. rhwp addBookmark.
+  add_bookmark(doc, op, cursor) {
+    const name = String(op.name ?? "");
+    if (!name) throw new Error("add_bookmark: 'name' is required");
+    unwrap(doc.addBookmark(cursor.sec, cursor.para, cursor.charOffset, name), "addBookmark");
+    log.push(`add_bookmark ("${name}")`);
+  },
+
   append_heading(doc, op, cursor) {
     startNewParagraph(doc, cursor);
     const level = Math.max(1, Math.min(6, op.level || 1));

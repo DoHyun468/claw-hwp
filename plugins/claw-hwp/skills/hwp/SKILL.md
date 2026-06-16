@@ -131,8 +131,12 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 | `append_paragraph` | `text` | `align`, `line_spacing`, `spacing_before`, `spacing_after`, `runs` |
 | `append_table` ⚠️ | `headers`, `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props` |
 | `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt` |
+| `append_equation` | `script` (Hangul equation script — token reference in `references/equation-syntax.md`) | `size` (HWP units/100, default 1000 ≈ 10pt), `color` (`#RRGGBB`), `align` |
 | `append_bullet_list`, `append_numbered_list` | `items[]` | — |
 | `append_page_break` | — | — |
+| `set_header`, `set_footer` | `text` | `apply_to` (0 = both pages, default) — 머리말/꼬리말, whole document |
+| `append_footnote` | `text` | — (attaches a footnote to the **end of the current paragraph** — add right after the `append_paragraph` it annotates) |
+| `add_bookmark` | `name` | — (invisible navigation mark at the cursor) |
 | `apply_text_style` ⚠️ | `target` (string to find) | `color`, `bold`, `italic`, `underline`, `strikethrough`, `size` (pt), `highlight` (`true` / `"#RRGGBB"` / `false`), `font_family`, `superscript`, `subscript`, `underline_color`, `letter_spacing`, `char_ratio` |
 | `apply_paragraph_style` ⚠️ | `index` (paragraph index, 0-based) | `align`, `indent`, `line_spacing` (% e.g. 130), `margin_left`, `margin_right`, `spacing_before`, `spacing_after`, `background_color`, `page_break_before`, `keep_with_next` |
 
@@ -509,3 +513,4 @@ Otherwise: don't push verification — user can invoke the companion skill thems
 - `references/hwpx-format.md` — HWPX file structure, XML schema cheatsheet, common edit patterns
 - `references/hwpx-edit-ops.md` — `hwpx-edit.js` operation vocabulary (every op, its args, and examples)
 - `references/rhwp-api.md` — `@rhwp/core` API surface for create/convert operations
+- `references/equation-syntax.md` — Hangul equation script tokens for the `append_equation` op (structures + symbols)
