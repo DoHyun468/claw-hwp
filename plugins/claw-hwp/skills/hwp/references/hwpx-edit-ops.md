@@ -59,6 +59,8 @@ each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 |--------|------|-------|
 | `set_cell_text` | `table`, `row`, `col`, `text` | Sets one cell's text. |
 | `append_table_row` | `table`, `cells` (string[]) | Clones the last row; fills cells left-to-right; updates `rowCnt`. Inherits the last row's column count. |
+| `insert_table_row` | `table`, `row`, `where?` (`before` default / `after`), `cells?` (string[]) | Inserts a row relative to row `row` (clones it for shape, fills `cells`), updates `rowCnt`, and renumbers every cell's `rowAddr` to its row index. Best on rectangular tables — a table with `rowSpan` merges may need manual `cellAddr` fixup. |
+| `insert_table_column` | `table`, `col`, `where?` (`before`/`after`), `cells?` (string[], top→bottom) | Inserts a column relative to col `col` in every row, updates `colCnt`, renumbers `colAddr`. Same merge caveat as `insert_table_row`. |
 | `delete_table_row` | `table`, `row` | Removes a row; updates `rowCnt`. |
 | `append_table_column` | `table`, `cells` (string[], top→bottom) | Adds a cell to every row's end; updates `colCnt`. |
 | `delete_table_column` | `table`, `col` | Removes the cell at `col` in every row; updates `colCnt`. |

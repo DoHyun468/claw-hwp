@@ -56,6 +56,8 @@
 //   insert_chart          { chart_type?, cat?, series? }  // chart: col/bar/line/area/pie (or 0-19); series=[{name,values:[]}], cat=[labels]
 //   insert_shape          { shape, index?, width_mm?, height_mm?, fill_color?, line_color? }  // 도형: rect | ellipse | line
 //   set_column_break      { index, on? }    // 단 나누기 (column break before paragraph index)
+//   insert_table_row      { table, row, where?, cells? }  // 줄 추가 — before/after row index (renumbers rowAddr)
+//   insert_table_column   { table, col, where?, cells? }  // 칸 추가 — before/after col index (renumbers colAddr)
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -379,6 +381,35 @@ function opAppendTableRow(doc, tableIndex, cells) {
   return { table: tableIndex, appendedCols: tcs.length };
 }
 
+// Insert a row at a position (줄 추가 — 위/아래). Clones row `row` for shape,
+// fills `cells`, inserts before (default) or after it, then normalizes every
+// cell's rowAddr to its row index so the cellAddr grid stays consistent.
+function opInsertTableRow(doc, tableIndex, row, where, cells) {
+  const { section, el } = getTable(doc, tableIndex);
+  let tbl = el.inner;
+  const rows = scanTopLevel(tbl, 'hp:tr');
+  if (!rows.length) throw new Error('insert_table_row: table has no rows');
+  const refIdx = Math.max(0, Math.min(row != null ? Number(row) : rows.length - 1, rows.length - 1));
+  const ref = rows[refIdx];
+  const tcs = scanTopLevel(ref.inner, 'hp:tc');
+  let acc = '';
+  for (let ci = 0; ci < tcs.length; ci++) {
+    const cellInner = setCellInner(tcs[ci].inner, (cells && cells[ci] != null) ? cells[ci] : '');
+    acc += freshenIds(`<hp:tc${tcs[ci].attrs}>${cellInner}</hp:tc>`);
+  }
+  const newRow = `<hp:tr${ref.attrs}>${acc}</hp:tr>`;
+  const refFull = `<hp:tr${ref.attrs}>${ref.inner}</hp:tr>`;
+  tbl = spliceEl(tbl, ref, where === 'after' ? refFull + newRow : newRow + refFull);
+  // Normalize rowAddr = row index (splice high→low so offsets stay valid).
+  const all = scanTopLevel(tbl, 'hp:tr');
+  for (let r = all.length - 1; r >= 0; r--) {
+    const fixed = all[r].inner.replace(/(<hp:cellAddr\b[^>]*\browAddr=")\d+(")/g, (m, a, b) => a + r + b);
+    if (fixed !== all[r].inner) tbl = spliceEl(tbl, all[r], `<hp:tr${all[r].attrs}>${fixed}</hp:tr>`);
+  }
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${bumpRowCnt(el.attrs, +1)}>${tbl}</hp:tbl>`));
+  return { table: tableIndex, insertedAt: where === 'after' ? refIdx + 1 : refIdx, rows: all.length };
+}
+
 function opDeleteTableRow(doc, tableIndex, row) {
   const { section, el } = getTable(doc, tableIndex);
   const tbl = el.inner;
@@ -415,6 +446,33 @@ function opAppendTableColumn(doc, tableIndex, cells) {
   }
   const newTbl = `<hp:tbl${bumpColCnt(el.attrs, +1)}>${tbl}</hp:tbl>`;
   doc.write(section, spliceEl(doc.read(section), el, newTbl));
+  return { table: tableIndex, rows: rows.length };
+}
+
+// Insert a column at a position (칸 추가 — 왼/오른쪽). For each row clones cell
+// `col`, fills `cells[r]`, inserts before/after it, then normalizes colAddr.
+function opInsertTableColumn(doc, tableIndex, col, where, cells) {
+  const { section, el } = getTable(doc, tableIndex);
+  let tbl = el.inner;
+  const rows = scanTopLevel(tbl, 'hp:tr');
+  for (let r = rows.length - 1; r >= 0; r--) {
+    const rowEl = rows[r];
+    const tcs = scanTopLevel(rowEl.inner, 'hp:tc');
+    if (!tcs.length) continue;
+    const refIdx = Math.max(0, Math.min(col != null ? Number(col) : tcs.length - 1, tcs.length - 1));
+    const ref = tcs[refIdx];
+    const cellInner = setCellInner(ref.inner, (cells && cells[r] != null) ? cells[r] : '');
+    const newTc = freshenIds(`<hp:tc${ref.attrs}>${cellInner}</hp:tc>`);
+    const refFull = `<hp:tc${ref.attrs}>${ref.inner}</hp:tc>`;
+    let rowInner = spliceEl(rowEl.inner, ref, where === 'after' ? refFull + newTc : newTc + refFull);
+    const cells2 = scanTopLevel(rowInner, 'hp:tc');
+    for (let c = cells2.length - 1; c >= 0; c--) {
+      const fixedInner = cells2[c].inner.replace(/(<hp:cellAddr\b[^>]*\bcolAddr=")\d+(")/, (m, a, b) => a + c + b);
+      rowInner = spliceEl(rowInner, cells2[c], `<hp:tc${cells2[c].attrs}>${fixedInner}</hp:tc>`);
+    }
+    tbl = spliceEl(tbl, rowEl, `<hp:tr${rowEl.attrs}>${rowInner}</hp:tr>`);
+  }
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${bumpColCnt(el.attrs, +1)}>${tbl}</hp:tbl>`));
   return { table: tableIndex, rows: rows.length };
 }
 
@@ -2573,6 +2631,8 @@ function applyOp(doc, op) {
     case 'insert_chart': return opInsertChart(doc, op);
     case 'insert_shape': return opInsertShape(doc, op);
     case 'set_column_break': return opSetColumnBreak(doc, op.index, op.on);
+    case 'insert_table_row': return opInsertTableRow(doc, op.table, op.row, op.where, op.cells);
+    case 'insert_table_column': return opInsertTableColumn(doc, op.table, op.col, op.where, op.cells);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
