@@ -58,6 +58,7 @@
 //   set_column_break      { index, on? }    // 단 나누기 (column break before paragraph index)
 //   insert_table_row      { table, row, where?, cells? }  // 줄 추가 — before/after row index (renumbers rowAddr)
 //   insert_table_column   { table, col, where?, cells? }  // 칸 추가 — before/after col index (renumbers colAddr)
+//   distribute_table      { table, mode? }    // 높이/너비 같게 — mode: width | height | both
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -1534,6 +1535,29 @@ function opSetCellSize(doc, tableIndex, row, col, width, height) {
   return { table: tableIndex, row, col, width: w, height: h };
 }
 
+// Distribute row heights / column widths evenly (셀 높이를/너비를 같게). Sums the
+// current row heights and column widths, divides by the count, and rewrites every
+// cell's <hp:cellSz>. mode: "width" / "height" / "both" (default). Best on
+// rectangular tables; merged cells (colSpan/rowSpan>1) would need proportional
+// sizing this doesn't do.
+function opDistributeTable(doc, tableIndex, mode) {
+  mode = String(mode || 'both').toLowerCase();
+  if (!['width', 'height', 'both'].includes(mode)) throw new Error('distribute_table: mode must be width / height / both');
+  const { section, el } = getTable(doc, tableIndex);
+  const tbl = el.inner;
+  const rows = scanTopLevel(tbl, 'hp:tr');
+  if (!rows.length) throw new Error('distribute_table: table has no rows');
+  const rowH = rows.map((r) => { const c = scanTopLevel(r.inner, 'hp:tc')[0]; const m = c && c.inner.match(/<hp:cellSz width="\d+" height="(\d+)"/); return m ? Number(m[1]) : 0; });
+  const cols = scanTopLevel(rows[0].inner, 'hp:tc');
+  const colW = cols.map((c) => { const m = c.inner.match(/<hp:cellSz width="(\d+)"/); return m ? Number(m[1]) : 0; });
+  const eqH = Math.round(rowH.reduce((a, b) => a + b, 0) / rows.length);
+  const eqW = Math.round(colW.reduce((a, b) => a + b, 0) / (cols.length || 1));
+  const newInner = tbl.replace(/<hp:cellSz width="(\d+)" height="(\d+)"\/>/g, (m, w, h) =>
+    `<hp:cellSz width="${mode === 'height' ? w : eqW}" height="${mode === 'width' ? h : eqH}"/>`);
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${newInner}</hp:tbl>`));
+  return { table: tableIndex, mode, eqWidth: mode !== 'height' ? eqW : undefined, eqHeight: mode !== 'width' ? eqH : undefined, rows: rows.length, cols: cols.length };
+}
+
 // ── style operations (clone-mutate-retarget in header.xml) ───────────────────
 
 // Find the <hp:run> that actually CONTAINS the first <hp:t> holding `target`,
@@ -2633,6 +2657,7 @@ function applyOp(doc, op) {
     case 'set_column_break': return opSetColumnBreak(doc, op.index, op.on);
     case 'insert_table_row': return opInsertTableRow(doc, op.table, op.row, op.where, op.cells);
     case 'insert_table_column': return opInsertTableColumn(doc, op.table, op.col, op.where, op.cells);
+    case 'distribute_table': return opDistributeTable(doc, op.table, op.mode);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }

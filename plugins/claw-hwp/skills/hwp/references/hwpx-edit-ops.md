@@ -84,6 +84,7 @@ when the same edit is performed through its UI.
 | `set_cell_diagonal` | `table`, `row`, `col`, `direction` (`"BACKSLASH"` `\` or `"SLASH"` `/`), `color?` (default `"#000000"`), `width?` (default `"0.3 mm"`) | Cellzone + borderFill whose `<hh:slash>` or `<hh:backSlash>` has `type="CENTER"` (Hancom's chosen enum for a solid diagonal — not `"SOLID"`). |
 | `set_cell_align` | `table`, `row`, `col`, `horizontal?` (`"LEFT"`/`"CENTER"`/`"RIGHT"`/`"JUSTIFY"`/`"DISTRIBUTE"`), `vertical?` (`"TOP"`/`"CENTER"`/`"BOTTOM"`) | `vertical` swaps `<hp:subList vertAlign>`. `horizontal` rewrites the cell's first `<hp:p>` paraPrIDRef through the same placeholder-paraPr trick as `apply_paragraph_style`. Either or both. |
 | `set_cell_size` | `table`, `row`, `col`, `width?`, `height?` (HWP units; one or both) | Rewrites the cell's `<hp:cellSz>` attrs. Hancom usually keeps row/column sizes consistent — changing one cell may make the row/column visually uneven until you set sibling cells to the same value. |
+| `distribute_table` | `table`, `mode?` (`width` / `height` / `both`, default `both`) | Evenly distributes column widths and/or row heights across the whole table (셀 너비를/높이를 같게): sums the current sizes, divides by the count, rewrites every `<hp:cellSz>`. Best on rectangular tables; merged cells aren't sized proportionally. |
 
 ### Styling (clone-mutate-retarget in `header.xml`)
 
