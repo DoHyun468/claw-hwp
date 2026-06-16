@@ -2972,17 +2972,21 @@ export async function insertHyperlinkInPlace(filePath, ops) {
 // "Footnote" style, and the footnote separator line + numbering are rendered
 // by Hancom from the always-present FOOTNOTE_SHAPE records. So this is a
 // resolution (not synthesis) op — self-contained writes stay in Section0.
-const FN_REF_CHAR_HEX   = '110020206e6600000000000000001100'; // 0x0011 + 'fn  ' + 0x0011
-const FN_CTRL_ID        = Buffer.from('20206e66', 'hex');      // '  nf' (= 'fn  ' reversed)
-const FN_LIST_HEADER_HEX = '01000000000000000000000000000000'; // nParas=1
-const FN_AUTONUM_HEX    = '12006f6e746100000000000000001200'; // 0x0012 + 'onta' + 0x0012
-const FN_ONTA_CTRL_HEX  = '6f6e7461010000000100000000002900'; // auto-number CTRL_HEADER
+// 각주(footnote) / 미주(endnote) share the same structure — they differ only
+// in the field ctrl id ('fn  ' vs 'en  '), the named style they resolve, and
+// the auto-number control's note-type byte (1 = footnote, 2 = endnote).
+const NOTE_KINDS = {
+  footnote: { refCharHex: '110020206e6600000000000000001100', ctrlId: '20206e66', styleName: 'Footnote', ontaType: 1 },
+  endnote:  { refCharHex: '110020206e6500000000000000001100', ctrlId: '20206e65', styleName: 'Endnote',  ontaType: 2 },
+};
+const NOTE_LIST_HEADER_HEX = '01000000000000000000000000000000'; // nParas=1
+const NOTE_AUTONUM_HEX     = '12006f6e746100000000000000001200'; // 0x0012 + 'onta' + 0x0012
 
 const TAG_STYLE_DI = 0x1a;  // HWPTAG_STYLE in DocInfo
 
-// Read the doc's "Footnote" style: its index (0-based among STYLE records)
-// plus the para_shape and char_shape ids it references.
-function resolveFootnoteStyle(buf) {
+// Read a named style (e.g. "Footnote" / "Endnote"): its index (0-based among
+// STYLE records) plus the para_shape and char_shape ids it references.
+function resolveNoteStyle(buf, styleName) {
   const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
   let sidx = 0;
   for (const r of parseRecords(di)) {
@@ -2993,32 +2997,32 @@ function resolveFootnoteStyle(buf) {
     const elen = sb.readUInt16LE(off); off += 2;
     const eng = sb.slice(off, off + elen * 2).toString('utf16le'); off += elen * 2;
     // off → prop(u8) next(u8) lang(u16) paraShape(u16) charShape(u16)
-    if (eng === 'Footnote') {
+    if (eng === styleName) {
       return { index: sidx, paraShape: sb.readUInt16LE(off + 4), charShape: sb.readUInt16LE(off + 6) };
     }
     sidx++;
   }
-  // Fallback: no named Footnote style (very unusual) — use style 0 / shape 0.
+  // Fallback: no such named style (very unusual) — use style 0 / shape 0.
   return { index: 0, paraShape: 0, charShape: 0 };
 }
 
-// Build the footnote content cluster (6 records) for the given footnote text.
-function buildFootnoteCluster(text, style, fnInstanceId) {
-  // CTRL_HEADER "fn  " (20B): ctrlId + 01000000 + 00002900 + 00000000 + instanceId
+// Build a note (footnote/endnote) content cluster (6 records).
+function buildNoteCluster(text, style, noteInstanceId, kind) {
+  // CTRL_HEADER 'fn  '/'en  ' (20B): ctrlId + 01000000 + 00002900 + 00000000 + instanceId
   const ctrlBody = Buffer.concat([
-    FN_CTRL_ID,
+    Buffer.from(kind.ctrlId, 'hex'),
     Buffer.from('010000000000290000000000', 'hex'),
-    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(fnInstanceId >>> 0, 0); return b; })(),
+    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(noteInstanceId >>> 0, 0); return b; })(),
   ]);
   const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, ctrlBody.length), ctrlBody]);
 
   const listHeader = Buffer.concat([
-    buildRecordHeader(TAG_LIST_HEADER, 2, 16), Buffer.from(FN_LIST_HEADER_HEX, 'hex'),
+    buildRecordHeader(TAG_LIST_HEADER, 2, 16), Buffer.from(NOTE_LIST_HEADER_HEX, 'hex'),
   ]);
 
   // PARA_TEXT (lvl3): auto-number ctrl + " " + text + EOP
   const ptBody = Buffer.concat([
-    Buffer.from(FN_AUTONUM_HEX, 'hex'), Buffer.from(' ' + text + PARA_TEXT_EOP, 'utf16le'),
+    Buffer.from(NOTE_AUTONUM_HEX, 'hex'), Buffer.from(' ' + text + PARA_TEXT_EOP, 'utf16le'),
   ]);
   const charCount = 8 + 1 + text.length + 1; // autonum(8u) + space + text + EOP
 
@@ -3027,7 +3031,7 @@ function buildFootnoteCluster(text, style, fnInstanceId) {
   ph.writeUInt32LE(((0x80000000 | (charCount & 0x7FFFFFFF)) >>> 0), 0);
   ph.writeUInt32LE(0x40000, 4);             // control_mask: char 0x12 (auto-number) present
   ph.writeUInt16LE(style.paraShape & 0xFFFF, 8);
-  ph.writeUInt8(style.index & 0xFF, 10);    // style id = Footnote style index
+  ph.writeUInt8(style.index & 0xFF, 10);    // style id = resolved note-style index
   ph.writeUInt8(0, 11);
   ph.writeUInt16LE(1, 12);                  // num_char_shapes
   ph.writeUInt16LE(0, 14);
@@ -3042,17 +3046,25 @@ function buildFootnoteCluster(text, style, fnInstanceId) {
   csBody.writeUInt32LE(style.charShape >>> 0, 4);
   const charShape = Buffer.concat([buildRecordHeader(TAG_PARA_CHAR_SHAPE, 3, 8), csBody]);
 
-  const onta = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 3, 16), Buffer.from(FN_ONTA_CTRL_HEX, 'hex')]);
+  // Auto-number CTRL_HEADER 'onta': ctrlId + u32 noteType (1=footnote,2=endnote)
+  // + 01000000 + 00002900
+  const ontaBody = Buffer.concat([
+    Buffer.from('6f6e7461', 'hex'),
+    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(kind.ontaType >>> 0, 0); return b; })(),
+    Buffer.from('0100000000002900', 'hex'),
+  ]);
+  const onta = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 3, 16), ontaBody]);
 
   return Buffer.concat([ctrl, listHeader, paraHeader, paraText, charShape, onta]);
 }
 
-// Insert a footnote anchored to text. Each op:
+// Insert a footnote/endnote anchored to text. `kind` is NOTE_KINDS.footnote
+// or NOTE_KINDS.endnote. Each op:
 //   { anchor: string, text: string }
-//   - anchor: text the footnote mark goes right after (level-1 PARA_TEXT of a
+//   - anchor: text the note mark goes right after (level-1 PARA_TEXT of a
 //             top-level paragraph)
-//   - text:   the footnote content shown at the bottom of the page
-export async function insertFootnoteInPlace(filePath, ops) {
+//   - text:   the note content (footnote: bottom of page; endnote: doc end)
+async function insertNoteInPlace(filePath, ops, kind) {
   if (!Array.isArray(ops) || ops.length === 0) {
     return Object.assign([], { mode: 'in-place', inserted_count: 0 });
   }
@@ -3072,7 +3084,7 @@ export async function insertFootnoteInPlace(filePath, ops) {
     return rootChain;
   };
 
-  const fnStyle = resolveFootnoteStyle(buf);
+  const noteStyle = resolveNoteStyle(buf, kind.styleName);
 
   const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
   const inMiniStream = dirEntry.size < 4096;
@@ -3089,7 +3101,7 @@ export async function insertFootnoteInPlace(filePath, ops) {
 
   const summary = [];
   for (const op of ops) {
-    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('footnote: an "anchor" string is required');
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error(`${kind.styleName}: an "anchor" string is required`);
     const text = (typeof op.text === 'string') ? op.text : '';
     const records = parseRecords(raw);
 
@@ -3106,19 +3118,19 @@ export async function insertFootnoteInPlace(filePath, ops) {
       }
       if (ptRec) break;
     }
-    if (!ptRec) throw new Error(`footnote: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+    if (!ptRec) throw new Error(`${kind.styleName}: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
 
     const paraHeaderRec = records[cluster.startIdx];
-    const fnInstanceId = pickFreshInstanceId(records, raw);
+    const noteInstanceId = pickFreshInstanceId(records, raw);
 
-    // 1) Insert the footnote-reference char after the anchor in PARA_TEXT.
-    const refChar = Buffer.from(FN_REF_CHAR_HEX, 'hex');
+    // 1) Insert the note-reference char after the anchor in PARA_TEXT.
+    const refChar = Buffer.from(kind.refCharHex, 'hex');
     const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
     const newBody = Buffer.concat([oldBody.slice(0, anchorEnd), refChar, oldBody.slice(anchorEnd)]);
     const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
 
-    // 2) Footnote content cluster appended at the end of the paragraph's records.
-    const fnCluster = buildFootnoteCluster(text, fnStyle, fnInstanceId);
+    // 2) Note content cluster appended at the end of the paragraph's records.
+    const fnCluster = buildNoteCluster(text, noteStyle, noteInstanceId, kind);
     const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
 
     // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x20000 (char 0x11).
@@ -3169,6 +3181,13 @@ export async function insertFootnoteInPlace(filePath, ops) {
   result.mode = 'in-place';
   result.inserted_count = summary.length;
   return result;
+}
+
+export function insertFootnoteInPlace(filePath, ops) {
+  return insertNoteInPlace(filePath, ops, NOTE_KINDS.footnote);
+}
+export function insertEndnoteInPlace(filePath, ops) {
+  return insertNoteInPlace(filePath, ops, NOTE_KINDS.endnote);
 }
 
 
