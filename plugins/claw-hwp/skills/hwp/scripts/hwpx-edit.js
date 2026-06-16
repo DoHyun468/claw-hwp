@@ -59,6 +59,7 @@
 //   insert_table_row      { table, row, where?, cells? }  // 줄 추가 — before/after row index (renumbers rowAddr)
 //   insert_table_column   { table, col, where?, cells? }  // 칸 추가 — before/after col index (renumbers colAddr)
 //   distribute_table      { table, mode? }    // 높이/너비 같게 — mode: width | height | both
+//   insert_textbox        { text, index?, width_mm?, height_mm?, fill_color?, line_color? }  // 글상자 (rect + drawText)
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2612,6 +2613,39 @@ function opInsertShape(doc, op) {
   return { inserted: true, shape, appended: true };
 }
 
+// Insert a text box (글상자) — a rect shape carrying an <hp:drawText> with the
+// text (one paragraph). Same floating placement as insert_shape; drawText sits
+// between the shape's <hp:shadow> and <hc:pt0> (the order Hancom writes).
+function opInsertTextbox(doc, op) {
+  const text = String(op.text != null ? op.text : '');
+  const toHu = (mm) => Math.round(Number(mm) * 283.46);
+  const w = op.width_mm != null ? toHu(op.width_mm) : 30000;
+  const h = op.height_mm != null ? toHu(op.height_mm) : 10000;
+  const fill = op.fill_color ? normHex(op.fill_color) : '#FFFFFF';
+  const line = op.line_color ? normHex(op.line_color) : '#000000';
+  const drawText = `<hp:drawText lastWidth="4294967295" name="" editable="0"><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0"><hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run></hp:p></hp:subList></hp:drawText>`;
+  const el = buildShape('rect', w, h, fill, line)
+    .replace('<hc:pt0 x="0" y="0"/>', drawText + '<hc:pt0 x="0" y="0"/>')
+    .replace('<hp:shapeComment>사각형</hp:shapeComment>', '<hp:shapeComment>글상자</hp:shapeComment>');
+  const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
+  if (op.index != null) {
+    const paras = doc.paragraphs();
+    if (op.index < 0 || op.index >= paras.length) throw new Error(`insert_textbox: index ${op.index} out of range`);
+    const { section, el: pel } = paras[op.index];
+    const charPrId = (pel.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+    const newPara = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${el}</hp:run></hp:p>`;
+    doc.write(section, spliceEl(doc.read(section), pel, `<hp:p${pel.attrs}>${pel.inner}</hp:p>` + newPara));
+    return { inserted: true, textbox: true, after: op.index };
+  }
+  const last = doc.sectionNames().slice(-1)[0];
+  let xml = doc.read(last);
+  const charPrId = (scanTopLevel(xml, 'hp:p').slice(-1)[0]?.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+  const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${el}</hp:run></hp:p>`;
+  xml = /<\/hs:sec>\s*$/.test(xml) ? xml.replace(/<\/hs:sec>\s*$/, para + '</hs:sec>') : xml + para;
+  doc.write(last, xml);
+  return { inserted: true, textbox: true, appended: true };
+}
+
 function applyOp(doc, op) {
   switch (op.type) {
     case 'replace_text': return opReplaceText(doc, op.find, op.replace);
@@ -2658,6 +2692,7 @@ function applyOp(doc, op) {
     case 'insert_table_row': return opInsertTableRow(doc, op.table, op.row, op.where, op.cells);
     case 'insert_table_column': return opInsertTableColumn(doc, op.table, op.col, op.where, op.cells);
     case 'distribute_table': return opDistributeTable(doc, op.table, op.mode);
+    case 'insert_textbox': return opInsertTextbox(doc, op);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }

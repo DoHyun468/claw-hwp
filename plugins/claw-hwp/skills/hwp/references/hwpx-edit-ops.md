@@ -255,6 +255,7 @@ part (no OLE binary needed).
 
 | `type` | Args | Notes |
 |--------|------|-------|
+| `insert_textbox` | `text`, `index?`, `width_mm?`, `height_mm?`, `fill_color?`, `line_color?` | Inserts a text box (글상자) — a rectangle carrying `text` as one vertically-centered paragraph. Same floating placement/sizing as `insert_shape` (default ≈106 × 35 mm). |
 | `insert_shape` | `shape`, `index?`, `width_mm?`, `height_mm?`, `fill_color?`, `line_color?` | Inserts a drawing shape — `shape`: `rect` / `ellipse` / `line`. `width_mm` × `height_mm` set the size (default ≈53 × 24 mm; for `line` the line runs corner-to-corner of that box, so `height_mm: 0` = horizontal). `fill_color` (rect/ellipse, hex) + `line_color` (border, hex). The shape floats relative to paragraph `index` (or is appended); multiple shapes inserted at the same spot overlap — give them different `index` or move them in Hancom afterwards. Renders on Hancom Docs web (rect + ellipse verified). |
 
 ## Examples
