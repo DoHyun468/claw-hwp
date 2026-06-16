@@ -169,6 +169,33 @@ itself is invisible in body rendering.
 | `replace_image` | `target` (any of: `"image1"` / `"image1.png"` / `"BinData/image1"` / `"BinData/image1.png"`), `source` | Swaps the bytes of an existing `BinData/` entry. Stem (extension-less) match works, so the manifest id is fine even when you don't know the file extension. |
 | `delete_image` | `target` (same matching rules as `replace_image`) | Removes the `BinData/` entry **and** its manifest item **and** every `<hp:pic>` that referenced it (no dangling reference). |
 
+### Equation (수식)
+
+A Hancom equation is an inline shape (`<hp:equation>`) whose math is written in
+Hancom's equation-script syntax inside `<hp:script>`. Hancom renders it from the
+script on open **and recomputes its size**, so you don't supply dimensions.
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `insert_equation` | `script`, `index?` | Inserts an equation as its own new plain paragraph (never inherits a neighbouring list's bullet/number). `script` is Hancom equation-script. With `index`, the equation paragraph goes right **after** paragraph `index`; without it, it's appended to the last section. Renders on both Hancom Docs web and desktop (verified). |
+
+Equation-script quick reference (case-sensitive): superscript `a^b`, subscript
+`a_b`, group `{ }`, space `~`, fraction `{ } over { }`, root `sqrt{ }` /
+`root n of x`, big operators `sum`/`int` with `_{ } ^{ }` limits (e.g.
+`int _0 ^inf`), auto-size brackets `LEFT ( RIGHT )`, matrices
+`matrix{ a & b # c & d }` (`&`=column, `#`=row), Greek `alpha`…`omega` /
+`ALPHA`…`OMEGA`, symbols `+-` (±) `TIMES` (×) `<=` (≤) `!=` (≠) `rightarrow` (→)
+`INF` (∞) `THEREFORE` (∴), decorations `vec{ }` `bar{ }` `hat{ }`. Examples:
+
+```
+x = {-b +- sqrt{b^2 -4ac}} over {2a}      → 근의 공식
+int _0 ^inf e^{-x} dx = 1                 → 적분
+sum from {i=1} to n i = {n(n+1)} over 2   → 시그마 합
+A = LEFT [ matrix{1 & 0 # 0 & 1} RIGHT ]  → 행렬
+```
+
+`<` `>` `&` in a script are XML-escaped automatically — write them as-is.
+
 ## Examples
 
 Template fill + a cell edit + a styled run, saved in place:

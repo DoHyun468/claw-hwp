@@ -50,6 +50,7 @@
 //   insert_endnote        { index, text }    // same shape, endnote
 //   insert_hyperlink      { index, url, text } // appends a clickable URL link to paragraph `index`
 //   insert_bookmark       { index, name }      // anchors a named bookmark at the start of paragraph `index`'s first run
+//   insert_equation       { script, index? }   // inserts a Hancom equation (script = equation-syntax); new paragraph after index, else appended
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2180,6 +2181,55 @@ function opSetFieldValue(doc, name, value) {
 
 // ── dispatch ─────────────────────────────────────────────────────────────────
 
+// Insert a Hancom equation. The equation script (e.g.
+// "x = {-b +- sqrt{b^2 -4ac}} over {2a}") goes verbatim in <hp:script>;
+// Hancom renders the math from the script on open. The element structure
+// mirrors exactly what Hancom Docs itself writes (verified by round-tripping a
+// real equation through 한컴독스): an inline (treatAsChar) shape with
+// font="HancomEQN", "Equation Version 60". The <hp:sz> is a render-size hint
+// Hancom recomputes from the script. Placed as its own new paragraph after
+// paragraph `index` (or appended to the last section when `index` is omitted).
+function opInsertEquation(doc, script, index) {
+  if (script == null || !String(script).trim()) throw new Error('insert_equation: script is required');
+  const scriptText = String(script);
+  const eq =
+    `<hp:equation id="${freshId()}" zOrder="0" numberingType="EQUATION" textWrap="TOP_AND_BOTTOM" ` +
+    `textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" version="Equation Version 60" baseLine="71" ` +
+    `textColor="#000000" baseUnit="1000" lineMode="CHAR" font="HancomEQN">` +
+    `<hp:sz width="9200" widthRelTo="ABSOLUTE" height="2588" heightRelTo="ABSOLUTE" protect="0"/>` +
+    `<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" ` +
+    `vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>` +
+    `<hp:outMargin left="56" right="56" top="0" bottom="0"/>` +
+    `<hp:script>${xmlEscape(scriptText)}</hp:script></hp:equation>`;
+
+  // Equation sits in its own fresh PLAIN paragraph (paraPrIDRef="0"). Hancom's
+  // own insert does the same — it does NOT inherit the anchor paragraph's
+  // paraPr, so an equation dropped next to a bullet/numbered item must not pick
+  // up that list heading (otherwise the equation renders with a stray ▶ / "3.").
+  const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
+
+  if (index != null) {
+    const paras = doc.paragraphs();
+    if (index < 0 || index >= paras.length) throw new Error(`insert_equation: index ${index} out of range`);
+    const { section, el } = paras[index];
+    const charPrId = (el.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+    const newPara = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${eq}</hp:run></hp:p>`;
+    const elFull = `<hp:p${el.attrs}>${el.inner}</hp:p>`;
+    doc.write(section, spliceEl(doc.read(section), el, elFull + newPara));
+    return { inserted: true, after: index, script: scriptText };
+  }
+
+  const names = doc.sectionNames();
+  const last = names[names.length - 1];
+  let xml = doc.read(last);
+  const paras = scanTopLevel(xml, 'hp:p');
+  const charPrId = paras.length ? (paras[paras.length - 1].inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1] : '0';
+  const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${eq}</hp:run></hp:p>`;
+  xml = /<\/hs:sec>\s*$/.test(xml) ? xml.replace(/<\/hs:sec>\s*$/, para + '</hs:sec>') : xml + para;
+  doc.write(last, xml);
+  return { inserted: true, appended: true, script: scriptText };
+}
+
 function applyOp(doc, op) {
   switch (op.type) {
     case 'replace_text': return opReplaceText(doc, op.find, op.replace);
@@ -2217,6 +2267,7 @@ function applyOp(doc, op) {
     case 'insert_endnote': return opInsertNote(doc, 'endNote', op.index, op.text);
     case 'insert_hyperlink': return opInsertHyperlink(doc, op.index, op.url, op.text);
     case 'insert_bookmark': return opInsertBookmark(doc, op.index, op.name);
+    case 'insert_equation': return opInsertEquation(doc, op.script, op.index);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }
