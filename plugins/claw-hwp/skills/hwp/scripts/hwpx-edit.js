@@ -54,6 +54,7 @@
 //   set_columns           { count, gap_mm? }    // multi-column (단) layout; count=1 resets to single, count>=2 = newspaper columns
 //   set_page_setup        { size?, orientation?, width_mm?, height_mm?, margin_mm? }  // 편집 용지 (paper size/orientation/margins)
 //   insert_chart          { chart_type?, cat?, series? }  // chart: col/bar/line/area/pie (or 0-19); series=[{name,values:[]}], cat=[labels]
+//   insert_shape          { shape, index?, width_mm?, height_mm?, fill_color?, line_color? }  // 도형: rect | ellipse | line
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -2442,6 +2443,67 @@ function opInsertChart(doc, op) {
   return { inserted: true, part: partName, chartEl: spec.el, series: series.length, cats: cat.length };
 }
 
+// Insert a drawing shape (도형): rectangle / ellipse / line. Structure mirrors
+// what Hancom Docs writes (verified by round-trip): a floating shape with
+// renderingInfo matrices, lineShape (border) + fillBrush (rect/ellipse) and the
+// shape-specific geometry (rect = pt0..pt3, ellipse = center/ax, line =
+// startPt/endPt). Placed floating relative to its paragraph (PARA/COLUMN).
+function buildShape(shape, w, h, fillColor, lineColor) {
+  const id = freshId(), inst = freshId();
+  const hw = Math.round(w / 2), hh = Math.round(h / 2);
+  const common = `<hp:offset x="0" y="0"/><hp:orgSz width="${w}" height="${h}"/><hp:curSz width="0" height="0"/>`
+    + `<hp:flip horizontal="0" vertical="0"/><hp:rotationInfo angle="0" centerX="0" centerY="0" rotateimage="1"/>`
+    + `<hp:renderingInfo><hc:transMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:scaMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/></hp:renderingInfo>`
+    + `<hp:lineShape color="${lineColor}" width="33" style="SOLID" endCap="FLAT" headStyle="NORMAL" tailStyle="NORMAL" headfill="1" tailfill="1" headSz="SMALL_SMALL" tailSz="SMALL_SMALL" outlineStyle="NORMAL" alpha="0"/>`;
+  const fill = `<hc:fillBrush><hc:winBrush faceColor="${fillColor}" hatchColor="#000000" alpha="0"/></hc:fillBrush>`;
+  const shadow = `<hp:shadow type="NONE" color="#B2B2B2" offsetX="0" offsetY="0" alpha="0"/>`;
+  const tail = `<hp:sz width="${w}" widthRelTo="ABSOLUTE" height="${h}" heightRelTo="ABSOLUTE" protect="0"/>`
+    + `<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="0" allowOverlap="1" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`
+    + `<hp:outMargin left="0" right="0" top="0" bottom="0"/>`;
+  const open = (extra) => `<hp:${shape} id="${id}" zOrder="0" numberingType="PICTURE" textWrap="IN_FRONT_OF_TEXT" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="${inst}"${extra}>`;
+  if (shape === 'line') {
+    return open(' isReverseHV="0"') + common + shadow
+      + `<hc:startPt x="0" y="0"/><hc:endPt x="${w}" y="${h}"/>` + tail + `<hp:shapeComment>선</hp:shapeComment></hp:line>`;
+  }
+  if (shape === 'ellipse') {
+    return open(' intervalDirty="0" hasArcPr="0" arcType="NORMAL"') + common + fill + shadow
+      + `<hc:center x="${hw}" y="${hh}"/><hc:ax1 x="${w}" y="${hh}"/><hc:ax2 x="${hw}" y="0"/><hc:start1 x="0" y="0"/><hc:end1 x="0" y="0"/><hc:start2 x="0" y="0"/><hc:end2 x="0" y="0"/>`
+      + tail + `<hp:shapeComment>타원</hp:shapeComment></hp:ellipse>`;
+  }
+  return open(' ratio="0"') + common + fill + shadow
+    + `<hc:pt0 x="0" y="0"/><hc:pt1 x="${w}" y="0"/><hc:pt2 x="${w}" y="${h}"/><hc:pt3 x="0" y="${h}"/>`
+    + tail + `<hp:shapeComment>사각형</hp:shapeComment></hp:rect>`;
+}
+function opInsertShape(doc, op) {
+  const shape = ({ rect: 'rect', rectangle: 'rect', box: 'rect', ellipse: 'ellipse', oval: 'ellipse', circle: 'ellipse', line: 'line' })[String(op.shape || 'rect').toLowerCase()];
+  if (!shape) throw new Error('insert_shape: shape must be rect / ellipse / line');
+  const toHu = (mm) => Math.round(Number(mm) * 283.46);
+  const w = op.width_mm != null ? toHu(op.width_mm) : 15000;
+  const h = op.height_mm != null ? toHu(op.height_mm) : 6750;
+  const fill = op.fill_color ? normHex(op.fill_color) : '#FFFFFF';
+  const line = op.line_color ? normHex(op.line_color) : '#000000';
+  const el = buildShape(shape, w, h, fill, line);
+  const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
+  const index = op.index;
+  if (index != null) {
+    const paras = doc.paragraphs();
+    if (index < 0 || index >= paras.length) throw new Error(`insert_shape: index ${index} out of range`);
+    const { section, el: pel } = paras[index];
+    const charPrId = (pel.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+    const newPara = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${el}</hp:run></hp:p>`;
+    const elFull = `<hp:p${pel.attrs}>${pel.inner}</hp:p>`;
+    doc.write(section, spliceEl(doc.read(section), pel, elFull + newPara));
+    return { inserted: true, shape, after: index };
+  }
+  const last = doc.sectionNames().slice(-1)[0];
+  let xml = doc.read(last);
+  const charPrId = (scanTopLevel(xml, 'hp:p').slice(-1)[0]?.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+  const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${el}</hp:run></hp:p>`;
+  xml = /<\/hs:sec>\s*$/.test(xml) ? xml.replace(/<\/hs:sec>\s*$/, para + '</hs:sec>') : xml + para;
+  doc.write(last, xml);
+  return { inserted: true, shape, appended: true };
+}
+
 function applyOp(doc, op) {
   switch (op.type) {
     case 'replace_text': return opReplaceText(doc, op.find, op.replace);
@@ -2483,6 +2545,7 @@ function applyOp(doc, op) {
     case 'set_columns': return opSetColumns(doc, op.count, op.gap_mm);
     case 'set_page_setup': return opSetPageSetup(doc, op);
     case 'insert_chart': return opInsertChart(doc, op);
+    case 'insert_shape': return opInsertShape(doc, op);
     default: throw new Error(`unknown operation type: ${op.type}`);
   }
 }

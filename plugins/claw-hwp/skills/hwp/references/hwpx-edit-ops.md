@@ -247,6 +247,12 @@ part (no OLE binary needed).
 {"type":"insert_chart","chart_type":"pie","cat":["A","B","C","D"],"series":[{"name":"점유율","values":[40,30,20,10]}]}
 ```
 
+### Shape (도형)
+
+| `type` | Args | Notes |
+|--------|------|-------|
+| `insert_shape` | `shape`, `index?`, `width_mm?`, `height_mm?`, `fill_color?`, `line_color?` | Inserts a drawing shape — `shape`: `rect` / `ellipse` / `line`. `width_mm` × `height_mm` set the size (default ≈53 × 24 mm; for `line` the line runs corner-to-corner of that box, so `height_mm: 0` = horizontal). `fill_color` (rect/ellipse, hex) + `line_color` (border, hex). The shape floats relative to paragraph `index` (or is appended); multiple shapes inserted at the same spot overlap — give them different `index` or move them in Hancom afterwards. Renders on Hancom Docs web (rect + ellipse verified). |
+
 ## Examples
 
 Template fill + a cell edit + a styled run, saved in place:
