@@ -2812,7 +2812,15 @@ function buildChartSpace(spec, cat, series) {
   const ax1 = '111111111', ax2 = '222222222';
   let plot;
   if (spec.scatter) {
-    const xs = cat.map((c) => Number(c) || 0);
+    // X values: use numeric categories where given, else a 1-based index. Sized
+    // to the longest series so xVal/yVal counts match (non-numeric labels like
+    // "A"/"B" would otherwise all collapse to x=0, stacking every point).
+    const n = Math.max(0, ...series.map((s) => (s.values || []).length));
+    const xs = Array.from({ length: n }, (_, i) => {
+      const c = cat && cat[i];
+      const v = Number(c);
+      return (c !== undefined && c !== '' && Number.isFinite(v)) ? v : i + 1;
+    });
     const sers = series.map((s, i) => scatterSer(i, s.name, xs, s.values)).join('');
     plot = `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${ax1}"/><c:axId val="${ax2}"/></c:scatterChart>`
       + valAxXml(ax1, 'b', ax2) + valAxXml(ax2, 'l', ax1);
