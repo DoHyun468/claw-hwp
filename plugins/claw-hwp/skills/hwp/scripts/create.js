@@ -3366,6 +3366,14 @@ async function readStdin() {
   try {
     for (; opIdx < ops.length; opIdx++) {
       const op = ops[opIdx];
+      // A section heading placed DIRECTLY after a table loses its spacingBefore
+      // on Hancom web (the gap is eaten), so a new section crowds the table.
+      // Insert a spacer paragraph between table→heading so the heading keeps its
+      // full "space above heading" — user's model: 표→헤딩 = 헤딩위 간격 (the
+      // heading owns the section gap). table→body needs no spacer.
+      if (op.type === 'append_heading' && ops[opIdx - 1]?.type === 'append_table') {
+        HANDLERS.append_paragraph(doc, { text: ' ' }, cursor);
+      }
       const handler = HANDLERS[op.type];
       if (!handler) throw new Error(`unknown op type '${op.type}'`);
       handler(doc, op, cursor);
