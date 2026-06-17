@@ -3191,6 +3191,199 @@ export function insertEndnoteInPlace(filePath, ops) {
 }
 
 
+// ── 쪽 번호 (page number, footer) raw-patch ────────────────────────────────
+//
+// GT-first (pagenum_native.hwp, captured from Hancom's 쪽 › 꼬리말 › 쪽 번호):
+// a page number is a footer control holding a paragraph whose only content is
+// the page-number auto-field. Structurally like a footnote, but at the
+// section's first paragraph and with note-type 0 (page number):
+//   - first paragraph: inline footer char (0x0010, ctrl id "foot") + EOP;
+//     PARA_HEADER char_count += 8, control_mask |= 0x10000.
+//   - footer cluster appended on that paragraph:
+//       CTRL_HEADER "foot"  (lvl1)
+//       LIST_HEADER         (lvl2, width = text column, height = footer margin)
+//       PARA_HEADER         (lvl2) — style = "Header" index; para_shape chosen
+//                                    to match the requested alignment
+//       PARA_TEXT           (lvl3) — auto-number ctrl (0x0012 "onta") + EOP
+//       PARA_CHAR_SHAPE     (lvl3) — "Page Number" style's char shape
+//       CTRL_HEADER "onta"  (lvl3) — note-type 0 (page number)
+//
+// Alignment note: Hancom stores alignment in the footer paragraph's
+// para_shape. To stay Section0-only (no DocInfo write), we reference an
+// EXISTING para_shape whose alignment matches `align`; if the document has
+// none, we fall back to para_shape 0 (the number then follows that shape's
+// alignment). Section0-only — no DocInfo change.
+const PAGENUM_FOOTER_CHAR_HEX = '1000746f6f6600000000000000001000'; // 0x0010 + 'foot' + 0x0010
+const PAGENUM_FOOT_CTRL_HEX    = '746f6f660000000001000000';          // CTRL_HEADER 'foot' body
+const PAGENUM_ONTA_HEX         = '6f6e7461000000000100000000000000'; // auto-number CTRL, note-type 0
+const ALIGN_BITS = { justify: 0, left: 1, right: 2, center: 3, distribute: 4 };
+
+// Find an existing para_shape (DocInfo) whose attr1 alignment bits (2..4)
+// match `align`; return its index, or 0 if none.
+function findParaShapeByAlign(buf, align) {
+  const want = ALIGN_BITS[align];
+  if (want === undefined) return 0;
+  const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
+  let idx = 0;
+  for (const r of parseRecords(di)) {
+    if (r.tag !== TAG_PARA_SHAPE) continue;
+    if (((di.readUInt32LE(r.dataOff) >> 2) & 7) === want) return idx;
+    idx++;
+  }
+  return 0;
+}
+
+// PAGE_DEF footer margin (HWPUNIT) — offset 28.
+function readFooterMarginFromPageDef(records, raw) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= 32) return raw.readUInt32LE(r.dataOff + 28);
+  }
+  return 0x109c; // sensible default (~15mm)
+}
+
+// Insert a page number in the footer. Each op: { align?: "left"|"center"|"right" }
+export async function insertPageNumberInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const headerStyle = resolveNoteStyle(buf, 'Header');
+  const pageNumStyle = resolveNoteStyle(buf, 'Page Number');
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const align = (op.align && ALIGN_BITS[op.align] !== undefined) ? op.align : 'center';
+    const records = parseRecords(raw);
+    const textWidth = readTextWidthFromPageDef(records, raw);
+    const footerMargin = readFooterMarginFromPageDef(records, raw);
+    const paraShape = findParaShapeByAlign(buf, align);
+
+    // The footer attaches to the section's first top-level paragraph that has
+    // a level-1 PARA_TEXT.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error('page_number: no top-level body paragraph found to host the footer');
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const noteInstanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Insert the footer char right before the paragraph's EOP (last 2 bytes).
+    const footerChar = Buffer.from(PAGENUM_FOOTER_CHAR_HEX, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length; // before EOP
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), footerChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Footer cluster.
+    const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, 12), Buffer.from(PAGENUM_FOOT_CTRL_HEX, 'hex')]);
+    const lh = Buffer.alloc(34);
+    lh.writeUInt32LE(1, 0);          // nParas
+    lh.writeUInt32LE(0x40, 4);       // attr
+    lh.writeUInt32LE(textWidth >>> 0, 8);
+    lh.writeUInt32LE(footerMargin >>> 0, 12);
+    const listHeader = Buffer.concat([buildRecordHeader(TAG_LIST_HEADER, 2, 34), lh]);
+    const ph = Buffer.alloc(24);
+    ph.writeUInt32LE(((0x80000000 | 9) >>> 0), 0); // char_count 9 (autonum 8 + EOP), last-para flag
+    ph.writeUInt32LE(0x40000, 4);                  // control_mask: char 0x12 (auto-number)
+    ph.writeUInt16LE(paraShape & 0xFFFF, 8);
+    ph.writeUInt8(headerStyle.index & 0xFF, 10);
+    ph.writeUInt8(0, 11);
+    ph.writeUInt16LE(1, 12);
+    const phRec = Buffer.concat([buildRecordHeader(TAG_PARA_HEADER, 2, 24), ph]);
+    const ptBody2 = Buffer.concat([Buffer.from(NOTE_AUTONUM_HEX, 'hex'), Buffer.from(PARA_TEXT_EOP, 'utf16le')]);
+    const ptRec2 = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 3, ptBody2.length), ptBody2]);
+    const csBody = Buffer.alloc(8); csBody.writeUInt32LE(pageNumStyle.charShape >>> 0, 4);
+    const csRec = Buffer.concat([buildRecordHeader(TAG_PARA_CHAR_SHAPE, 3, 8), csBody]);
+    const onta = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 3, 16), Buffer.from(PAGENUM_ONTA_HEX, 'hex')]);
+    const footerCluster = Buffer.concat([ctrl, listHeader, phRec, ptRec2, csRec, onta]);
+
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x10000 (char 0x10).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x10000) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), footerCluster, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, where: 'footer', align });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's
