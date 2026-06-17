@@ -42,8 +42,8 @@
 //   replace_image         { target, source }
 //   delete_image          { target }
 //   set_field_value       { name, value }
-//   set_header            { text, applyPageType? }   // BOTH | EVEN | ODD, default BOTH
-//   set_footer            { text, applyPageType? }
+//   set_header            { text, applyPageType?, align? }   // applyPageType: BOTH|EVEN|ODD (default BOTH); align: LEFT|CENTER|RIGHT
+//   set_footer            { text, applyPageType?, align? }
 //   remove_header         { }
 //   remove_footer         { }
 //   insert_footnote       { index, text }    // appends a footnote at end of paragraph `index`
@@ -2333,10 +2333,26 @@ function buildPic(doc, itemId, width, height) {
 
 const VALID_APPLY = new Set(['BOTH', 'EVEN', 'ODD']);
 
-function opSetHeaderFooter(doc, kind, text, applyPageType) {
+function opSetHeaderFooter(doc, kind, text, applyPageType, align) {
   const tag = `hp:${kind}`;
   const apply = String(applyPageType || 'BOTH').toUpperCase();
   if (!VALID_APPLY.has(apply)) throw new Error(`set_${kind}: applyPageType must be one of BOTH/EVEN/ODD`);
+
+  // Optional horizontal alignment (LEFT/CENTER/RIGHT). GT (2026-06-17, 한컴독스
+  // round-trip): Hancom records header/footer alignment as the INNER paragraph's
+  // paraPrIDRef pointing at a paraPr that carries <hh:align horizontal=...>
+  // (머리말 center → CENTER paraPr, 꼬리말 right → RIGHT paraPr; it survives the
+  // Hancom-web round-trip). We reuse/inject that exact clean native paraPr via the
+  // same helper apply_paragraph_style uses. null align → leave the default
+  // (paraPrIDRef 0). pprId may be null if header.xml/stub is missing → also default.
+  let pprId = null;
+  if (align != null && String(align).trim() !== '') {
+    const al = String(align).toUpperCase();
+    if (!ALIGN_VALUES.has(al)) throw new Error(`set_${kind}: align must be one of ${[...ALIGN_VALUES].join('/')}`);
+    pprId = ensureCleanAlignParaPr(doc, al);
+  }
+  const innerRef = pprId != null ? pprId : '0';
+  const resultAlign = pprId != null ? String(align).toUpperCase() : undefined;
 
   // Update first existing instance anywhere across sections.
   for (const name of doc.sectionNames()) {
@@ -2344,14 +2360,16 @@ function opSetHeaderFooter(doc, kind, text, applyPageType) {
     const els = scanTopLevel(xml, tag);
     if (!els.length) continue;
     const el = els[0];
-    const newInner = setCellInner(el.inner, text); // header/footer share subList>p>run>t shape with cells
+    let newInner = setCellInner(el.inner, text); // header/footer share subList>p>run>t shape with cells
+    // Retarget the inner paragraph's alignment when requested (first inner hp:p).
+    if (pprId != null) newInner = newInner.replace(/(<hp:p\b[^>]*\bparaPrIDRef=")\d+(")/, `$1${pprId}$2`);
     let attrs = el.attrs;
     attrs = /applyPageType="[^"]*"/.test(attrs)
       ? attrs.replace(/applyPageType="[^"]*"/, `applyPageType="${apply}"`)
       : `${attrs} applyPageType="${apply}"`;
     const replacement = `<${tag}${attrs}>${newInner}</${tag}>`;
     doc.write(name, dropLinesegs(spliceEl(xml, el, replacement)));
-    return { kind, applyPageType: apply, updated: true };
+    return { kind, applyPageType: apply, align: resultAlign, updated: true };
   }
 
   // None present — insert into the first section after its first body paragraph.
@@ -2366,7 +2384,7 @@ function opSetHeaderFooter(doc, kind, text, applyPageType) {
         `<hp:ctrl>` +
           `<${tag} id="0" applyPageType="${apply}">` +
             `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
-              `<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
+              `<hp:p id="0" paraPrIDRef="${innerRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
                 `<hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run>` +
               `</hp:p>` +
             `</hp:subList>` +
@@ -2376,7 +2394,7 @@ function opSetHeaderFooter(doc, kind, text, applyPageType) {
     `</hp:p>`;
   const insertAt = paras[0].end;
   doc.write(firstSec, dropLinesegs(xml.slice(0, insertAt) + wrapper + xml.slice(insertAt)));
-  return { kind, applyPageType: apply, inserted: true };
+  return { kind, applyPageType: apply, align: resultAlign, inserted: true };
 }
 
 // Page number (쪽번호) — a header/footer whose paragraph holds an <hp:autoNum
@@ -3044,8 +3062,8 @@ function applyOp(doc, op) {
     case 'replace_image': return opReplaceImage(doc, op.target, op.source);
     case 'delete_image': return opDeleteImage(doc, op.target);
     case 'set_field_value': return opSetFieldValue(doc, op.name, op.value);
-    case 'set_header': return opSetHeaderFooter(doc, 'header', op.text, op.applyPageType);
-    case 'set_footer': return opSetHeaderFooter(doc, 'footer', op.text, op.applyPageType);
+    case 'set_header': return opSetHeaderFooter(doc, 'header', op.text, op.applyPageType, op.align);
+    case 'set_footer': return opSetHeaderFooter(doc, 'footer', op.text, op.applyPageType, op.align);
     case 'remove_header': return opRemoveHeaderFooter(doc, 'header');
     case 'remove_footer': return opRemoveHeaderFooter(doc, 'footer');
     case 'insert_footnote': return opInsertNote(doc, 'footNote', op.index, op.text);

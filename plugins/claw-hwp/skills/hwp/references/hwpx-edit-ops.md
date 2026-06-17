@@ -122,8 +122,8 @@ not a top-level `<hp:secPr>` reference. `applyPageType` is `BOTH` | `EVEN` | `OD
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `set_header` | `text`, `applyPageType?` (default `"BOTH"`) | If a header already exists, replaces its text + updates `applyPageType` (returns `updated: true`). If none exists, inserts a new wrapper paragraph right after the first body paragraph of the first section (returns `inserted: true`). **Index-shift warning:** the `inserted: true` path adds a body paragraph, so every subsequent index-based op (`set_page_break`, `insert_hyperlink`, `apply_paragraph_style`, `delete_paragraph`, etc.) shifts by +1. Easiest fix: place `set_header` **last** in the batch, after all index-dependent ops resolve. |
-| `set_footer` | `text`, `applyPageType?` (default `"BOTH"`) | Same as `set_header` for `<hp:footer>`. |
+| `set_header` | `text`, `applyPageType?` (default `"BOTH"`), `align?` (`LEFT`/`CENTER`/`RIGHT`) | `align` sets the header text's horizontal alignment — it reuses (or injects from the Hancom-native stub) a clean paraPr declaring that align, the same path `apply_paragraph_style` uses, so it survives the 한컴독스 web round-trip (GT-verified 2026-06-17). Omit `align` to keep the default (left). If a header already exists, replaces its text + updates `applyPageType` (returns `updated: true`). If none exists, inserts a new wrapper paragraph right after the first body paragraph of the first section (returns `inserted: true`). **Index-shift warning:** the `inserted: true` path adds a body paragraph, so every subsequent index-based op (`set_page_break`, `insert_hyperlink`, `apply_paragraph_style`, `delete_paragraph`, etc.) shifts by +1. Easiest fix: place `set_header` **last** in the batch, after all index-dependent ops resolve. |
+| `set_footer` | `text`, `applyPageType?` (default `"BOTH"`), `align?` (`LEFT`/`CENTER`/`RIGHT`) | Same as `set_header` for `<hp:footer>` (incl. `align`). |
 | `remove_header` | — | Removes the `<hp:run>` hosting each `<hp:ctrl><hp:header>` (leaves the enclosing paragraph). Returns `removed: N`. |
 | `remove_footer` | — | Same for `<hp:footer>`. |
 
