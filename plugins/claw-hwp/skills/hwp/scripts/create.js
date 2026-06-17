@@ -230,11 +230,14 @@ const bodyStylePatches = [];
 function uniformRunStyle(runs) {
   const styled = (runs || []).filter((r) => r && r.text);
   if (!styled.length) return null;
-  const norm = (r) => ({
-    height: r.fontSize != null ? Math.round(Number(r.fontSize) * 100) : 1000,
-    bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
-    color: normalizeHexColor(r.color ?? r.textColor ?? "#000000"),
-  });
+  const norm = (r) => {
+    const pt = r.fontSize ?? r.size ?? r.size_pt;
+    return {
+      height: pt != null ? Math.round(Number(pt) * 100) : 1000,
+      bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
+      color: normalizeHexColor(r.color ?? r.textColor ?? "#000000"),
+    };
+  };
   const first = norm(styled[0]);
   const key = (s) => `${s.height}:${s.bold}:${s.italic}:${s.underline}:${s.color}`;
   if (!styled.every((r) => key(norm(r)) === key(first))) return null; // mixed → skip
@@ -339,8 +342,12 @@ function buildCharFormatProps(input = {}, defaults = {}) {
   }
 
   // fontSize — input in points, rhwp expects HWP units (×100). Defaults
-  // arrive already in HWP units (HEADING_DEFAULTS path).
-  if (input.fontSize != null) props.fontSize = Math.round(input.fontSize * 100);
+  // arrive already in HWP units (HEADING_DEFAULTS path). Accept the documented
+  // user-facing aliases `size` / `size_pt` (points) as well as `fontSize` —
+  // SKILL.md advertises `size` (pt), so dropping it silently lost create-time
+  // font sizing.
+  const ptSize = input.fontSize ?? input.size ?? input.size_pt;
+  if (ptSize != null) props.fontSize = Math.round(Number(ptSize) * 100);
   else if (defaults.fontSize != null) props.fontSize = defaults.fontSize;
 
   // textColor — managed (always emit). User-facing `color` or `textColor`.
