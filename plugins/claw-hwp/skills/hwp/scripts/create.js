@@ -2523,6 +2523,51 @@ async function patchHwpxMixedRuns(filePath, patches) {
   return fixed;
 }
 
+// Convert rhwp's PLAIN <hh:margin>+<hh:lineSpacing> paraPrs into the Hancom-
+// native <hp:switch>(hp:case[hwpunitchar] + hp:default) form so paragraph
+// spacing / indent / left-right margin / lineSpacing survive the Hancom-web
+// round-trip. GT (한컴 para-shape → download): a plain paraPr margin is stripped
+// to 0 on open; only the hp:switch form persists. Units (GT): hp:case = mm×100,
+// hp:default = mm×200, where rhwp's values are standard HWPUNIT (≈283.46/mm).
+// Also moves <hh:autoSpacing> ahead of the switch to match the native child order
+// (align, heading, breakSetting, autoSpacing, switch, border).
+async function patchHwpxParaSpacing(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const he = zip.file("Contents/header.xml");
+  if (!he) return 0;
+  let header = await he.async("string");
+  let n = 0;
+  header = header.replace(/<hh:paraPr\b[^>]*>[\s\S]*?<\/hh:paraPr>/g, (pp) => {
+    if (pp.includes("<hp:switch")) return pp;                 // already native
+    const mar = /<hh:margin>([\s\S]*?)<\/hh:margin>/.exec(pp);
+    if (!mar) return pp;
+    const val = (tag) => { const m = new RegExp(`<hh:${tag}\\b[^>]*value="(-?\\d+)"`).exec(mar[1]); return m ? Number(m[1]) : 0; };
+    const I = val("intent"), L = val("left"), R = val("right"), P = val("prev"), N = val("next");
+    const lsM = /<hh:lineSpacing\b[^>]*\/>/.exec(pp);
+    const ls = lsM ? lsM[0] : '<hh:lineSpacing type="PERCENT" value="160" unit="HWPUNIT"/>';
+    const mk = (mult) => {
+      const c = (hu) => Math.round((hu / 283.46) * mult);
+      return `<hh:margin><hc:intent value="${c(I)}" unit="HWPUNIT"/><hc:left value="${c(L)}" unit="HWPUNIT"/><hc:right value="${c(R)}" unit="HWPUNIT"/><hc:prev value="${c(P)}" unit="HWPUNIT"/><hc:next value="${c(N)}" unit="HWPUNIT"/></hh:margin>`;
+    };
+    const sw = `<hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">${mk(100)}${ls}</hp:case><hp:default>${mk(200)}${ls}</hp:default></hp:switch>`;
+    let out = pp;
+    // pull autoSpacing out (re-inserted right before the switch, native order)
+    const autoM = /<hh:autoSpacing\b[^>]*\/>/.exec(out);
+    const auto = autoM ? autoM[0] : "";
+    if (auto) out = out.replace(/<hh:autoSpacing\b[^>]*\/>/, "");
+    out = out.replace(/<hh:margin>[\s\S]*?<\/hh:margin>/, " SW ");
+    out = out.replace(/<hh:lineSpacing\b[^>]*\/>/, "");        // drop the now-duplicate plain lineSpacing
+    out = out.replace(" SW ", auto + sw);
+    n++;
+    return out;
+  });
+  if (n > 0) {
+    zip.file("Contents/header.xml", header);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return n;
+}
+
 // Remap the default char shape (charPr id=0) to the theme body font. rhwp
 // resets a fair number of run charPrIDRefs to "0" on .hwpx export — notably
 // in-table-cell runs (applyCharFormatInCell creates a styled charPr in
@@ -3244,6 +3289,17 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: remapped default font → ${activeTheme.bodyFont}`);
     } catch (err) {
       log.push(`hwpx_defaultfont_patch failed: ${err.message}`);
+    }
+  }
+
+  // Convert plain paraPr margins → Hancom-native hp:switch so paragraph spacing
+  // (heading before/after, indent, lineSpacing) survives the Hancom-web open.
+  if (ext === ".hwpx") {
+    try {
+      const n = await patchHwpxParaSpacing(outPath);
+      if (n > 0) log.push(`hwpx_patch: ${n} paraPr → hp:switch spacing`);
+    } catch (err) {
+      log.push(`hwpx_paraspacing_patch failed: ${err.message}`);
     }
   }
 
