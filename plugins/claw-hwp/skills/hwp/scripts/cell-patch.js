@@ -3832,6 +3832,269 @@ export async function insertImageInPlace(filePath, ops) {
 }
 
 
+// ── chart data editing (rows/cols/values via OOXMLChartContents) ──────────
+// Hancom Docs renders a chart from the OOXMLChartContents XML inside the OLE
+// (verified by capture: editing only that XML's category label changed the
+// rendered chart, while the legacy VtChart "Contents" stream stayed stale).
+// So we edit that XML to set category count (rows), series count (cols),
+// labels, and values, then repack the inner CFB and re-deflate the OLE.
+// The inner OLE is a minimal v3 CFB (512-B sectors, single FAT sector, no
+// mini stream — both real streams are >4 KB regular streams).
+const _chXmlEsc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const _chStrCache = (labels) => `<c:ptCount val="${labels.length}"/>` + labels.map((l, i) => `<c:pt idx="${i}"><c:v>${_chXmlEsc(l)}</c:v></c:pt>`).join('');
+const _chNumCache = (vals) => `<c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>` + vals.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join('');
+function _chReplaceBlock(s, openTag, closeTag, fromIdx, newInner) {
+  const a = s.indexOf(openTag, fromIdx); if (a < 0) return { s, end: fromIdx };
+  const b = s.indexOf(closeTag, a); if (b < 0) return { s, end: fromIdx };
+  return { s: s.slice(0, a + openTag.length) + newInner + s.slice(b), end: a + openTag.length + newInner.length + closeTag.length };
+}
+function _chEditSer(ser, idx, name, categories, values) {
+  let out = ser.replace(/<c:idx val="\d+"\/>/, `<c:idx val="${idx}"/>`).replace(/<c:order val="\d+"\/>/, `<c:order val="${idx}"/>`);
+  let r = _chReplaceBlock(out, '<c:strCache>', '</c:strCache>', 0, _chStrCache([name])); out = r.s;       // series name
+  r = _chReplaceBlock(out, '<c:strCache>', '</c:strCache>', r.end, _chStrCache(categories)); out = r.s;   // categories (rows)
+  r = _chReplaceBlock(out, '<c:numCache>', '</c:numCache>', 0, _chNumCache(values)); out = r.s;           // values
+  return out;
+}
+function _chEditXml(xml, model) {
+  const first = xml.indexOf('<c:ser>'); const lastClose = xml.lastIndexOf('</c:ser>');
+  if (first < 0 || lastClose < 0) throw new Error('chart data edit: no <c:ser> blocks (unsupported chart structure)');
+  if (xml.indexOf('<c:cat>') < 0 || xml.indexOf('<c:val>') < 0) throw new Error('chart data edit: this chart type has no category/value axis (e.g. scatter/bubble) — data editing not supported');
+  const serTpl = xml.slice(first, xml.indexOf('</c:ser>') + 8);
+  const sers = model.series.map((s, i) => _chEditSer(serTpl, i, s.name, model.categories, s.values));
+  return xml.slice(0, first) + sers.join('') + xml.slice(lastClose + 8);
+}
+// minimal inner-CFB primitives (simple v3 CFB only)
+const _icHdr = (cfb) => { const ssz = 1 << cfb.readUInt16LE(30); const nFat = cfb.readUInt32LE(44); const dirStart = cfb.readUInt32LE(48); const difat = []; for (let i = 0; i < 109; i++) { const v = cfb.readUInt32LE(76 + i * 4); if (v <= 0xFFFFFFFA) difat.push(v); } return { ssz, nFat, dirStart, difat }; };
+const _icFat = (cfb, difat, ssz) => { const fat = []; for (const fs of difat) { const off = 512 + fs * ssz; for (let i = 0; i < ssz / 4; i++) fat.push(cfb.readUInt32LE(off + i * 4)); } return fat; };
+const _icChain = (fat, start) => { const c = []; let s = start; while (s <= 0xFFFFFFFA && s < fat.length) { c.push(s); s = fat[s]; if (c.length > 100000) break; } return c; };
+const _icSecOff = (idx, ssz) => 512 + idx * ssz;
+function _icFindEntry(cfb, hdr, fat, name) {
+  for (const sec of _icChain(fat, hdr.dirStart)) for (let e = 0; e < hdr.ssz / 128; e++) {
+    const off = _icSecOff(sec, hdr.ssz) + e * 128; const nameLen = cfb.readUInt16LE(off + 64); if (nameLen <= 0) continue;
+    if (cfb.slice(off, off + nameLen - 2).toString('utf16le') === name) return off;
+  }
+  return -1;
+}
+function _icReadStream(cfb, hdr, fat, entryOff) {
+  const size = cfb.readUInt32LE(entryOff + 120); const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116));
+  const out = Buffer.alloc(size); let p = 0;
+  for (const sec of chain) { const off = _icSecOff(sec, hdr.ssz); const n = Math.min(hdr.ssz, size - p); cfb.copy(out, p, off, off + n); p += n; if (p >= size) break; }
+  return out;
+}
+function _icWriteOoxml(cfb, newXml) {
+  const hdr = _icHdr(cfb); const ssz = hdr.ssz; let fat = _icFat(cfb, hdr.difat, ssz);
+  const entryOff = _icFindEntry(cfb, hdr, fat, 'OOXMLChartContents'); if (entryOff < 0) throw new Error('chart data edit: OOXMLChartContents not found');
+  const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116)); const capacity = chain.length * ssz;
+  const data = Buffer.from(newXml, 'utf8');
+  if (data.length <= capacity) {
+    let p = 0; for (const sec of chain) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(cfb, off, p, p + n); if (n < ssz) cfb.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+    cfb.writeUInt32LE(data.length, entryOff + 120); return cfb;
+  }
+  if (hdr.nFat !== 1 || hdr.difat.length !== 1) throw new Error('chart data edit: multi-FAT OLE not supported');
+  const needSectors = Math.ceil(data.length / ssz); const addSectors = needSectors - chain.length; let buf = cfb; const added = [];
+  for (let i = 0; i < addSectors; i++) { const idx = (buf.length - 512) / ssz; const tmp = Buffer.alloc(buf.length + ssz); buf.copy(tmp); buf = tmp; added.push(idx); }
+  while (fat.length < (buf.length - 512) / ssz) fat.push(0xFFFFFFFF);
+  const full = chain.concat(added); for (let i = 0; i < full.length - 1; i++) fat[full[i]] = full[i + 1]; fat[full[full.length - 1]] = 0xFFFFFFFE;
+  const maxEntries = ssz / 4; if (fat.length > maxEntries) throw new Error('chart data edit: OLE exceeded single-FAT capacity (too many rows/cols)');
+  const fatOff = _icSecOff(hdr.difat[0], ssz); for (let i = 0; i < maxEntries; i++) buf.writeUInt32LE((i < fat.length ? fat[i] : 0xFFFFFFFF) >>> 0, fatOff + i * 4);
+  let p = 0; for (const sec of full) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(buf, off, p, p + n); if (n < ssz) buf.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+  buf.writeUInt32LE(data.length, entryOff + 120); return buf;
+}
+function buildChartOleWithData(baseOleBytes, model) {
+  const inner = Buffer.from(inflateRawSync(baseOleBytes));
+  let cfb = Buffer.from(inner.slice(4));
+  const hdr = _icHdr(cfb); const fat = _icFat(cfb, hdr.difat, hdr.ssz);
+  const xEntry = _icFindEntry(cfb, hdr, fat, 'OOXMLChartContents'); if (xEntry < 0) throw new Error('chart data edit: OLE has no OOXMLChartContents');
+  const newXml = _chEditXml(_icReadStream(cfb, hdr, fat, xEntry).toString('utf8'), model);
+  cfb = _icWriteOoxml(cfb, newXml);
+  const newInner = Buffer.alloc(4 + cfb.length); newInner.writeUInt32LE(cfb.length, 0); cfb.copy(newInner, 4);
+  return deflateRawSync(newInner); // caller (insertChartInPlace) routes < 4096 B to the mini-stream
+}
+// Set/clear the gso "treat-as-character" bit (attribute bit 0) on the chart
+// cluster's CTRL_HEADER. As a floating object the chart reserves no line height,
+// so following paragraphs wrap into a cramped column beside it (the overlap the
+// user reported); as a like-char object it sits on its own line and text flows
+// cleanly above and below it. We default to like-char for that reason.
+function setGsoLikeChar(cluster, likeChar) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      const attrOff = p + 4; const attr = cluster.readUInt32LE(attrOff);
+      cluster.writeUInt32LE((likeChar ? (attr | 1) : (attr & ~1)) >>> 0, attrOff);
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Build a {categories, series:[{name,values}]} model from op params, or null if
+// the op carries no data overrides (then the template's default chart is used).
+function buildChartDataModel(op) {
+  const hasData = Array.isArray(op.categories) || Array.isArray(op.series) || Array.isArray(op.data) || Number.isInteger(op.rows) || Number.isInteger(op.cols);
+  if (!hasData) return null;
+  let categories = Array.isArray(op.categories) ? op.categories.map(String) : null;
+  const rows = Number.isInteger(op.rows) ? op.rows : (categories ? categories.length : 4);
+  if (!categories) categories = Array.from({ length: rows }, (_, i) => `항목 ${i + 1}`);
+  else if (categories.length !== rows) categories = categories.slice(0, rows).concat(Array.from({ length: Math.max(0, rows - categories.length) }, (_, i) => `항목 ${categories.length + i + 1}`));
+  let series = null;
+  if (Array.isArray(op.series)) series = op.series.map((s, i) => ({ name: String(s && s.name != null ? s.name : `계열 ${i + 1}`), values: (s && Array.isArray(s.values) ? s.values : []).map(Number) }));
+  else if (Array.isArray(op.data)) series = op.data.map((vals, i) => ({ name: `계열 ${i + 1}`, values: (Array.isArray(vals) ? vals : []).map(Number) }));
+  const cols = Number.isInteger(op.cols) ? op.cols : (series ? series.length : 3);
+  if (!series) series = Array.from({ length: cols }, (_, c) => ({ name: `계열 ${c + 1}`, values: [] }));
+  else if (series.length !== cols) series = series.slice(0, cols).concat(Array.from({ length: Math.max(0, cols - series.length) }, (_, c) => ({ name: `계열 ${series.length + c + 1}`, values: [] })));
+  series = series.map((s, c) => { const v = s.values.slice(0, rows); while (v.length < rows) v.push(((v.length + c) % 5) + 1); return { name: s.name, values: v }; });
+  return { categories, series };
+}
+
+// ── 차트 (chart) raw-patch — Hancom-Docs compatible ───────────────────────
+//
+// GT-first (each type GT'd from Hancom's 입력 › 차트 into a clean doc): a chart
+// is ONE "ole$" gso object in a new paragraph, backed by a deflated OLE in
+// BinData/BIN0001.OLE (regular-FAT, >4 KB). Hancom re-renders the chart from
+// that OLE — no cached PNG needed. The gso cluster is type-INDEPENDENT (shared
+// across all 20 types); only the OLE differs, so each chart-<N>.json template
+// pairs the one shared cluster with its type's verbatim OLE. DocInfo gets one
+// BIN_DATA def (attr 0x0002 = OLE storage, ext "OLE"); ID_MAPPINGS += 1.
+//
+// Optional data params (rows/cols/categories/series/data) edit the chart's
+// OOXMLChartContents to change the grid; otherwise the default chart is used.
+// Insertion targets a doc whose BinData starts empty (the common case).
+export async function insertChartInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  const summary = [];
+  for (const op of ops) {
+    const type = Number.isInteger(op.chart_type) && op.chart_type >= 0 && op.chart_type <= 19 ? op.chart_type : 0;
+    const tplName = (typeof op.template_override === 'string' && /^[A-Za-z0-9_-]+$/.test(op.template_override)) ? op.template_override : `chart-${type}`;
+    const tplPath = `${__dirname}/references/chart-templates/${tplName}.json`;
+    if (!existsSync(tplPath)) throw new Error(`insert_chart: no template for type ${type} (${tplPath})`);
+    const tpl = JSON.parse(readFileSync(tplPath, 'utf8'));
+    let oleBytes = Buffer.from(tpl.oleB64, 'base64');
+
+    // Optional rows/cols/data editing — edit the OOXMLChartContents in the OLE.
+    const dataModel = buildChartDataModel(op);
+    if (dataModel) oleBytes = buildChartOleWithData(oleBytes, dataModel);
+
+    // A sub-4096 OLE goes in the mini-stream (below). Re-deflate it at max
+    // compression first: a mini-stream that exactly fills a 128-entry mini-FAT
+    // sector makes Hancom drop the object (3-D pies, the largest small OLEs,
+    // hit this). Maximal compression keeps the mini footprint well under 128.
+    if (oleBytes.length < 4096) oleBytes = deflateRawSync(Buffer.from(inflateRawSync(oleBytes)), { level: 9 });
+
+    // Reject if the doc already has BinData (storage-id remap not yet done).
+    {
+      const probe = readFileSync(filePath);
+      const pc = parseCfbHeader(probe);
+      const pf = readFat(probe, pc.fatAddrs, pc.ssz);
+      const pd = readDirectory(probe, pf, pc.ssz, pc.dirStart);
+      if (pd.entries.some((e) => e.type === 1 && e.name === 'BinData')) {
+        throw new Error('insert_chart: target already has a BinData folder — chart insert into docs with existing images/charts is not yet supported (use a clean document)');
+      }
+    }
+
+    // ── Step 1: CFB — create BinData folder + the OLE stream ───────────────
+    // CFB routes a stream by size: < 4096 B → mini-stream, else regular FAT.
+    // Hancom is strict about this (a small OLE forced into the regular FAT
+    // renders as a broken-object placeholder), so match the cutoff exactly —
+    // the bigger bar/line charts go regular, the smaller pie/doughnut go mini.
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    if (!mssz) mssz = MSSZ_DEFAULT_IMG;
+    let fat = readFat(buf, fatAddrs, ssz);
+    let dir = readDirectory(buf, fat, ssz, dirStart);
+    let rootChain = walkChain(fat, dir.entries[0].start);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+
+    const folderSlot = findUnusedDirSlot(dir.entries);
+    writeDirEntry(buf, dir.entries[folderSlot], 'BinData', 1, 0, 0);
+    insertEntryIntoTree(buf, dir.entries, 0, folderSlot);
+
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    rootChain = walkChain(fat, dir.entries[0].start);
+    let binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    const oleSlot = findUnusedDirSlot(dir.entries);
+    if (oleSlot < 0) throw new Error('insert_chart: no free directory slot for the OLE stream');
+
+    let oleStartSec;
+    if (oleBytes.length < 4096) {
+      const alloc = allocMiniChain({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain, rootEntry: dir.entries[0] }, oleBytes.length);
+      buf = alloc.buf; fat = alloc.fat; minifat = alloc.minifat; minifatStart = alloc.minifatStart; rootChain = alloc.rootChain;
+      writeMiniChainBytes(buf, alloc.chain, rootChain, ssz, mssz, oleBytes);
+      oleStartSec = alloc.chain[0];
+    } else {
+      const oa = allocRegularChain(buf, ssz, fat, fatAddrs, oleBytes.length);
+      buf = oa.buf; fat = oa.fat;
+      writeChainBytes(buf, oa.chain, ssz, oleBytes);
+      oleStartSec = oa.chain[0];
+    }
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    writeDirEntry(buf, dir.entries[oleSlot], 'BIN0001.OLE', 2, oleStartSec, oleBytes.length, 0);
+    insertEntryIntoTree(buf, dir.entries, binIdx, oleSlot);
+    writeFileSync(filePath, buf);
+
+    // ── Step 2: DocInfo — one BIN_DATA def (attr 0x0002 = OLE storage) ─────
+    await addBinDataDefToDocInfo(filePath, 1, 'OLE', 0x0002);
+
+    // ── Step 3: Section0 — insert the chart cluster (one ole$ paragraph) ───
+    {
+      let b2 = readFileSync(filePath);
+      let h = parseCfbHeader(b2);
+      let f2 = readFat(b2, h.fatAddrs, h.ssz);
+      const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+      let mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+      const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+      const secInMini = secEntry.size < 4096;
+      let rc2 = null; const ensureRC = () => rc2 || (rc2 = walkChain(f2, entries[0].start));
+      let sChain, sComp;
+      if (secInMini) { const rc = ensureRC(); sChain = walkChain(mf2, secEntry.start); sComp = readMiniChainBytes(b2, sChain, rc, h.ssz, h.mssz, secEntry.size); }
+      else { sChain = walkChain(f2, secEntry.start); sComp = readChainBytes(b2, sChain, h.ssz, secEntry.size); }
+      let raw = Buffer.from(inflateRawSync(sComp));
+
+      const records = parseRecords(raw);
+      const cluster = Buffer.from(tpl.clusterHex, 'hex');
+      // Default to like-char so the chart reserves its height and surrounding
+      // text flows above/below it (set op.float:true for the floating original).
+      setGsoLikeChar(cluster, op.float === true ? false : (op.like_char !== false));
+      let insertAt = raw.length;
+      const clusters = findClusterBoundaries(records);
+      if (op.anchor && typeof op.anchor === 'string') {
+        const ab = Buffer.from(op.anchor, 'utf16le');
+        for (const c of clusters) { let hit = false; for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } } if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; } }
+      } else { const t = findLastSimpleBodyParagraph(records); insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length; }
+      raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+      normalizeLastParaFlag(raw);
+
+      let newComp;
+      if (secInMini) {
+        const rc = ensureRC();
+        const e = deflateMiniChainWithExpansion({ buf: b2, ssz: h.ssz, mssz: h.mssz, fat: f2, fatAddrs: h.fatAddrs, minifat: mf2, minifatStart: h.minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, sChain);
+        b2 = e.buf; f2 = e.fat; mf2 = e.minifat; h.minifatStart = e.minifatStart; newComp = e.compressed;
+        if (e.promoted) { sChain = e.newRegularChain; writeChainBytes(b2, sChain, h.ssz, newComp); b2.writeInt32LE(sChain[0], secEntry.entryFileOffset + 0x74); }
+        else { rc2 = e.rootChain; sChain = e.miniChain; writeMiniChainBytes(b2, sChain, rc2, h.ssz, h.mssz, newComp); }
+      } else {
+        const e = deflateAndFitWithExpansion(raw, sChain.length * h.ssz, h.ssz, f2, h.fatAddrs, sChain, b2, false);
+        b2 = e.buf; f2 = e.fat; sChain = e.chain; newComp = e.compressed; writeChainBytes(b2, sChain, h.ssz, newComp);
+      }
+      b2.writeUInt32LE(newComp.length, secEntry.entryFileOffset + 0x78);
+      b2.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      writeFileSync(filePath, b2);
+    }
+
+    summary.push({ section: 0, chart_type: type, ole: 'BinData/BIN0001.OLE' });
+  }
+
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── 도형 (shapes: rectangle / ellipse) raw-patch ──────────────────────────
 //
 // GT-first (shape_rect.hwp / shape_ellipse from Hancom's 입력 › 도형): a shape
@@ -4073,6 +4336,24 @@ function allocMiniChain(ctx, byteCount) {
     buf.writeUInt32LE(0, rootEntry.entryFileOffset + 0x7C);
   }
   return { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain, rootEntry, chain };
+}
+
+// Allocate a fresh regular-FAT chain large enough for `byteLen` bytes (for a
+// new stream stored in the regular FAT, e.g. a chart OLE > 4096 bytes).
+function allocRegularChain(buf, ssz, fat, fatAddrs, byteLen) {
+  const totalSectors = Math.max(1, Math.ceil(byteLen / ssz));
+  // First sector: ensure FAT capacity, append a blank sector, mark ENDOFCHAIN.
+  let exp = expandFatCapacity(buf, ssz, fat, fatAddrs, (buf.length / ssz) + 1);
+  buf = exp.buf; fat = exp.fat;
+  let alloc = appendBlankSector(buf, ssz); buf = alloc.buf;
+  const first = alloc.newSecIdx;
+  writeFatEntry(buf, ssz, fatAddrs, first, ENDOFCHAIN); fat[first] = ENDOFCHAIN;
+  let chain = [first];
+  if (totalSectors > 1) {
+    const e = extendFatChain(buf, ssz, fat, fatAddrs, chain, totalSectors - 1);
+    buf = e.buf; fat = e.fat; chain = e.chain;
+  }
+  return { buf, fat, chain };
 }
 
 function insertEntryIntoTree(buf, entries, parentIdx, newIdx) {

@@ -2284,6 +2284,13 @@ async function readStdin() {
   // storage folder + stream, DocInfo BIN_DATA def, and a gso "$pic" cluster
   // reproduced from Hancom's own output). See cell-patch.js insertImageInPlace.
   const IMAGE_RAWPATCH_OPS = new Set(['insert_image']);
+  // 차트 (raw-patch — gso "ole$" object + a deflated chart OLE stream, one of
+  // 20 GT'd per-type templates; Hancom re-renders from the OLE's embedded
+  // OOXMLChartContents). op fields: chart_type 0-19, anchor, optional
+  // rows/cols/categories/series/data (edit the chart's grid), float:true to
+  // keep it floating instead of the default like-char placement. Clean docs
+  // only for now. See cell-patch.js insertChartInPlace.
+  const CHART_OPS = new Set(['insert_chart']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2313,7 +2320,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...IMAGE_RAWPATCH_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2636,6 +2643,13 @@ async function readStdin() {
         const imSummary = await insertImageInPlace(outPath, imgRawOps);
         subModes.push(`image:${imSummary.mode || 'in-place'}`);
         for (const e of imSummary) allEdits.push({ kind: 'image', ...e });
+      }
+      const chartOps = ops.filter((o) => CHART_OPS.has(o.type));
+      if (chartOps.length > 0) {
+        const { insertChartInPlace } = await import('./cell-patch.js');
+        const chSummary = await insertChartInPlace(outPath, chartOps);
+        subModes.push(`chart:${chSummary.mode || 'in-place'}`);
+        for (const e of chSummary) allEdits.push({ kind: 'chart', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');
