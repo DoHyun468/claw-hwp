@@ -2201,6 +2201,23 @@ async function patchHwpxStubFingerprint(filePath) {
     out.file("Contents/content.hpf", hpf);
   }
 
+  // ── 2b. Patch version.xml — xmlVersion 1.2 → 1.5 ────────────────────────
+  // rhwp's exportHwpx writes version.xml with xmlVersion="1.2" (HWP 11 legacy
+  // format), while <hh:head version="..."> is bumped to 1.5 below. Hancom Docs
+  // web reads version.xml's xmlVersion; when it says "1.2" it treats the whole
+  // document as a LEGACY-format file and HALVES every paraPr margin (문단
+  // 위/아래/좌/우) value on import — the long-standing "문단 간격이 절반으로
+  // 나온다" bug. GT-confirmed (2026-06-17, byte-isolated round-trip): flipping
+  // ONLY xmlVersion 1.2→1.5 makes Hancom preserve our margins verbatim (case=
+  // mm×100, default=mm×200, no rescale). Keep consistent with the head version.
+  const verEntry = out.file("version.xml");
+  if (verEntry) {
+    let ver = await verEntry.async("string");
+    if (/xmlVersion="1\.2"/.test(ver)) {
+      out.file("version.xml", ver.replace(/xmlVersion="1\.2"/, 'xmlVersion="1.5"'));
+    }
+  }
+
   // ── 3. Patch header.xml — namespace + version + Hancom-native list bits ─
   const headerEntry = out.file("Contents/header.xml");
   if (!headerEntry) return { patched: true, paraPrInjected: false };
@@ -2592,6 +2609,13 @@ async function patchHwpxParaSpacing(filePath) {
       const c = (hu) => Math.round((hu / 283.46) * mult);
       return `<hh:margin><hc:intent value="${c(I)}" unit="HWPUNIT"/><hc:left value="${c(L)}" unit="HWPUNIT"/><hc:right value="${c(R)}" unit="HWPUNIT"/><hc:prev value="${c(P)}" unit="HWPUNIT"/><hc:next value="${c(N)}" unit="HWPUNIT"/></hh:margin>`;
     };
+    // UNIT NOTE (2026-06-17, unresolved): emit case = mm×100, default = mm×200
+    // (matches Hancom-native structure exactly per round-trip diff). BUT Hancom
+    // ignores the emitted case value and re-derives it on its own — round-trip
+    // case is FIXED (~mm×50) regardless of whether we emit ×1 or ×2, and the
+    // web render is identical. So neither ½ nor ×2 corrects the size. The exact
+    // Hancom unit mapping needs precise reverse-engineering (para-shape N mm →
+    // stored case, several N) before a real fix. Keeping native ×100/×200 for now.
     const sw = `<hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">${mk(100)}${ls}</hp:case><hp:default>${mk(200)}${ls}</hp:default></hp:switch>`;
     let out = pp;
     // pull autoSpacing out (re-inserted right before the switch, native order)
