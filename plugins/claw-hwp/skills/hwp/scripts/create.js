@@ -227,6 +227,16 @@ const bodyStylePatches = [];
 
 // Returns the uniform char style of `runs` ({height,bold,italic,underline,color})
 // when every text run shares the same non-default style, else null.
+//
+// FONT awareness: the uniformity check includes each run's font_family, so a
+// paragraph mixing fonts (e.g. a "맑은 고딕" label + a different-font sample on
+// one line) is NOT considered uniform and returns null — otherwise the
+// post-export re-link (patchHwpxBodyRunStyles) would flatten every run in the
+// paragraph onto ONE charPr and clobber the per-run fonts. rhwp preserves
+// distinct per-run fonts on its own, so leaving mixed-font paragraphs untracked
+// is exactly right. (The font is only part of the *uniformity* test; it is not
+// added to the re-link key, which matches on height:bold:italic:underline:color
+// — for a genuinely uniform paragraph all runs share the font anyway.)
 function uniformRunStyle(runs) {
   const styled = (runs || []).filter((r) => r && r.text);
   if (!styled.length) return null;
@@ -236,10 +246,11 @@ function uniformRunStyle(runs) {
       height: pt != null ? Math.round(Number(pt) * 100) : 1000,
       bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
       color: normalizeHexColor(r.color ?? r.textColor ?? "#000000"),
+      font: r.font_family ?? r.fontFamily ?? "",
     };
   };
   const first = norm(styled[0]);
-  const key = (s) => `${s.height}:${s.bold}:${s.italic}:${s.underline}:${s.color}`;
+  const key = (s) => `${s.height}:${s.bold}:${s.italic}:${s.underline}:${s.color}:${s.font}`;
   if (!styled.every((r) => key(norm(r)) === key(first))) return null; // mixed → skip
   const isDefault = first.height === 1000 && !first.bold && !first.italic
     && !first.underline && first.color.toUpperCase() === "#000000";
@@ -395,7 +406,12 @@ function buildCharFormatProps(input = {}, defaults = {}) {
   // BEFORE calling this builder, and passing `fontIds` directly. The
   // legacy `fontFamilies` name input is preserved here for back-compat
   // but won't actually change the font.
+  //
+  // Per-run fontIds win; otherwise inherit the defaults' fontIds. This is how
+  // the active theme's body/heading font flows: append_* passes the theme font
+  // as a default, while a per-run `font_family` still overrides it run-by-run.
   if (Array.isArray(input.fontIds)) props.fontIds = input.fontIds;
+  else if (Array.isArray(defaults.fontIds)) props.fontIds = defaults.fontIds;
   if (Array.isArray(input.fontFamilies)) props.fontFamilies = input.fontFamilies;
 
   // letterSpacing — broadcast scalar to all 7 slots. rhwp prop is
@@ -498,19 +514,144 @@ const HEADING_DEFAULTS = {
   // got pushed to next pages with empty bottom space. Frontend §5(k) #1+#3
   // fixes (single-<text> merge, scale removal) should make natural values
   // visible enough now. spacer paragraphs supplement vertical breathing.
-  1: { fontSize: 18,   color: "#1A1A1A", spacingBefore: 1300, spacingAfter: 800 },
-  2: { fontSize: 14,   color: "#2D2D2D", spacingBefore: 1000, spacingAfter: 600 },
-  3: { fontSize: 12,   color: "#404040", spacingBefore: 800,  spacingAfter: 500 },
-  4: { fontSize: 11,   color: "#595959", spacingBefore: 600,  spacingAfter: 400 },
-  5: { fontSize: 10.5, color: "#595959", spacingBefore: 500,  spacingAfter: 350 },
-  6: { fontSize: 10,   color: "#595959", spacingBefore: 450,  spacingAfter: 300 },
+  // Bumped 2026-06-17: 1300/800 read as "모자라" (insufficient) on Hancom — a
+  // section heading needs a clear band above it and breathing room to its body.
+  1: { fontSize: 18,   color: "#1A1A1A", spacingBefore: 2200, spacingAfter: 1100 },
+  2: { fontSize: 14,   color: "#2D2D2D", spacingBefore: 1700, spacingAfter: 900 },
+  3: { fontSize: 12,   color: "#404040", spacingBefore: 1400, spacingAfter: 750 },
+  4: { fontSize: 11,   color: "#595959", spacingBefore: 1100, spacingAfter: 600 },
+  5: { fontSize: 10.5, color: "#595959", spacingBefore: 900,  spacingAfter: 520 },
+  6: { fontSize: 10,   color: "#595959", spacingBefore: 800,  spacingAfter: 450 },
 };
 
 // Body line spacing 130% (rhwp default 160% is too airy). Heading 115% tighter.
 const BODY_LINE_SPACING = 130;
 const HEADING_LINE_SPACING = 115;
-// Body paragraph trailing gap (natural HWP value).
-const BODY_SPACING_AFTER = 600;
+// Body paragraph trailing gap. 600 HWPUNIT (~2.1mm) read as "packed" on Hancom web
+// (the title↔section gap at 1300 looked right), so use ~1000 (~3.5mm) for a clear
+// but not airy para↔para rhythm.
+const BODY_SPACING_AFTER = 1000;
+
+// ── Themes ────────────────────────────────────────────────────────────────
+//
+// A theme bundles the document's *visual identity* — heading colour per level,
+// heading font, body font, an accent colour — so a caller picks a whole look
+// with one `theme` field instead of repeating font_family/color on every op.
+// Layout knobs (font SIZE, spacing) stay in HEADING_DEFAULTS: a theme restyles,
+// it does not re-flow the page.
+//
+// HARD RULE — fonts must come from Hancom Docs web's supported set or they
+// silently substitute in the web viewer (we are HWPX, font_family registers any
+// name in fontfaces, but the *renderer* only has the picker's fonts). The
+// authoritative 39-font GT lives in memory `hancom-web-font-list`; every font
+// below is from it. A caller passing a font outside that set still works — it
+// just may substitute on web; that is on them.
+//
+// `government` (default) === the exact prior behaviour: gov-style gray heading
+// gradient + NO font override (so rhwp's default 함초롬 renders, unchanged).
+// Per-op `color` / `font_family` ALWAYS beat the theme, and `theme_overrides`
+// deep-patches any field at the payload level — the "agent got user feedback,
+// tweak the look without defining a whole theme" fallback the user asked for.
+//
+// A null font means "do not override" (keep rhwp default) — only `government`
+// uses null; every other theme names real Hancom-web fonts.
+const THEMES = {
+  government: {
+    label: "정부·공문서 (회색, 기본값)",
+    bodyFont: null,
+    headingFont: null,
+    headingColors: {
+      1: HEADING_DEFAULTS[1].color, 2: HEADING_DEFAULTS[2].color,
+      3: HEADING_DEFAULTS[3].color, 4: HEADING_DEFAULTS[4].color,
+      5: HEADING_DEFAULTS[5].color, 6: HEADING_DEFAULTS[6].color,
+    },
+    accent: "#1F3864",
+  },
+  corporate: {
+    label: "기업·비즈니스 (네이비)",
+    bodyFont: "맑은 고딕",
+    headingFont: "맑은 고딕",
+    headingColors: {
+      1: "#1F4E79", 2: "#2E5E8C", 3: "#36679B",
+      4: "#5A7A9E", 5: "#5A7A9E", 6: "#5A7A9E",
+    },
+    accent: "#1F4E79",
+  },
+  modern: {
+    label: "모던·테크 (블루)",
+    bodyFont: "Pretendard",
+    headingFont: "Pretendard SemiBold",
+    headingColors: {
+      1: "#111827", 2: "#1F2937", 3: "#374151",
+      4: "#4B5563", 5: "#4B5563", 6: "#4B5563",
+    },
+    accent: "#2563EB",
+  },
+  clean: {
+    label: "클린·미니멀 (틸)",
+    bodyFont: "해피니스 산스 레귤러",
+    headingFont: "해피니스 산스 볼드",
+    headingColors: {
+      1: "#0F172A", 2: "#1E293B", 3: "#334155",
+      4: "#475569", 5: "#475569", 6: "#475569",
+    },
+    accent: "#0F766E",
+  },
+  warm: {
+    label: "따뜻한·문화 (오렌지)",
+    bodyFont: "Apple SD 산돌고딕 Neo",
+    headingFont: "HY헤드라인M",
+    headingColors: {
+      1: "#3F2A1A", 2: "#5A3A22", 3: "#6B4226",
+      4: "#7C5A3E", 5: "#7C5A3E", 6: "#7C5A3E",
+    },
+    accent: "#C2410C",
+  },
+};
+
+// The theme in force for the current run; resolved once from the payload before
+// the op loop. Defaults to government so any code path that runs before
+// resolveTheme() (or a payload that omits `theme`) behaves exactly as before.
+let activeTheme = THEMES.government;
+
+// Resolve the active theme from the payload. Unknown `theme` names fall back to
+// government with a logged note (a typo must never abort a document). The
+// optional `theme_overrides` object deep-patches the chosen theme — bodyFont /
+// headingFont / accent / headingColors{level:hex} — so a caller can tweak the
+// look without defining a whole theme. Returns a fresh object; THEMES is never
+// mutated.
+function resolveTheme(payload, log) {
+  const name = payload.theme;
+  let base = THEMES.government;
+  if (name != null) {
+    if (THEMES[name]) base = THEMES[name];
+    else if (log) log.push(`theme '${name}' unknown — using 'government'. Valid: ${Object.keys(THEMES).join(", ")}`);
+  }
+  const theme = { ...base, headingColors: { ...base.headingColors } };
+  const ov = payload.theme_overrides;
+  if (ov && typeof ov === "object") {
+    if (ov.bodyFont != null) theme.bodyFont = ov.bodyFont;
+    if (ov.headingFont != null) theme.headingFont = ov.headingFont;
+    if (ov.accent != null) theme.accent = ov.accent;
+    if (ov.headingColors && typeof ov.headingColors === "object") {
+      for (const k of Object.keys(ov.headingColors)) theme.headingColors[k] = ov.headingColors[k];
+    }
+    if (log) log.push(`theme_overrides applied (${Object.keys(ov).join(", ")})`);
+  }
+  return theme;
+}
+
+// Resolve the active theme's font for a role ('body' | 'heading') to a
+// broadcast fontIds[7] on the supplied props object, registering the face in
+// DocInfo if needed. No-op when the theme leaves that role's font null
+// (government). Per-run / per-op fontIds set elsewhere still take precedence
+// because buildCharFormatProps prefers input.fontIds over defaults.fontIds.
+function themeFontIds(doc, role) {
+  const name = role === "heading" ? activeTheme.headingFont : activeTheme.bodyFont;
+  if (!name) return null;
+  const id = doc.findOrCreateFontId(String(name));
+  return id >= 0 ? Array(7).fill(id) : null;
+}
 
 function applyParaProps(doc, cursor, opts = {}) {
   // Apply paragraph-level properties: alignment + line spacing + before/after.
@@ -658,7 +799,11 @@ const HANDLERS = {
     const runs = Array.isArray(op.runs) && op.runs.length > 0
       ? op.runs
       : parseInlineRuns(op.text ?? "");
-    writeRunsAt(doc, cursor, runs);
+    // Theme body font flows in as a default; per-run font_family still wins.
+    const bodyDefaults = {};
+    const bFontIds = themeFontIds(doc, "body");
+    if (bFontIds) bodyDefaults.fontIds = bFontIds;
+    writeRunsAt(doc, cursor, runs, bodyDefaults);
     // rhwp drops the run's charPrIDRef on .hwpx export — track uniform run
     // styling so we can re-link it post-export (same fix as headings).
     const bstyle = uniformRunStyle(runs);
@@ -689,11 +834,16 @@ const HANDLERS = {
       ? op.runs
       : parseInlineRuns(op.text || "");
     const heightHU = Math.round(def.fontSize * 100);
-    writeRunsAt(doc, cursor, runs, {
+    // Theme controls colour + font; HEADING_DEFAULTS still owns size/spacing.
+    // A per-run color / font_family overrides the theme (handled downstream).
+    const headingDefaults = {
       fontSize: heightHU,
       bold: true,
-      color: def.color,
-    });
+      color: activeTheme.headingColors[level] ?? def.color,
+    };
+    const hFontIds = themeFontIds(doc, "heading");
+    if (hFontIds) headingDefaults.fontIds = hFontIds;
+    writeRunsAt(doc, cursor, runs, headingDefaults);
     headingPatches.push({
       paraIdx: cursor.para,
       heightHU,
@@ -850,6 +1000,12 @@ const HANDLERS = {
           baseProps.bold = true;
           baseProps.fontSize = 1050;
         }
+        // Theme font for table content: header cells use the heading font
+        // (falling back to body), body cells use the body font. No-op for the
+        // government theme (null fonts → keeps rhwp default).
+        const cellFontIds = themeFontIds(doc, isHeader ? "heading" : "body")
+          ?? themeFontIds(doc, "body");
+        if (cellFontIds) baseProps.fontIds = cellFontIds;
         doc.applyCharFormatInCell(
           cursor.sec, tableParaIdx, controlIdx, cellIdx,
           0, 0, cellText.length,
@@ -1023,7 +1179,10 @@ const HANDLERS = {
       const prefix = "• ";
       startNewParagraph(doc, cursor);
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
-      writeRunsAt(doc, cursor, runs);
+      const liDefaults = {};
+      const liFontIds = themeFontIds(doc, "body");
+      if (liFontIds) liDefaults.fontIds = liFontIds;
+      writeRunsAt(doc, cursor, runs, liDefaults);
       // Tighter spacing for list items — 100 HWPUNIT after = ~0.35mm.
       applyParaProps(doc, cursor, {
         align: "left",
@@ -1042,7 +1201,10 @@ const HANDLERS = {
       const prefix = `${idx + 1}. `;
       startNewParagraph(doc, cursor);
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
-      writeRunsAt(doc, cursor, runs);
+      const liDefaults = {};
+      const liFontIds = themeFontIds(doc, "body");
+      if (liFontIds) liDefaults.fontIds = liFontIds;
+      writeRunsAt(doc, cursor, runs, liDefaults);
       applyParaProps(doc, cursor, {
         align: "left",
         lineSpacing: 120,
@@ -2088,17 +2250,34 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
   const headerXml = await headerEntry.async("string");
   const sectionXml = await sectionEntry.async("string");
 
-  // header charPr → composite-key lookup.
+  // Map a fontRef face id → face NAME (HANGUL block is representative — rhwp
+  // assigns the same id across every language block). Lets us key charPrs on
+  // their font so paragraphs that differ ONLY by font (e.g. a font-sample sheet,
+  // or a 14pt 궁서 line next to a 14pt 바탕 line) re-link to the RIGHT charPr
+  // instead of collapsing onto the first one that matches size+colour.
+  const faceById = new Map();
+  const hangulBlock = (/<hh:fontface lang="HANGUL"[^>]*>[\s\S]*?<\/hh:fontface>/.exec(headerXml) || [])[0] || "";
+  for (const fm of hangulBlock.matchAll(/<hh:font id="(\d+)"[^>]*\bface="([^"]*)"/g)) {
+    faceById.set(fm[1], fm[2]);
+  }
+
+  // header charPr → composite-key lookup. Two maps: `lookupFull` keys on font
+  // too (for patches that carry an explicit font), `lookup` ignores it (the
+  // fallback for font-less styled paragraphs — original behaviour).
   const charPrRe = /<hh:charPr\b[^>]*?(?:\/>|>(?:[^<]|<(?!\/hh:charPr>))*?<\/hh:charPr>)/g;
   const lookup = new Map();
+  const lookupFull = new Map();
   for (const m of headerXml.matchAll(charPrRe)) {
     const s = m[0];
     const id = (/\bid="(\d+)"/.exec(s) || [])[1];
     const height = (/\bheight="(\d+)"/.exec(s) || [])[1];
     if (!id || !height) continue;
     const color = ((/\btextColor="([^"]*)"/.exec(s) || [])[1] || "#000000").toUpperCase();
-    const key = `${height}:${/<hh:bold\b/.test(s) ? 1 : 0}:${/<hh:italic\b/.test(s) ? 1 : 0}:${/<hh:underline\b/.test(s) ? 1 : 0}:${color}`;
-    if (!lookup.has(key)) lookup.set(key, id);
+    const base = `${height}:${/<hh:bold\b/.test(s) ? 1 : 0}:${/<hh:italic\b/.test(s) ? 1 : 0}:${/<hh:underline\b/.test(s) ? 1 : 0}:${color}`;
+    if (!lookup.has(base)) lookup.set(base, id);
+    const faceId = (/<hh:fontRef\s+hangul="(\d+)"/.exec(s) || [])[1];
+    const face = faceById.get(faceId) || "";
+    if (!lookupFull.has(`${base}:${face}`)) lookupFull.set(`${base}:${face}`, id);
   }
 
   const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
@@ -2109,8 +2288,10 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
   for (let i = patches.length - 1; i >= 0; i--) {
     const p = patches[i];
     if (p.paraIdx < 0 || p.paraIdx >= regions.length) continue;
-    const key = `${p.height}:${p.bold ? 1 : 0}:${p.italic ? 1 : 0}:${p.underline ? 1 : 0}:${p.color.toUpperCase()}`;
-    const targetId = lookup.get(key);
+    const base = `${p.height}:${p.bold ? 1 : 0}:${p.italic ? 1 : 0}:${p.underline ? 1 : 0}:${p.color.toUpperCase()}`;
+    // Explicit font → match the charPr with that font; otherwise fall back to
+    // the font-agnostic match (original behaviour for font-less styled paras).
+    const targetId = (p.font && lookupFull.get(`${base}:${p.font}`)) || lookup.get(base);
     if (!targetId) continue;
     const region = regions[p.paraIdx];
     const body = xml.slice(region.start, region.end);
@@ -2128,6 +2309,49 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
     fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
   }
   return fixed;
+}
+
+// Remap the default char shape (charPr id=0) to the theme body font. rhwp
+// resets a fair number of run charPrIDRefs to "0" on .hwpx export — notably
+// in-table-cell runs (applyCharFormatInCell creates a styled charPr in
+// header.xml but the cell run still serializes as id 0). Those leaked runs
+// then render in the document default (함초롬), ignoring the theme. Rewriting
+// charPr id=0's <hh:fontRef> to the theme body face id makes every such leaked
+// run pick up the theme font — a catch-all on top of the per-paragraph
+// re-links above. No-op for the government theme (bodyFont null → not called).
+// The face is already registered (every body op resolved it via
+// findOrCreateFontId), so we only look up its id, never add it.
+async function patchHwpxDefaultFont(filePath, bodyFontName) {
+  if (!bodyFontName) return 0;
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const headerEntry = zip.file("Contents/header.xml");
+  if (!headerEntry) return 0;
+  let headerXml = await headerEntry.async("string");
+
+  // Find the body font's face id from the HANGUL fontface block (rhwp assigns
+  // the same id across every language block, so HANGUL is representative).
+  const hangulBlock = (/<hh:fontface lang="HANGUL"[^>]*>[\s\S]*?<\/hh:fontface>/.exec(headerXml) || [])[0];
+  if (!hangulBlock) return 0;
+  const esc = bodyFontName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const faceM = new RegExp(`<hh:font id="(\\d+)"[^>]*\\bface="${esc}"`).exec(hangulBlock);
+  if (!faceM) return 0; // font not registered (no body op ran) → nothing to remap
+  const faceId = faceM[1];
+
+  // Rewrite charPr id=0's fontRef so all seven language slots point at faceId.
+  let patched = 0;
+  headerXml = headerXml.replace(
+    /(<hh:charPr id="0"[^>]*>[\s\S]*?)<hh:fontRef\b[^>]*\/>/,
+    (full, head) => {
+      patched++;
+      return `${head}<hh:fontRef hangul="${faceId}" latin="${faceId}" hanja="${faceId}" japanese="${faceId}" other="${faceId}" symbol="${faceId}" user="${faceId}"/>`;
+    },
+  );
+
+  if (patched > 0) {
+    zip.file("Contents/header.xml", headerXml);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return patched;
 }
 
 // ── Layout-cache strip ────────────────────────────────────────────────────
@@ -2271,6 +2495,11 @@ async function readStdin() {
     process.stdout.write(JSON.stringify({ status: "error", message: `path must end in .hwp or .hwpx (got ${ext})` }) + "\n");
     process.exit(1);
   }
+
+  // Resolve the document theme once, up front, so every append_* op below sees
+  // the right fonts/colours. `theme` selects a base; `theme_overrides` tweaks
+  // it. Defaults to government (== prior behaviour) when omitted.
+  activeTheme = resolveTheme(payload, log);
 
   // ── Hancom Docs raw-patch fast path ─────────────────────────────────────
   //
@@ -2779,6 +3008,18 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: fixed ${n} body run charPrIDRef`);
     } catch (err) {
       log.push(`hwpx_bodystyle_patch failed: ${err.message}`);
+    }
+  }
+
+  // Theme body font: remap default charPr id=0 → theme body face, so any run
+  // rhwp left pointing at id 0 (notably table-cell text) still renders in the
+  // theme font. No-op for the government theme (bodyFont null).
+  if (ext === ".hwpx" && activeTheme.bodyFont) {
+    try {
+      const n = await patchHwpxDefaultFont(outPath, activeTheme.bodyFont);
+      if (n > 0) log.push(`hwpx_patch: remapped default font → ${activeTheme.bodyFont}`);
+    } catch (err) {
+      log.push(`hwpx_defaultfont_patch failed: ${err.message}`);
     }
   }
 
