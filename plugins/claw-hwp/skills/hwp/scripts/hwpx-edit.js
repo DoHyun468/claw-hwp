@@ -743,9 +743,11 @@ function opInsertTable(doc, index, rows, cols, cells) {
     cellTemplateInner = srcTcs[0].inner;
     srcTblAttrs = srcTbl.el.attrs;
 
-    // Keep the source tbl's pre-row metadata (hp:sz, hp:pos, hp:outMargin, hp:inMargin).
+    // Keep the source tbl's pre-row metadata (hp:sz, hp:pos, hp:outMargin, hp:inMargin)
+    // but drop any caption — a fresh table shouldn't inherit the template's caption.
     const firstTrIdx = srcTbl.el.inner.indexOf('<hp:tr');
-    tblMeta = firstTrIdx >= 0 ? srcTbl.el.inner.slice(0, firstTrIdx) : '';
+    tblMeta = (firstTrIdx >= 0 ? srcTbl.el.inner.slice(0, firstTrIdx) : '')
+      .replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, '');
   } else {
     // Fallback path — no source table to clone. Hancom Docs's web viewer
     // suppresses cellzone fills when the table's own borderFill paints a
@@ -2293,7 +2295,10 @@ function buildPic(doc, itemId, width, height) {
       pic = pic
         .replace(/binaryItemIDRef="[^"]*"/, `binaryItemIDRef="${itemId}"`)
         .replace(/\bid="\d+"/, `id="${freshId()}"`)
-        .replace(/\binstid="\d+"/, `instid="${freshId()}"`);
+        .replace(/\binstid="\d+"/, `instid="${freshId()}"`)
+        // Don't inherit the template pic's caption — a fresh image has none, and
+        // Hancom Docs rejects a stray caption cloned onto a new pic.
+        .replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, '');
       return pic;
     }
   }
