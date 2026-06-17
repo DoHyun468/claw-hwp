@@ -2678,8 +2678,15 @@ async function patchHwpxParaSpacing(filePath) {
 //     outMargin.top alone — matching the below-gap (outMargin.bottom).
 // Net: every table sits with the same ~3.5mm above and below, whether wrapped
 // by body text or section headings.
-const TABLE_OUTMARGIN_TB = 1000; // HWPUNIT ≈ 3.5mm above & below each table
-async function patchHwpxTableOutMargin(filePath, topBottom = TABLE_OUTMARGIN_TB) {
+// top == bottom: Hancom web FORCES table outMargin symmetric on import (GT: sent
+// top=1000/bottom=1500, Hancom stored bottom=1000), so an asymmetric value is a
+// no-op. The gap above a table still renders ~1.5–2mm larger than below because
+// Hancom paints the preceding paragraph's line-height trailing (150% body line
+// spacing) above the table but does NOT mirror the following paragraph's leading
+// below — an irreducible line-metric artifact, not a spacing bug.
+const TABLE_OUTMARGIN_TOP = 1000;    // HWPUNIT ≈ 3.5mm
+const TABLE_OUTMARGIN_BOTTOM = 1000; // forced equal to top by Hancom on import
+async function patchHwpxTableOutMargin(filePath, top = TABLE_OUTMARGIN_TOP, bottom = TABLE_OUTMARGIN_BOTTOM) {
   const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
   const headerEntry = zip.file("Contents/header.xml");
   let header = headerEntry ? await headerEntry.async("string") : null;
@@ -2699,7 +2706,7 @@ async function patchHwpxTableOutMargin(filePath, topBottom = TABLE_OUTMARGIN_TB)
         const left = (m.match(/left="(\d+)"/) || [])[1] ?? "283";
         const right = (m.match(/right="(\d+)"/) || [])[1] ?? "283";
         total++;
-        return `<hp:outMargin left="${left}" right="${right}" top="${topBottom}" bottom="${topBottom}"/>`;
+        return `<hp:outMargin left="${left}" right="${right}" top="${top}" bottom="${bottom}"/>`;
       }),
     );
     if (xml2 !== xml) { xml = xml2; changed = true; }
@@ -3487,7 +3494,7 @@ async function readStdin() {
   if (ext === ".hwpx") {
     try {
       const n = await patchHwpxTableOutMargin(outPath);
-      if (n > 0) log.push(`hwpx_patch: ${n} table outMargin top/bottom → ${TABLE_OUTMARGIN_TB}`);
+      if (n > 0) log.push(`hwpx_patch: ${n} table outMargin top=${TABLE_OUTMARGIN_TOP} bottom=${TABLE_OUTMARGIN_BOTTOM}`);
     } catch (err) {
       log.push(`hwpx_tableoutmargin_patch failed: ${err.message}`);
     }
