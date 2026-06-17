@@ -3506,6 +3506,174 @@ export async function insertPageNumberInPlace(filePath, ops) {
 }
 
 
+// ── 머리말 / 꼬리말 텍스트 (header / footer text) raw-patch ────────────────
+//
+// Derived from the verified page-number footer/header control structure
+// (insertPageNumberInPlace) — same control + LIST_HEADER — but the content
+// paragraph holds USER TEXT instead of the page-number auto-field (no
+// auto-number control, control_mask 0). The header uses ctrl id "head"
+// (GT pagenum_header.hwp) and the footer "foot" (GT pagenum_native.hwp);
+// LIST_HEADER attr/height differ (header: attr 0, height = header margin;
+// footer: attr 0x40, height = footer margin). Section0-only — no DocInfo
+// write (resolves the existing "Header" style for the paragraph).
+const HF_KINDS = {
+  header: { ctrlId: '64616568', listAttr: 0x00, marginOff: 24 }, // 'head'
+  footer: { ctrlId: '746f6f66', listAttr: 0x40, marginOff: 28 }, // 'foot'
+};
+
+// PAGE_DEF margin (HWPUNIT) at the given offset (24 = header, 28 = footer).
+function readPageDefMargin(records, raw, off) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= off + 4) return raw.readUInt32LE(r.dataOff + off);
+  }
+  return 0x109c;
+}
+
+// Insert header/footer text. Each op: { where: "header"|"footer", text: string }
+export async function insertHeaderFooterTextInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const hdrStyle = resolveNoteStyle(buf, 'Header');
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const where = (op.where === 'header') ? 'header' : 'footer';
+    const kind = HF_KINDS[where];
+    const text = (typeof op.text === 'string') ? op.text : '';
+    if (!text) throw new Error(`${where}_text: a "text" string is required`);
+    const records = parseRecords(raw);
+    const textWidth = readTextWidthFromPageDef(records, raw);
+    const margin = readPageDefMargin(records, raw, kind.marginOff);
+
+    // Attach to the section's first top-level paragraph that has PARA_TEXT.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`${where}_text: no top-level body paragraph found`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+
+    // 1) Inline header/footer char (0x0010 + ctrlId) before the paragraph's EOP.
+    const hfChar = Buffer.alloc(16);
+    hfChar.writeUInt16LE(0x10, 0);
+    Buffer.from(kind.ctrlId, 'hex').copy(hfChar, 2);
+    hfChar.writeUInt16LE(0x10, 14);
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), hfChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Header/footer cluster with a user-text paragraph.
+    const ctrlBody = Buffer.concat([Buffer.from(kind.ctrlId, 'hex'), Buffer.from('0000000001000000', 'hex')]);
+    const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, 12), ctrlBody]);
+    const lh = Buffer.alloc(34);
+    lh.writeUInt32LE(1, 0);
+    lh.writeUInt32LE(kind.listAttr, 4);
+    lh.writeUInt32LE(textWidth >>> 0, 8);
+    lh.writeUInt32LE(margin >>> 0, 12);
+    const listHeader = Buffer.concat([buildRecordHeader(TAG_LIST_HEADER, 2, 34), lh]);
+    const ph = Buffer.alloc(24);
+    ph.writeUInt32LE(((0x80000000 | ((text.length + 1) & 0x7FFFFFFF)) >>> 0), 0); // text + EOP, last-para
+    ph.writeUInt32LE(0, 4);                       // control_mask: plain text
+    ph.writeUInt16LE(0, 8);                       // para_shape 0 (default alignment)
+    ph.writeUInt8(hdrStyle.index & 0xFF, 10);
+    ph.writeUInt8(0, 11);
+    ph.writeUInt16LE(1, 12);
+    const phRec = Buffer.concat([buildRecordHeader(TAG_PARA_HEADER, 2, 24), ph]);
+    const ptBody2 = Buffer.from(text + PARA_TEXT_EOP, 'utf16le');
+    const ptRec2 = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 3, ptBody2.length), ptBody2]);
+    const csBody = Buffer.alloc(8); csBody.writeUInt32LE(hdrStyle.charShape >>> 0, 4);
+    const csRec = Buffer.concat([buildRecordHeader(TAG_PARA_CHAR_SHAPE, 3, 8), csBody]);
+    const hfCluster = Buffer.concat([ctrl, listHeader, phRec, ptRec2, csRec]);
+
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x10000 (char 0x10).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x10000) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), hfCluster, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, where, text });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's
