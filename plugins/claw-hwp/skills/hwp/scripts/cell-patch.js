@@ -3674,6 +3674,164 @@ export async function insertHeaderFooterTextInPlace(filePath, ops) {
 }
 
 
+// ── 이미지 (image) raw-patch — Hancom-Docs compatible ─────────────────────
+//
+// GT-first (image_native.hwp from Hancom's 입력 › 그림): an image is a gso
+// "$pic" drawing object in a NEW paragraph, backed by a deflated image stream
+// in a `BinData/BIN000N.<ext>` CFB stream and a DocInfo HWPTAG_BIN_DATA def.
+// The earlier Phase-6 attempt failed Hancom Docs render (donor-template
+// cluster) and could not create a BinData folder; this op reproduces Hancom's
+// exact $pic cluster + creates the BinData storage folder when missing.
+//   3 steps (each re-writes the file):
+//     1. CFB: create the BinData storage folder if absent, add a
+//        BIN000N.<ext> stream holding deflate(image bytes).
+//     2. DocInfo: HWPTAG_BIN_DATA def (attr 0x0001 = Embedding/Default,
+//        matching the GT, NOT Phase-6's 0x0101) + ID_MAPPINGS bin-data count++.
+//     3. Section0: insert the gso "$pic" cluster (GT template) as a new
+//        paragraph; CTRL_DATA[71] = the storage id.
+const IMG_GSO_CTRL_HEX  = '206f736711230a14000000000000000070170000a60e000000000000000000000000000065969a42000000000000';
+const IMG_PIC_COMP_HEX  = '636970246369702400000000000000000000010070170000a60e000070170000a60e000000000b20000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000';
+const IMG_CTRL_DATA_HEX = '0000000000000000000000000000000000000000701700000000000070170000a60e000000000000a60e0000000000000000000070170000c40e0000000000000000000000000001000066969a020000000070170000c40e000000';
+const TAG_CTRL_DATA = 0x55;
+
+// Build the image's new-paragraph gso "$pic" cluster (6 records).
+function buildImagePicCluster(storageId, paraInstanceId, gsoInstanceId) {
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(9, 0);              // char_count 9 (last-para flag normalized later)
+  ph.writeUInt32LE(0x800, 4);         // control_mask: gso bit
+  ph.writeUInt16LE(0, 8);             // para_shape 0
+  ph.writeUInt8(0, 10); ph.writeUInt8(0, 11);
+  ph.writeUInt16LE(1, 12);            // num_char_shapes
+  ph.writeUInt16LE(0, 14); ph.writeUInt16LE(0, 16);
+  ph.writeUInt32LE(paraInstanceId >>> 0, 18);
+
+  const pt = Buffer.from('0b00206f736700000000000000000b000d00', 'hex'); // gso char + EOP
+  const cs = Buffer.alloc(8);
+
+  const ch = Buffer.from(IMG_GSO_CTRL_HEX, 'hex'); ch.writeUInt32LE(gsoInstanceId >>> 0, 36);
+  const pic = Buffer.from(IMG_PIC_COMP_HEX, 'hex');
+  const cd = Buffer.from(IMG_CTRL_DATA_HEX, 'hex'); cd.writeUInt16LE(storageId & 0xFFFF, 71);
+
+  const parts = [
+    [TAG_PARA_HEADER, 0, ph], [TAG_PARA_TEXT, 1, pt], [TAG_PARA_CHAR_SHAPE, 1, cs],
+    [TAG_CTRL_HEADER, 1, ch], [TAG_SHAPE_COMPONENT, 2, pic], [TAG_CTRL_DATA, 3, cd],
+  ];
+  const chunks = [];
+  for (const [tag, lvl, body] of parts) chunks.push(buildRecordHeader(tag, lvl, body.length), body);
+  return Buffer.concat(chunks);
+}
+
+export async function insertImageInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.path) throw new Error('insert_image: op.path (image file) is required');
+    const imgBuf = readFileSync(op.path);
+    const ext = (op.path.split('.').pop() || 'png').toLowerCase();
+    const stored = deflateRawSync(imgBuf, { level: 9 });
+    if (stored.length >= 4096) throw new Error(`insert_image: image too large for mini-stream (${stored.length} deflated bytes)`);
+
+    // ── Step 1: CFB — ensure BinData folder, add the image stream ──────────
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    if (!mssz) mssz = MSSZ_DEFAULT_IMG;
+    let fat = readFat(buf, fatAddrs, ssz);
+    let dir = readDirectory(buf, fat, ssz, dirStart);
+    let rootChain = walkChain(fat, dir.entries[0].start);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+
+    let binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    if (binDataIdx < 0) {
+      const folderSlot = findUnusedDirSlot(dir.entries);
+      if (folderSlot < 0) throw new Error('insert_image: no free directory slot for the BinData folder');
+      writeDirEntry(buf, dir.entries[folderSlot], 'BinData', 1, 0, 0); // storage: start 0, size 0
+      insertEntryIntoTree(buf, dir.entries, 0, folderSlot);            // link under Root Entry
+      binDataIdx = folderSlot;
+    }
+
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    rootChain = walkChain(fat, dir.entries[0].start);
+    binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    const newName = pickFreeBinDataName(dir.entries, ext);
+    const streamSlot = findUnusedDirSlot(dir.entries);
+    if (streamSlot < 0) throw new Error('insert_image: no free directory slot for the image stream');
+    const alloc = allocMiniChain({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain, rootEntry: dir.entries[0] }, stored.length);
+    buf = alloc.buf; fat = alloc.fat; minifat = alloc.minifat; minifatStart = alloc.minifatStart; rootChain = alloc.rootChain;
+    writeMiniChainBytes(buf, alloc.chain, rootChain, ssz, mssz, stored);
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    writeDirEntry(buf, dir.entries[streamSlot], newName, 2, alloc.chain[0], stored.length, 0);
+    insertEntryIntoTree(buf, dir.entries, binDataIdx, streamSlot);
+    const storageId = parseInt(newName.match(/BIN(\d{4})\./)[1], 10);
+    writeFileSync(filePath, buf);
+
+    // ── Step 2: DocInfo BIN_DATA def (attr 0x0001) + ID_MAPPINGS count++ ───
+    await addBinDataDefToDocInfo(filePath, storageId, ext, 0x0001);
+
+    // ── Step 3: Section0 — insert the gso "$pic" cluster as a new paragraph ─
+    {
+      let b2 = readFileSync(filePath);
+      let h = parseCfbHeader(b2);
+      let f2 = readFat(b2, h.fatAddrs, h.ssz);
+      const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+      let mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+      const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+      const secInMini = secEntry.size < 4096;
+      let rc2 = null; const ensureRC = () => rc2 || (rc2 = walkChain(f2, entries[0].start));
+      let sChain, sComp;
+      if (secInMini) { const rc = ensureRC(); sChain = walkChain(mf2, secEntry.start); sComp = readMiniChainBytes(b2, sChain, rc, h.ssz, h.mssz, secEntry.size); }
+      else { sChain = walkChain(f2, secEntry.start); sComp = readChainBytes(b2, sChain, h.ssz, secEntry.size); }
+      let raw = Buffer.from(inflateRawSync(sComp));
+
+      const records = parseRecords(raw);
+      const paraInst = pickFreshInstanceId(records, raw);
+      const cluster = buildImagePicCluster(storageId, paraInst, (paraInst + 0x100) >>> 0);
+      // Insert after the anchor paragraph, else after the last simple paragraph.
+      let insertAt = raw.length;
+      const clusters = findClusterBoundaries(records);
+      if (op.anchor && typeof op.anchor === 'string') {
+        const ab = Buffer.from(op.anchor, 'utf16le');
+        for (const c of clusters) {
+          let hit = false;
+          for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } }
+          if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; }
+        }
+      } else {
+        const t = findLastSimpleBodyParagraph(records);
+        insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+      }
+      raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+      normalizeLastParaFlag(raw);
+
+      let newComp;
+      if (secInMini) {
+        const rc = ensureRC();
+        const e = deflateMiniChainWithExpansion({ buf: b2, ssz: h.ssz, mssz: h.mssz, fat: f2, fatAddrs: h.fatAddrs, minifat: mf2, minifatStart: h.minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, sChain);
+        b2 = e.buf; f2 = e.fat; mf2 = e.minifat; h.minifatStart = e.minifatStart; newComp = e.compressed;
+        if (e.promoted) { sChain = e.newRegularChain; writeChainBytes(b2, sChain, h.ssz, newComp); b2.writeInt32LE(sChain[0], secEntry.entryFileOffset + 0x74); }
+        else { rc2 = e.rootChain; sChain = e.miniChain; writeMiniChainBytes(b2, sChain, rc2, h.ssz, h.mssz, newComp); }
+      } else {
+        const e = deflateAndFitWithExpansion(raw, sChain.length * h.ssz, h.ssz, f2, h.fatAddrs, sChain, b2, false);
+        b2 = e.buf; f2 = e.fat; sChain = e.chain; newComp = e.compressed; writeChainBytes(b2, sChain, h.ssz, newComp);
+      }
+      b2.writeUInt32LE(newComp.length, secEntry.entryFileOffset + 0x78);
+      b2.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      writeFileSync(filePath, b2);
+    }
+
+    summary.push({ section: 0, image: op.path, storage_id: storageId, stream: `BinData/${newName}` });
+  }
+
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── 도형 (shapes: rectangle / ellipse) raw-patch ──────────────────────────
 //
 // GT-first (shape_rect.hwp / shape_ellipse from Hancom's 입력 › 도형): a shape
@@ -4131,7 +4289,7 @@ function parseDocInfoRecords(raw) {
   return parseRecords(raw); // identical record format
 }
 
-async function addBinDataDefToDocInfo(filePath, storageId, ext) {
+async function addBinDataDefToDocInfo(filePath, storageId, ext, attrOverride) {
   let buf = readFileSync(filePath);
   let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
   let fat = readFat(buf, fatAddrs, ssz);
@@ -4169,7 +4327,7 @@ async function addBinDataDefToDocInfo(filePath, storageId, ext) {
   raw.writeUInt32LE(oldCount + 1, idMap.dataOff);
 
   // Build new HWPTAG_BIN_DATA record.
-  const body = buildBinDataDefBody(storageId, ext);
+  const body = buildBinDataDefBody(storageId, ext, attrOverride);
   const header = buildRecordHeader(TAG_BIN_DATA_DEF, 1, body.length);
   const newRec = Buffer.concat([header, body]);
 
