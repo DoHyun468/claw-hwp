@@ -3674,6 +3674,160 @@ export async function insertHeaderFooterTextInPlace(filePath, ops) {
 }
 
 
+// ── 도형 (shapes: rectangle / ellipse) raw-patch ──────────────────────────
+//
+// GT-first (shape_rect.hwp / shape_ellipse from Hancom's 입력 › 도형): a shape
+// is a gso drawing object (same family as 문단 띠) attached to the anchor
+// paragraph — an inline gso char (0x000b "gso ") goes into the paragraph's
+// PARA_TEXT (char_count += 8, control_mask |= 0x800), and a gso cluster is
+// appended: CTRL_HEADER "gso " + SHAPE_COMPONENT (id "cer$"=rect / "lle$"=
+// ellipse) + the shape record (RECTANGLE 0x4f / ELLIPSE 0x50). The rect and
+// ellipse SHAPE_COMPONENTs are byte-identical except the 8-byte id prefix.
+// Default size 15000×6750 HWPUNIT (~53×24mm), floating. Section0-only.
+const SHAPE_GSO_CTRL_HEX = '206f736700406a144a2e00002c4c0000983a00005e1a0000000000000000000000000000ec969a42000000000800acc001ac15d6200085c7c8b2e4b22e00';
+const SHAPE_COMP_HEX     = '6365722463657224000000000000000000000100983a00005e1a0000983a00005e1a000000000b00000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000000000000021000000410000c00001000000ffffff0000000000ffffffff000000000000000000b2b2b2000000000000000000ed969a020000';
+const SHAPE_KINDS = {
+  rect:    { idPrefix: '6365722463657224', recTag: TAG_SHAPE_COMPONENT_RECTANGLE, recHex: '000000000000000000983a000000000000983a00005e1a0000000000005e1a0000' },
+  ellipse: { idPrefix: '6c6c65246c6c6524', recTag: 0x50, recHex: '000000004c1d00002f0d0000983a00002f0d00004c1d0000000000000000000000000000000000000000000000000000000000000000000000000000' },
+};
+
+export async function insertShapeInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const shapeName = SHAPE_KINDS[op.shape] ? op.shape : 'rect';
+    const kind = SHAPE_KINDS[shapeName];
+    const records = parseRecords(raw);
+
+    // Anchor paragraph + its level-1 PARA_TEXT.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1 &&
+              raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf) !== -1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) {
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) throw new Error('insert_shape: no top-level body paragraph found to anchor the shape');
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const inst = pickFreshInstanceId(records, raw);
+
+    // 1) Inline gso char (0x000b "gso ") before the paragraph's EOP.
+    const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) gso cluster: CTRL_HEADER + SHAPE_COMPONENT + shape record.
+    const ch = Buffer.from(SHAPE_GSO_CTRL_HEX, 'hex'); ch.writeUInt32LE(inst >>> 0, 36);
+    const sc = Buffer.from(SHAPE_COMP_HEX, 'hex');
+    Buffer.from(kind.idPrefix, 'hex').copy(sc, 0);              // shape id prefix
+    sc.writeUInt32LE((inst + 1) >>> 0, sc.length - 6);          // fresh shape instance id
+    const rec = Buffer.from(kind.recHex, 'hex');
+    const cluster2 = Buffer.concat([
+      buildRecordHeader(TAG_CTRL_HEADER, 1, ch.length), ch,
+      buildRecordHeader(TAG_SHAPE_COMPONENT, 2, sc.length), sc,
+      buildRecordHeader(kind.recTag, 3, rec.length), rec,
+    ]);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x800 (char 0x0b).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), cluster2, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, shape: shapeName, anchor: op.anchor ?? null });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's
