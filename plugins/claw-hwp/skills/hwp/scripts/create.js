@@ -2256,6 +2256,12 @@ async function readStdin() {
   // anchor text). Functional link; not auto-styled blue/underline (layer
   // apply_text_style for that). See cell-patch.js insertHyperlinkInPlace.
   const HYPERLINK_OPS = new Set(['insert_hyperlink']);
+  // 책갈피 (raw-patch — invisible point-marker: inline char 0x16 + 'bokm' ctrl
+  // + 0x57 name data; byte-identical to Hancom's own bookmark). No DocInfo
+  // change. See cell-patch.js insertBookmarkInPlace.
+  const BOOKMARK_OPS = new Set(['insert_bookmark']);
+  // 글상자 (raw-patch — rect gso + inner text). See cell-patch.js insertTextboxInPlace.
+  const TEXTBOX_OPS = new Set(['insert_textbox']);
   // 각주/미주 (raw-patch — inline note-ref char + a nested note-content
   // cluster; resolves the doc's standard "Footnote"/"Endnote" style, no
   // DocInfo write). See cell-patch.js insertFootnoteInPlace/insertEndnoteInPlace.
@@ -2320,7 +2326,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2583,6 +2589,20 @@ async function readStdin() {
         const hlSummary = await insertHyperlinkInPlace(outPath, hyperlinkOps);
         subModes.push(`hyperlink:${hlSummary.mode || 'in-place'}`);
         for (const e of hlSummary) allEdits.push({ kind: 'hyperlink', ...e });
+      }
+      const bookmarkOps = ops.filter((o) => BOOKMARK_OPS.has(o.type));
+      if (bookmarkOps.length > 0) {
+        const { insertBookmarkInPlace } = await import('./cell-patch.js');
+        const bmSummary = await insertBookmarkInPlace(outPath, bookmarkOps);
+        subModes.push(`bookmark:${bmSummary.mode || 'in-place'}`);
+        for (const e of bmSummary) allEdits.push({ kind: 'bookmark', ...e });
+      }
+      const textboxOps = ops.filter((o) => TEXTBOX_OPS.has(o.type));
+      if (textboxOps.length > 0) {
+        const { insertTextboxInPlace } = await import('./cell-patch.js');
+        const tbSummary = await insertTextboxInPlace(outPath, textboxOps);
+        subModes.push(`textbox:${tbSummary.mode || 'in-place'}`);
+        for (const e of tbSummary) allEdits.push({ kind: 'textbox', ...e });
       }
       const footnoteOps = ops.filter((o) => FOOTNOTE_OPS.has(o.type));
       if (footnoteOps.length > 0) {

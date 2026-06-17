@@ -2784,6 +2784,132 @@ export async function insertFieldInPlace(filePath, ops) {
 }
 
 
+// ── 책갈피 (bookmark) raw-patch ────────────────────────────────────────────
+// GT-first (Hancom's 입력 › 책갈피): a bookmark is an invisible point-marker in
+// the same inline-control family as fields/gso. After the anchor text it adds
+// an 8-unit inline control (char 0x0016 + 'bokm' id + reserved + 0x0016), then
+// a 'bokm' CTRL_HEADER and a 0x57 FIELD_DATA record holding the mark name:
+//   PARA_TEXT:  … <anchor> [0x16 'bokm' 0×4u 0x16  (8 units)] …
+//   PARA_HEADER: char_count += 8; control_mask |= 0x400000 (char 0x16 present)
+//   + CTRL_HEADER 'bokm' (lvl1, 4-byte id) + FIELD_DATA 0x57 (lvl2: 10-byte
+//     GT prefix + nameLen + UTF-16 name)
+// Self-contained in Section0 — no DocInfo change. Renders nothing visible;
+// verify by reopening in Hancom (책갈피 목록) — there is no visual mark.
+const BOOKMARK_MARK_HEX = '16006d6b6f6200000000000000001600'; // 0x16 + 'bokm'(rev) + reserved + 0x16 (8 units)
+const BOOKMARK_CTRL_ID = Buffer.from('6d6b6f62', 'hex');      // 'bokm' stored reversed
+const BOOKMARK_DATA_PREFIX = Buffer.from('1b020100000000400100', 'hex'); // 10-byte GT-verbatim prefix
+
+function buildBookmarkCtrlRecord() {
+  return Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, BOOKMARK_CTRL_ID.length), BOOKMARK_CTRL_ID]);
+}
+function buildBookmarkDataRecord(name) {
+  const nameBuf = Buffer.from(name, 'utf16le');
+  const lenBuf = Buffer.alloc(2); lenBuf.writeUInt16LE(name.length, 0);
+  const body = Buffer.concat([BOOKMARK_DATA_PREFIX, lenBuf, nameBuf]);
+  return Buffer.concat([buildRecordHeader(TAG_FIELD_DATA, 2, body.length), body]);
+}
+
+// Insert a bookmark at `anchor`. Each op: { anchor: string, mark_name: string }
+export async function insertBookmarkInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('insert_bookmark: an "anchor" string is required');
+    const markName = (typeof op.mark_name === 'string' && op.mark_name) ? op.mark_name : '책갈피';
+    const records = parseRecords(raw);
+
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorByteOff = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const at = raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorByteOff = at + anchorBuf.length; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`insert_bookmark: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+
+    // 1) Insert the 8-unit inline bookmark marker right after the anchor text.
+    const mark = Buffer.from(BOOKMARK_MARK_HEX, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const newBody = Buffer.concat([oldBody.slice(0, anchorByteOff), mark, oldBody.slice(anchorByteOff)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) bokm control records appended at the end of the paragraph cluster.
+    const ctrlBlock = Buffer.concat([buildBookmarkCtrlRecord(), buildBookmarkDataRecord(markName)]);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER: char_count += 8, control_mask |= 0x400000 (char 0x16).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0, phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x400000) >>> 0, phOff + 4);
+
+    // Splice high→low so earlier offsets stay valid.
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), ctrlBlock, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor, mark_name: markName });
+  }
+
+  // Deflate + write back (identical to insertFieldInPlace).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, chain);
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart; newCompressed = ext.compressed;
+    if (ext.promoted) { chain = ext.newRegularChain; writeChainBytes(buf, chain, ssz, newCompressed); buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74); }
+    else { rootChain = ext.rootChain; chain = ext.miniChain; writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed); }
+  } else {
+    const ext = deflateAndFitWithExpansion(raw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain; newCompressed = ext.compressed; writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── 하이퍼링크 (hyperlink) raw-patch ───────────────────────────────────────
 //
 // GT-first (hyperlink_native.hwp, captured from Hancom's 입력 › 하이퍼링크):
@@ -4245,6 +4371,141 @@ export async function insertShapeInPlace(filePath, ops) {
     buf = ext.buf; fat = ext.fat; chain = ext.chain;
     newCompressed = ext.compressed;
     writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 글상자 (text box) raw-patch ───────────────────────────────────────────
+// GT-first (Hancom's 입력 › 글상자): a text box is a rect gso object carrying
+// inner text. Same anchor-attach as insert_shape (inline gso char 0x000b in
+// the anchor PARA_TEXT, char_count += 8, control_mask |= 0x800), but the gso
+// cluster is richer: CTRL_HEADER "gso " + SHAPE_COMPONENT "cer$" + LIST_HEADER
+// + an inner text paragraph (PARA_HEADER/PARA_TEXT/CHAR_SHAPE, level 3-4) +
+// the RECTANGLE record. Only the inner paragraph varies with the user's text;
+// the geometry records are GT-verbatim (so the default-text box is byte-
+// identical to Hancom's). Default size ~53×24mm, floating. Section0-only.
+const TB_PREFIX_HEX = '4704e003206f736700406a14b42d00002c4c0000983a00005e1a0000000000000000000000000000537a9b42000000000800acc001ac15d6200085c7c8b2e4b22e004c08c00f6365722463657224000000000000000000000100983a00005e1a0000983a00005e1a000000000b01000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000000000000021000000410000c00001000000ffffff0000000000ffffffff000000000000000000b2b2b2000000000000000000547a9b020000480c100201000000200000001b011b011b011b01ffffffff00000000000000000000000000';
+const TB_INNER_PARAHEADER_HEX = '420c80010a0000800000000000000000010000000000000000000000'; // char_count field rewritten per text
+const TB_INNER_CHARSHAPE_HEX = '441080000000000000000000';
+const TB_RECTANGLE_HEX = '4f0c1002000000000000000000983a000000000000983a00005e1a0000000000005e1a0000';
+
+// Build the text box's gso cluster for the given inner text.
+function buildTextboxCluster(text) {
+  const prefix = Buffer.from(TB_PREFIX_HEX, 'hex');
+  // inner PARA_HEADER with char_count = text chars + 1 (the trailing 0x000d),
+  // high bit preserved (HWP sets it on the last paragraph of a list).
+  const ph = Buffer.from(TB_INNER_PARAHEADER_HEX, 'hex');
+  ph.writeUInt32LE((0x80000000 | (text.length + 1)) >>> 0, 4); // data starts at offset 4
+  // inner PARA_TEXT = text (UTF-16) + 0x000d paragraph terminator.
+  const txt = Buffer.concat([Buffer.from(text, 'utf16le'), Buffer.from('0d00', 'hex')]);
+  const ptRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 4, txt.length), txt]);
+  return Buffer.concat([prefix, ph, ptRec, Buffer.from(TB_INNER_CHARSHAPE_HEX, 'hex'), Buffer.from(TB_RECTANGLE_HEX, 'hex')]);
+}
+
+// Insert a text box. Each op: { anchor?: string, text: string }
+export async function insertTextboxInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const text = (typeof op.text === 'string') ? op.text : '';
+    const records = parseRecords(raw);
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1 && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf) !== -1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) {
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) throw new Error('insert_textbox: no top-level body paragraph found to anchor the text box');
+
+    const paraHeaderRec = records[cluster.startIdx];
+
+    // 1) Inline gso char (0x000b "gso ") before the paragraph's EOP.
+    const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) text box gso cluster.
+    const cluster2 = buildTextboxCluster(text);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x800.
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), cluster2, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor ?? null, text });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, chain);
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart; newCompressed = ext.compressed;
+    if (ext.promoted) { chain = ext.newRegularChain; writeChainBytes(buf, chain, ssz, newCompressed); buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74); }
+    else { rootChain = ext.rootChain; chain = ext.miniChain; writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed); }
+  } else {
+    const ext = deflateAndFitWithExpansion(raw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain; newCompressed = ext.compressed; writeChainBytes(buf, chain, ssz, newCompressed);
   }
   buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
   buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
