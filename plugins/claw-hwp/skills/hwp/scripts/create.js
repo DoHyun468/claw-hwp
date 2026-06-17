@@ -216,6 +216,33 @@ const imagePatches = [];
 // already references the correct shape id.
 const headingPatches = [];
 
+// Tracks body paragraphs (append_paragraph) whose run carries char styling
+// (size / colour / bold / italic / underline). Same rhwp .hwpx-export quirk as
+// headings: rhwp creates the <hh:charPr> in header.xml but writes the run with
+// charPrIDRef="0", so create-time styling silently vanished. We re-link via a
+// richer key (height:bold:italic:underline:colour). Only paragraphs whose runs
+// share ONE uniform non-default style are tracked (the common "style this label"
+// case); mixed multi-style runs are left to apply_text_style (edit path).
+const bodyStylePatches = [];
+
+// Returns the uniform char style of `runs` ({height,bold,italic,underline,color})
+// when every text run shares the same non-default style, else null.
+function uniformRunStyle(runs) {
+  const styled = (runs || []).filter((r) => r && r.text);
+  if (!styled.length) return null;
+  const norm = (r) => ({
+    height: r.fontSize != null ? Math.round(Number(r.fontSize) * 100) : 1000,
+    bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
+    color: normalizeHexColor(r.color ?? r.textColor ?? "#000000"),
+  });
+  const first = norm(styled[0]);
+  const key = (s) => `${s.height}:${s.bold}:${s.italic}:${s.underline}:${s.color}`;
+  if (!styled.every((r) => key(norm(r)) === key(first))) return null; // mixed → skip
+  const isDefault = first.height === 1000 && !first.bold && !first.italic
+    && !first.underline && first.color.toUpperCase() === "#000000";
+  return isDefault ? null : first;
+}
+
 function startNewParagraph(doc, cursor) {
   // First write goes into the existing empty paragraph; later writes split a
   // new paragraph at the current cursor position.
@@ -625,6 +652,10 @@ const HANDLERS = {
       ? op.runs
       : parseInlineRuns(op.text ?? "");
     writeRunsAt(doc, cursor, runs);
+    // rhwp drops the run's charPrIDRef on .hwpx export — track uniform run
+    // styling so we can re-link it post-export (same fix as headings).
+    const bstyle = uniformRunStyle(runs);
+    if (bstyle) bodyStylePatches.push({ paraIdx: cursor.para, ...bstyle });
     applyParaProps(doc, cursor, {
       align: op.align,
       lineSpacing: op.line_spacing ?? BODY_LINE_SPACING,
@@ -2037,6 +2068,61 @@ async function patchHwpxHeadings(filePath, patches) {
   return fixed;
 }
 
+// Re-link body-paragraph runs to their styled <hh:charPr> (the rhwp .hwpx-export
+// quirk: charPr exists in header.xml but the run points at id 0). Matches on the
+// full style key (height + bold + italic + underline + textColor) so colour and
+// emphasis survive, then retargets every text-bearing run in the paragraph.
+async function patchHwpxBodyRunStyles(filePath, patches) {
+  if (!patches.length) return 0;
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const headerEntry = zip.file("Contents/header.xml");
+  const sectionEntry = zip.file("Contents/section0.xml");
+  if (!headerEntry || !sectionEntry) return 0;
+  const headerXml = await headerEntry.async("string");
+  const sectionXml = await sectionEntry.async("string");
+
+  // header charPr → composite-key lookup.
+  const charPrRe = /<hh:charPr\b[^>]*?(?:\/>|>(?:[^<]|<(?!\/hh:charPr>))*?<\/hh:charPr>)/g;
+  const lookup = new Map();
+  for (const m of headerXml.matchAll(charPrRe)) {
+    const s = m[0];
+    const id = (/\bid="(\d+)"/.exec(s) || [])[1];
+    const height = (/\bheight="(\d+)"/.exec(s) || [])[1];
+    if (!id || !height) continue;
+    const color = ((/\btextColor="([^"]*)"/.exec(s) || [])[1] || "#000000").toUpperCase();
+    const key = `${height}:${/<hh:bold\b/.test(s) ? 1 : 0}:${/<hh:italic\b/.test(s) ? 1 : 0}:${/<hh:underline\b/.test(s) ? 1 : 0}:${color}`;
+    if (!lookup.has(key)) lookup.set(key, id);
+  }
+
+  const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
+  const regions = [];
+  for (const m of sectionXml.matchAll(pRe)) regions.push({ start: m.index, end: m.index + m[0].length });
+  let xml = sectionXml;
+  let fixed = 0;
+  for (let i = patches.length - 1; i >= 0; i--) {
+    const p = patches[i];
+    if (p.paraIdx < 0 || p.paraIdx >= regions.length) continue;
+    const key = `${p.height}:${p.bold ? 1 : 0}:${p.italic ? 1 : 0}:${p.underline ? 1 : 0}:${p.color.toUpperCase()}`;
+    const targetId = lookup.get(key);
+    if (!targetId) continue;
+    const region = regions[p.paraIdx];
+    const body = xml.slice(region.start, region.end);
+    const runRe = /<hp:run\s+charPrIDRef="(\d+)"\s*>([\s\S]*?)<\/hp:run>/g;
+    const newBody = body.replace(runRe, (full, currentId, inner) => {
+      if (!/<hp:t\b/.test(inner) || currentId === targetId) return full;
+      fixed++;
+      return `<hp:run charPrIDRef="${targetId}">${inner}</hp:run>`;
+    });
+    if (newBody !== body) xml = xml.slice(0, region.start) + newBody + xml.slice(region.end);
+  }
+
+  if (fixed > 0) {
+    zip.file("Contents/section0.xml", xml);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return fixed;
+}
+
 // ── Layout-cache strip ────────────────────────────────────────────────────
 //
 // rhwp's HWP/HWPX serializer pre-fills PARA_LINESEG (binary) /
@@ -2675,6 +2761,17 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: fixed ${n} heading charPrIDRef`);
     } catch (err) {
       log.push(`hwpx_heading_patch failed: ${err.message}`);
+    }
+  }
+
+  // Same re-link fix for body-paragraph run styling (size/colour/bold/etc.),
+  // which rhwp likewise drops to charPrIDRef="0" on .hwpx export.
+  if (ext === ".hwpx" && bodyStylePatches.length > 0) {
+    try {
+      const n = await patchHwpxBodyRunStyles(outPath, bodyStylePatches);
+      if (n > 0) log.push(`hwpx_patch: fixed ${n} body run charPrIDRef`);
+    } catch (err) {
+      log.push(`hwpx_bodystyle_patch failed: ${err.message}`);
     }
   }
 
