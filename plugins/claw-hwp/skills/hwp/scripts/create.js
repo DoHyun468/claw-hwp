@@ -2660,6 +2660,41 @@ async function patchHwpxParaSpacing(filePath) {
   return n;
 }
 
+// Table vertical breathing via the table's OWN outMargin (top/bottom), not
+// paragraph spacing. GT (2026-06-17): Hancom web does NOT render the paragraph
+// spacing adjacent to a table — a heading placed right after a table loses its
+// spacingBefore entirely (heading ends up touching the table border), and the
+// table wrapper's own spacingAfter is swallowed too. Only the table object's
+// <hp:outMargin top/bottom> is always rendered. rhwp emits top=bottom=283
+// (~1mm) → tables feel cramped/asymmetric. Bumping to a body-rhythm value makes
+// the gap above AND below a table consistent regardless of what follows (body
+// or heading). Symmetric top=bottom keeps it neighbour-independent.
+const TABLE_OUTMARGIN_TB = 1000; // HWPUNIT ≈ 3.5mm above & below each table
+async function patchHwpxTableOutMargin(filePath, topBottom = TABLE_OUTMARGIN_TB) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  let total = 0;
+  for (const name of Object.keys(zip.files)) {
+    if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
+    let xml = await zip.file(name).async("string");
+    // Each table's outMargin lives in the table header (before its first row);
+    // match <hp:tbl …> up to the first <hp:tr and rewrite top/bottom there so
+    // nested in-cell tables (after the first row) keep their own margins.
+    xml = xml.replace(/<hp:tbl\b[\s\S]*?<hp:tr\b/g, (seg) =>
+      seg.replace(/<hp:outMargin\b[^>]*\/>/, (m) => {
+        const left = (m.match(/left="(\d+)"/) || [])[1] ?? "283";
+        const right = (m.match(/right="(\d+)"/) || [])[1] ?? "283";
+        total++;
+        return `<hp:outMargin left="${left}" right="${right}" top="${topBottom}" bottom="${topBottom}"/>`;
+      }),
+    );
+    if (total) zip.file(name, xml);
+  }
+  if (total > 0) {
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return total;
+}
+
 // Remap the default char shape (charPr id=0) to the theme body font. rhwp
 // resets a fair number of run charPrIDRefs to "0" on .hwpx export — notably
 // in-table-cell runs (applyCharFormatInCell creates a styled charPr in
@@ -3392,6 +3427,18 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: ${n} paraPr → hp:switch spacing`);
     } catch (err) {
       log.push(`hwpx_paraspacing_patch failed: ${err.message}`);
+    }
+  }
+
+  // Tables breathe via their own outMargin (Hancom eats table-adjacent paragraph
+  // spacing — see patchHwpxTableOutMargin). Symmetric top/bottom so a table has
+  // a consistent gap above and below whether followed by body or a heading.
+  if (ext === ".hwpx") {
+    try {
+      const n = await patchHwpxTableOutMargin(outPath);
+      if (n > 0) log.push(`hwpx_patch: ${n} table outMargin top/bottom → ${TABLE_OUTMARGIN_TB}`);
+    } catch (err) {
+      log.push(`hwpx_tableoutmargin_patch failed: ${err.message}`);
     }
   }
 
