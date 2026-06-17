@@ -5560,6 +5560,20 @@ function buildCharShapeBody(base, style) {
     buf.writeUInt32LE(parseColorBGR(hex) >>> 0, 60);
   }
 
+  // 장평 (char width ratio %, 7× u8 at 14-20; default 100) and 자간 (letter
+  // spacing %, 7× i8 at 21-27; default 0). Offsets are GT-confirmed against
+  // Hancom's char-shape --width/--spacing output. Broadcast to all 7 slots.
+  const charRatio = style.char_ratio ?? style.charRatio;
+  if (charRatio != null) {
+    const v = Math.max(1, Math.min(255, Math.round(charRatio)));
+    for (let i = 0; i < 7; i++) buf.writeUInt8(v, 14 + i);
+  }
+  const letterSpacing = style.letter_spacing ?? style.letterSpacing;
+  if (letterSpacing != null) {
+    const v = Math.max(-128, Math.min(127, Math.round(letterSpacing)));
+    for (let i = 0; i < 7; i++) buf.writeInt8(v, 21 + i);
+  }
+
   return buf;
 }
 
