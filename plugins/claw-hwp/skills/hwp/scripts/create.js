@@ -2076,13 +2076,8 @@ async function patchHwpxPictures(filePath, patches) {
   const emptyRunRe =
     /<hp:run\s+charPrIDRef="(\d+)"\s*>\s*(?:<hp:t\s*\/>|<hp:t\s*>\s*<\/hp:t>)\s*<\/hp:run>/;
 
-  // Index every <hp:p>...</hp:p> region.
-  const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
-  const regions = [];
-  let m;
-  while ((m = pRe.exec(xml)) !== null) {
-    regions.push({ start: m.index, end: m.index + m[0].length });
-  }
+  // Index every TOP-LEVEL <hp:p> region (table-cell paras excluded — see helper).
+  const regions = topLevelParaRegions(xml);
 
   // Apply patches in reverse so earlier offsets stay valid as we splice.
   const applied = [];
@@ -2274,6 +2269,31 @@ async function patchHwpxStubFingerprint(filePath) {
   return { patched: true, paraPrInjected: injected, bulletId, numberId };
 }
 
+// Section regions for TOP-LEVEL <hp:p> only — depth-tracked so table-cell
+// <hp:p> (nested inside <hp:tbl>) are NOT counted, and a table's wrapper
+// paragraph closes at its REAL </hp:p> (not the first cell's). This matches
+// doc.paragraphs() (a table = one wrapper para), so post-export paraIdx ↔ region
+// indices stay aligned even when the doc has tables. Without this, the re-link
+// patches mis-target cells (e.g. a table header cell "2025년" getting a
+// heading's 14pt-bold charPr). The old `<hp:p>…?</hp:p>` regex broke on both
+// counts (it included cell paras AND truncated the wrapper at the first cell).
+function topLevelParaRegions(xml) {
+  const re = /<hp:p\b[^>]*?(\/?)>|<\/hp:p>/g;
+  const out = [];
+  let m, depth = 0, start = -1;
+  while ((m = re.exec(xml)) !== null) {
+    if (m[0] === "</hp:p>") {
+      if (depth > 0 && --depth === 0 && start >= 0) { out.push({ start, end: re.lastIndex }); start = -1; }
+    } else if (m[1] === "/") {
+      if (depth === 0) out.push({ start: m.index, end: re.lastIndex }); // self-closing top-level <hp:p/>
+    } else {
+      if (depth === 0) start = m.index;
+      depth++;
+    }
+  }
+  return out;
+}
+
 async function patchHwpxHeadings(filePath, patches) {
   if (patches.length === 0) return 0;
   const buf = fs.readFileSync(filePath);
@@ -2302,11 +2322,7 @@ async function patchHwpxHeadings(filePath, patches) {
 
   // Find every <hp:p>...</hp:p> region and rewrite the text-bearing run's
   // charPrIDRef in each tracked heading paragraph.
-  const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
-  const regions = [];
-  for (const m of sectionXml.matchAll(pRe)) {
-    regions.push({ start: m.index, end: m.index + m[0].length });
-  }
+  const regions = topLevelParaRegions(sectionXml);
   let xml = sectionXml;
   let fixed = 0;
   // Apply in reverse so offsets stay valid.
@@ -2392,9 +2408,7 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
   const headerSynth = [];
   let nextCharId = maxCharId + 1;
 
-  const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
-  const regions = [];
-  for (const m of sectionXml.matchAll(pRe)) regions.push({ start: m.index, end: m.index + m[0].length });
+  const regions = topLevelParaRegions(sectionXml);
   let xml = sectionXml;
   let fixed = 0;
   for (let i = patches.length - 1; i >= 0; i--) {
@@ -2510,9 +2524,7 @@ async function patchHwpxMixedRuns(filePath, patches) {
     return null;
   };
 
-  const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
-  const regions = [];
-  for (const m of sectionXml.matchAll(pRe)) regions.push({ start: m.index, end: m.index + m[0].length });
+  const regions = topLevelParaRegions(sectionXml);
   let xml = sectionXml;
   let fixed = 0;
   for (let i = patches.length - 1; i >= 0; i--) {
