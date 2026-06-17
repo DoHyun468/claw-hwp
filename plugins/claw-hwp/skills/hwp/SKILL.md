@@ -118,6 +118,8 @@ Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Alwa
 
 Omitting `theme` = `government` (unchanged default). A theme sets only heading colours + body/heading fonts; font sizes and spacing stay the same. Per-op `color` / `font_family` and per-run styling always win over the theme.
 
+**Extra themes from `themes/*.md`** — beyond the 5 built-ins, 10 more (converted from Anthropic's theme-factory, re-fonted to the Hancom A-set) load by name from the `themes/` folder: `ocean-depths`, `sunset-boulevard`, `forest-canopy`, `modern-minimalist`, `golden-hour`, `arctic-frost`, `desert-rose`, `tech-innovation`, `botanical-garden`, `midnight-galaxy`. Pass any of these as `theme`. To add your own, drop a `themes/<name>.md` with frontmatter `name / label / bodyFont / headingFont / headingColor / accent` (fonts must be from the A-set to render on Hancom web).
+
 Fine-tune without defining a whole theme via the top-level `theme_overrides` object — `{ "bodyFont": "...", "headingFont": "...", "accent": "#RRGGBB", "headingColors": { "1": "#RRGGBB", "2": "#RRGGBB", ... } }`. Use it when the user gives specific colour/font feedback (e.g. "제목을 진한 파랑으로", "본문은 굴림으로"); set just the fields you want to change.
 
 All five themes use only render-confirmed fonts (see the **`font_family`** note below for which fonts render where). Theme colours/fonts take effect when **building a new document** (payload starts with `setup_document`); for in-place edits of an existing form, append ops stay plain text (same as the heading-styling limitation noted below).

@@ -684,6 +684,33 @@ const THEMES = {
 // resolveTheme() (or a payload that omits `theme`) behaves exactly as before.
 let activeTheme = THEMES.government;
 
+// Load a converted theme from themes/<name>.md (the borrowed Anthropic
+// theme-factory set, re-fonted to the Hancom A-set). frontmatter → activeTheme
+// shape; the single headingColor fills all six heading levels. Returns null if
+// the file is missing/malformed so resolveTheme can fall back cleanly.
+const THEMES_DIR = path.join(__dirname, "..", "themes");
+function loadThemeFile(name) {
+  if (!/^[a-z0-9-]+$/i.test(String(name || ""))) return null;
+  const p = path.join(THEMES_DIR, `${name}.md`);
+  if (!fs.existsSync(p)) return null;
+  const m = /^---\s*\n([\s\S]*?)\n---/.exec(fs.readFileSync(p, "utf8"));
+  if (!m) return null;
+  const fm = {};
+  for (const line of m[1].split("\n")) {
+    const mm = /^([A-Za-z]+):\s*"?(.*?)"?\s*$/.exec(line);
+    if (mm) fm[mm[1]] = mm[2];
+  }
+  if (!fm.name) return null;
+  const hc = normalizeHexColor(fm.headingColor || "#1A1A1A");
+  return {
+    label: fm.label || name,
+    bodyFont: fm.bodyFont || null,
+    headingFont: fm.headingFont || null,
+    headingColors: { 1: hc, 2: hc, 3: hc, 4: hc, 5: hc, 6: hc },
+    accent: fm.accent ? normalizeHexColor(fm.accent) : "#1F3864",
+  };
+}
+
 // Resolve the active theme from the payload. Unknown `theme` names fall back to
 // government with a logged note (a typo must never abort a document). The
 // optional `theme_overrides` object deep-patches the chosen theme — bodyFont /
@@ -695,7 +722,11 @@ function resolveTheme(payload, log) {
   let base = THEMES.government;
   if (name != null) {
     if (THEMES[name]) base = THEMES[name];
-    else if (log) log.push(`theme '${name}' unknown — using 'government'. Valid: ${Object.keys(THEMES).join(", ")}`);
+    else {
+      const loaded = loadThemeFile(name);
+      if (loaded) base = loaded;
+      else if (log) log.push(`theme '${name}' unknown — using 'government'. Valid: ${Object.keys(THEMES).join(", ")} + themes/*.md`);
+    }
   }
   const theme = { ...base, headingColors: { ...base.headingColors } };
   const ov = payload.theme_overrides;
