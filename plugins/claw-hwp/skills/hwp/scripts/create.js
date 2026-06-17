@@ -225,66 +225,92 @@ const headingPatches = [];
 // case); mixed multi-style runs are left to apply_text_style (edit path).
 const bodyStylePatches = [];
 
-// Returns the uniform char style of `runs` ({height,bold,italic,underline,color})
-// when every text run shares the same non-default style, else null.
+// ── Char-style normalization (shared by uniform re-link + mixed-run re-split) ──
 //
-// FONT awareness: the uniformity check includes each run's font_family, so a
-// paragraph mixing fonts (e.g. a "맑은 고딕" label + a different-font sample on
-// one line) is NOT considered uniform and returns null — otherwise the
-// post-export re-link (patchHwpxBodyRunStyles) would flatten every run in the
-// paragraph onto ONE charPr and clobber the per-run fonts. rhwp preserves
-// distinct per-run fonts on its own, so leaving mixed-font paragraphs untracked
-// is exactly right. (The font is only part of the *uniformity* test; it is not
-// added to the re-link key, which matches on height:bold:italic:underline:color
-// — for a genuinely uniform paragraph all runs share the font anyway.)
+// Both post-export fixes match a run against a header <hh:charPr> by a composite
+// style key. The key MUST cover every managed char attribute rhwp can emit, or a
+// run carrying an un-keyed attribute (highlight / strikeout / letter-spacing /
+// char-ratio) gets matched to a charPr that lacks it and the attribute is lost
+// (the v1.5.33 mixed-run regression). normRunStyle (our run input) and
+// charPrStyleFromXml (a header charPr) produce the SAME normalized shape so
+// styleBaseKey compares them apples-to-apples. `font` is kept OUT of the base key
+// and matched via the dual lookup in the patches (a run with no explicit font
+// must still match a charPr that carries the document default face).
+function normRunStyle(r) {
+  const pt = r.fontSize ?? r.size ?? r.size_pt;
+  const hl = r.highlight;
+  let shade = "NONE";
+  if (hl === true) shade = "#FFFF00";
+  else if (typeof hl === "string" && hl.toLowerCase() !== "none") shade = normalizeHexColor(hl).toUpperCase();
+  return {
+    height: pt != null ? Math.round(Number(pt) * 100) : 1000,
+    bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
+    strike: !!(r.strikethrough ?? r.strike),
+    color: normalizeHexColor(r.color ?? r.textColor ?? "#000000").toUpperCase(),
+    shade,
+    spacing: Number(r.letter_spacing ?? r.letterSpacing ?? 0),
+    ratio: Number(r.char_ratio ?? r.charRatio ?? 100),
+    font: r.font_family ?? r.fontFamily ?? "",
+  };
+}
+
+function styleBaseKey(s) {
+  return `${s.height}:${s.bold ? 1 : 0}:${s.italic ? 1 : 0}:${s.underline ? 1 : 0}:${s.strike ? 1 : 0}:${s.color}:${s.shade}:${s.spacing}:${s.ratio}`;
+}
+
+// Parse a header <hh:charPr> XML string into the same normalized shape as
+// normRunStyle. `faceById` maps a fontRef id → face NAME (HANGUL block).
+function charPrStyleFromXml(s, faceById) {
+  const g = (re, d) => { const m = re.exec(s); return m ? m[1] : d; };
+  let shade = (g(/\bshadeColor="([^"]*)"/, "NONE") || "NONE").toUpperCase();
+  if (shade === "NONE" || shade === "#FFFFFF") shade = "NONE";
+  const st = /<hh:strikeout\b[^>]*type="([^"]*)"/.exec(s);
+  return {
+    height: g(/\bheight="(\d+)"/, "1000"),
+    bold: /<hh:bold\b/.test(s), italic: /<hh:italic\b/.test(s),
+    underline: /<hh:underline\b[^>]*type="(?!NONE)/.test(s),
+    strike: !!(st && st[1] !== "NONE"),
+    color: g(/\btextColor="([^"]*)"/, "#000000").toUpperCase(),
+    shade,
+    spacing: Number(g(/<hh:spacing\b[^>]*hangul="(-?\d+)"/, "0")),
+    ratio: Number(g(/<hh:ratio\b[^>]*hangul="(\d+)"/, "100")),
+    font: faceById.get(g(/<hh:fontRef\s+hangul="(\d+)"/, "")) || "",
+  };
+}
+
+// Returns the uniform char style of `runs` when every text run shares the same
+// non-default style, else null. The uniformity test includes font (so a
+// mixed-font line returns null → handled by mixedRunSegments instead).
 function uniformRunStyle(runs) {
   const styled = (runs || []).filter((r) => r && r.text);
   if (!styled.length) return null;
-  const norm = (r) => {
-    const pt = r.fontSize ?? r.size ?? r.size_pt;
-    return {
-      height: pt != null ? Math.round(Number(pt) * 100) : 1000,
-      bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
-      color: normalizeHexColor(r.color ?? r.textColor ?? "#000000"),
-      font: r.font_family ?? r.fontFamily ?? "",
-    };
-  };
-  const first = norm(styled[0]);
-  const key = (s) => `${s.height}:${s.bold}:${s.italic}:${s.underline}:${s.color}:${s.font}`;
-  if (!styled.every((r) => key(norm(r)) === key(first))) return null; // mixed → skip
+  const first = normRunStyle(styled[0]);
+  const fullKey = (s) => `${styleBaseKey(s)}:${s.font}`;
+  if (!styled.every((r) => fullKey(normRunStyle(r)) === fullKey(first))) return null; // mixed → skip
+  // Default = nothing to re-link. font is excluded here on purpose: a font-only
+  // uniform paragraph is left to rhwp + the charPr-0 remap, not the re-link.
   const isDefault = first.height === 1000 && !first.bold && !first.italic
-    && !first.underline && first.color.toUpperCase() === "#000000";
+    && !first.underline && !first.strike && first.color === "#000000"
+    && first.shade === "NONE" && first.spacing === 0 && first.ratio === 100;
   return isDefault ? null : first;
 }
 
 // Paragraphs whose runs carry MIXED char styling (e.g. "일반 **굵게** 일반", or
-// explicit runs with different bold/colour/font). rhwp's .hwpx serializer
-// COALESCES every run in a paragraph into ONE run (dropping mid-paragraph char
-// shapes), so inline bold/colour/font set at create time silently vanish — even
-// though rhwp DOES create the per-run <hh:charPr> in header.xml. We re-split the
-// coalesced run back into per-run <hp:run>s post-export (patchHwpxMixedRuns).
+// explicit runs with different bold/colour/font/highlight). rhwp's .hwpx
+// serializer COALESCES every run in a paragraph into ONE run (dropping
+// mid-paragraph char shapes), so inline styling set at create time silently
+// vanishes — even though rhwp DOES create the per-run <hh:charPr> in header.xml.
+// We re-split the coalesced run back into per-run <hp:run>s post-export.
 const mixedRunPatches = [];
 
-// Returns ordered per-run style segments {text,height,bold,italic,underline,
-// color,font} for a paragraph that needs re-splitting, else null. Null when:
-// fewer than 2 text runs (rhwp keeps a single run fine), or all runs share one
-// style (uniformRunStyle / native handling covers that). So this fires exactly
-// for the "multiple distinct styles in one paragraph" case uniformRunStyle skips.
+// Ordered per-run style segments {text, ...normRunStyle} for a paragraph that
+// needs re-splitting, else null (fewer than 2 text runs, or all runs uniform).
 function mixedRunSegments(runs) {
   const styled = (runs || []).filter((r) => r && r.text);
   if (styled.length < 2) return null;
-  const seg = styled.map((r) => {
-    const pt = r.fontSize ?? r.size ?? r.size_pt;
-    return {
-      text: String(r.text),
-      height: pt != null ? Math.round(Number(pt) * 100) : 1000,
-      bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
-      color: normalizeHexColor(r.color ?? r.textColor ?? "#000000"),
-      font: r.font_family ?? r.fontFamily ?? "",
-    };
-  });
-  const keyOf = (s) => `${s.height}:${s.bold}:${s.italic}:${s.underline}:${s.color}:${s.font}`;
-  if (new Set(seg.map(keyOf)).size < 2) return null; // uniform → not our job
+  const seg = styled.map((r) => ({ text: String(r.text), ...normRunStyle(r) }));
+  const fullKey = (s) => `${styleBaseKey(s)}:${s.font}`;
+  if (new Set(seg.map(fullKey)).size < 2) return null; // uniform → not our job
   return seg;
 }
 
@@ -2299,23 +2325,21 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
     faceById.set(fm[1], fm[2]);
   }
 
-  // header charPr → composite-key lookup. Two maps: `lookupFull` keys on font
-  // too (for patches that carry an explicit font), `lookup` ignores it (the
-  // fallback for font-less styled paragraphs — original behaviour).
+  // header charPr → composite style-key lookup. `lookupFull` keys on font too
+  // (for patches with an explicit font); `lookup` ignores font (fallback for
+  // font-less styled paragraphs). The key now covers every managed attribute
+  // (incl. highlight/strike/spacing/ratio) via the shared normalizers.
   const charPrRe = /<hh:charPr\b[^>]*?(?:\/>|>(?:[^<]|<(?!\/hh:charPr>))*?<\/hh:charPr>)/g;
   const lookup = new Map();
   const lookupFull = new Map();
   for (const m of headerXml.matchAll(charPrRe)) {
     const s = m[0];
     const id = (/\bid="(\d+)"/.exec(s) || [])[1];
-    const height = (/\bheight="(\d+)"/.exec(s) || [])[1];
-    if (!id || !height) continue;
-    const color = ((/\btextColor="([^"]*)"/.exec(s) || [])[1] || "#000000").toUpperCase();
-    const base = `${height}:${/<hh:bold\b/.test(s) ? 1 : 0}:${/<hh:italic\b/.test(s) ? 1 : 0}:${/<hh:underline\b/.test(s) ? 1 : 0}:${color}`;
+    if (!id) continue;
+    const st = charPrStyleFromXml(s, faceById);
+    const base = styleBaseKey(st);
     if (!lookup.has(base)) lookup.set(base, id);
-    const faceId = (/<hh:fontRef\s+hangul="(\d+)"/.exec(s) || [])[1];
-    const face = faceById.get(faceId) || "";
-    if (!lookupFull.has(`${base}:${face}`)) lookupFull.set(`${base}:${face}`, id);
+    if (!lookupFull.has(`${base}:${st.font}`)) lookupFull.set(`${base}:${st.font}`, id);
   }
 
   const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
@@ -2326,9 +2350,9 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
   for (let i = patches.length - 1; i >= 0; i--) {
     const p = patches[i];
     if (p.paraIdx < 0 || p.paraIdx >= regions.length) continue;
-    const base = `${p.height}:${p.bold ? 1 : 0}:${p.italic ? 1 : 0}:${p.underline ? 1 : 0}:${p.color.toUpperCase()}`;
+    const base = styleBaseKey(p);
     // Explicit font → match the charPr with that font; otherwise fall back to
-    // the font-agnostic match (original behaviour for font-less styled paras).
+    // the font-agnostic match (font-less styled paragraphs).
     const targetId = (p.font && lookupFull.get(`${base}:${p.font}`)) || lookup.get(base);
     if (!targetId) continue;
     const region = regions[p.paraIdx];
@@ -2377,21 +2401,28 @@ async function patchHwpxMixedRuns(filePath, patches) {
   for (const m of headerXml.matchAll(charPrRe)) {
     const s = m[0];
     const id = (/\bid="(\d+)"/.exec(s) || [])[1];
-    const height = (/\bheight="(\d+)"/.exec(s) || [])[1];
-    if (!id || !height) continue;
-    const color = ((/\btextColor="([^"]*)"/.exec(s) || [])[1] || "#000000").toUpperCase();
-    const base = `${height}:${/<hh:bold\b/.test(s) ? 1 : 0}:${/<hh:italic\b/.test(s) ? 1 : 0}:${/<hh:underline\b/.test(s) ? 1 : 0}:${color}`;
+    if (!id) continue;
+    const st = charPrStyleFromXml(s, faceById);
+    const base = styleBaseKey(st);
     if (!lookup.has(base)) lookup.set(base, id);
-    const faceId = (/<hh:fontRef\s+hangul="(\d+)"/.exec(s) || [])[1];
-    const face = faceById.get(faceId) || "";
-    if (!lookupFull.has(`${base}:${face}`)) lookupFull.set(`${base}:${face}`, id);
+    if (!lookupFull.has(`${base}:${st.font}`)) lookupFull.set(`${base}:${st.font}`, id);
   }
 
   const escXml = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const unescXml = (t) => t.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
   const segCharPr = (sg) => {
-    const base = `${sg.height}:${sg.bold ? 1 : 0}:${sg.italic ? 1 : 0}:${sg.underline ? 1 : 0}:${sg.color.toUpperCase()}`;
-    return (sg.font && lookupFull.get(`${base}:${sg.font}`)) || lookup.get(base) || null;
+    const base = styleBaseKey(sg);
+    if (sg.font && lookupFull.has(`${base}:${sg.font}`)) return lookupFull.get(`${base}:${sg.font}`);
+    if (lookup.has(base)) return lookup.get(base);
+    // Fallback: rhwp sometimes fails to emit a charPr for a rarely-used attr
+    // (e.g. strikethrough on the create path). Rather than abandon the WHOLE
+    // paragraph's re-split (which would lose bold/colour/highlight on every
+    // OTHER run too), drop the unmatched extras and match on the core
+    // size+weight+colour so the run keeps what IS available — only the
+    // un-emitted attribute is lost.
+    const core = styleBaseKey({ ...sg, strike: false, shade: "NONE", spacing: 0, ratio: 100 });
+    if (lookup.has(core)) return lookup.get(core);
+    return null;
   };
 
   const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
