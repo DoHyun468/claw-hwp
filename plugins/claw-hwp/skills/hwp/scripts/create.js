@@ -2660,26 +2660,41 @@ async function patchHwpxParaSpacing(filePath) {
   return n;
 }
 
-// Table vertical breathing via the table's OWN outMargin (top/bottom), not
-// paragraph spacing. GT (2026-06-17): Hancom web does NOT render the paragraph
-// spacing adjacent to a table — a heading placed right after a table loses its
-// spacingBefore entirely (heading ends up touching the table border), and the
-// table wrapper's own spacingAfter is swallowed too. Only the table object's
-// <hp:outMargin top/bottom> is always rendered. rhwp emits top=bottom=283
-// (~1mm) → tables feel cramped/asymmetric. Bumping to a body-rhythm value makes
-// the gap above AND below a table consistent regardless of what follows (body
-// or heading). Symmetric top=bottom keeps it neighbour-independent.
+// Table vertical breathing via the table's OWN outMargin (top/bottom), NOT
+// paragraph spacing. GT (2026-06-17, native-table round-trip + render matrix):
+//   1. Hancom web does NOT render the paragraph spacing of the element AFTER a
+//      table — a heading right below a table loses its spacingBefore entirely
+//      (it touches the table border); the table wrapper's own spacingAfter is
+//      swallowed too. Only the table object's <hp:outMargin bottom> shows below.
+//   2. ABOVE a table, the PRECEDING body paragraph's spacingAfter DOES render
+//      and ADDS to outMargin.top — so a body→table gap came out roughly double
+//      a table→heading gap (user: "표 아래가 훨씬 작은데 위보다?"). A heading
+//      before a table, by contrast, has its spacingAfter swallowed, so a
+//      heading→table gap came out too tight.
+// Fix for a uniform, symmetric gap regardless of neighbour type:
+//   • set every top-level table's outMargin top = bottom = TABLE_OUTMARGIN_TB;
+//   • neutralise the preceding top-level paragraph's spacingAfter (clone its
+//     paraPr with next=0 and repoint just that paragraph) so the above-gap is
+//     outMargin.top alone — matching the below-gap (outMargin.bottom).
+// Net: every table sits with the same ~3.5mm above and below, whether wrapped
+// by body text or section headings.
 const TABLE_OUTMARGIN_TB = 1000; // HWPUNIT ≈ 3.5mm above & below each table
 async function patchHwpxTableOutMargin(filePath, topBottom = TABLE_OUTMARGIN_TB) {
   const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const headerEntry = zip.file("Contents/header.xml");
+  let header = headerEntry ? await headerEntry.async("string") : null;
+  let nextPprId = header
+    ? Math.max(0, ...[...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map((m) => Number(m[1])))
+    : 0;
   let total = 0;
+  let headerChanged = false;
   for (const name of Object.keys(zip.files)) {
     if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
     let xml = await zip.file(name).async("string");
-    // Each table's outMargin lives in the table header (before its first row);
-    // match <hp:tbl …> up to the first <hp:tr and rewrite top/bottom there so
-    // nested in-cell tables (after the first row) keep their own margins.
-    xml = xml.replace(/<hp:tbl\b[\s\S]*?<hp:tr\b/g, (seg) =>
+    let changed = false;
+
+    // 1. outMargin top = bottom on each top-level table (left/right preserved).
+    const xml2 = xml.replace(/<hp:tbl\b[\s\S]*?<hp:tr\b/g, (seg) =>
       seg.replace(/<hp:outMargin\b[^>]*\/>/, (m) => {
         const left = (m.match(/left="(\d+)"/) || [])[1] ?? "283";
         const right = (m.match(/right="(\d+)"/) || [])[1] ?? "283";
@@ -2687,9 +2702,45 @@ async function patchHwpxTableOutMargin(filePath, topBottom = TABLE_OUTMARGIN_TB)
         return `<hp:outMargin left="${left}" right="${right}" top="${topBottom}" bottom="${topBottom}"/>`;
       }),
     );
-    if (total) zip.file(name, xml);
+    if (xml2 !== xml) { xml = xml2; changed = true; }
+
+    // 2. zero spacingAfter of the top-level paragraph immediately before each
+    //    table (clone its paraPr so other paragraphs sharing the id keep theirs).
+    if (header) {
+      const regions = topLevelParaRegions(xml);
+      const edits = [];
+      for (let i = 1; i < regions.length; i++) {
+        const seg = xml.slice(regions[i].start, regions[i].end);
+        if (!/<hp:tbl\b/.test(seg)) continue;             // region i is a table
+        const prevSeg = xml.slice(regions[i - 1].start, regions[i - 1].end);
+        if (/<hp:tbl\b/.test(prevSeg)) continue;          // prev is also a table
+        const ref = (prevSeg.match(/paraPrIDRef="(\d+)"/) || [])[1];
+        if (!ref) continue;
+        const src = header.match(new RegExp(`<hh:paraPr id="${ref}"[\\s\\S]*?</hh:paraPr>`));
+        if (!src) continue;
+        nextPprId += 1;
+        const cloneId = String(nextPprId);
+        const clone = src[0]
+          .replace(/^<hh:paraPr id="\d+"/, `<hh:paraPr id="${cloneId}"`)
+          .replace(/(<h[hc]:next\b[^>]*\bvalue=")(-?\d+)(")/g, "$10$3");
+        header = header.replace("</hh:paraProperties>", clone + "</hh:paraProperties>");
+        header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + 1) + b);
+        headerChanged = true;
+        edits.push({ region: regions[i - 1], cloneId });
+      }
+      // apply paraPrIDRef repoints right-to-left so earlier offsets stay valid
+      edits.sort((a, b) => b.region.start - a.region.start);
+      for (const e of edits) {
+        const seg = xml.slice(e.region.start, e.region.end).replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${e.cloneId}"`);
+        xml = xml.slice(0, e.region.start) + seg + xml.slice(e.region.end);
+        changed = true;
+      }
+    }
+
+    if (changed) zip.file(name, xml);
   }
-  if (total > 0) {
+  if (headerChanged && headerEntry) zip.file("Contents/header.xml", header);
+  if (total > 0 || headerChanged) {
     fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
   }
   return total;
