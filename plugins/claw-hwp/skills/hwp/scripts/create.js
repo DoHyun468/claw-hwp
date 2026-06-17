@@ -594,9 +594,15 @@ const HEADING_DEFAULTS = {
   6: { fontSize: 10,   color: "#595959", spacingBefore: 800,  spacingAfter: 450 },
 };
 
-// Body line spacing 130% (rhwp default 160% is too airy). Heading 115% tighter.
-const BODY_LINE_SPACING = 130;
-const HEADING_LINE_SPACING = 115;
+// Body line spacing. 130% read as 빽빽 (cramped) on Hancom once the version.xml
+// xmlVersion 1.2→1.5 fix stopped paraPr margins from being halved; 150% gives a
+// report comfortable line rhythm without the 160% rhwp-default airiness.
+const BODY_LINE_SPACING = 150;
+const HEADING_LINE_SPACING = 120;
+// List items: a touch tighter than body line spacing, clearly separated from
+// each other (LIST_SPACING_AFTER ≈ 2.5mm) but grouped as a list.
+const LIST_LINE_SPACING = 140;
+const LIST_SPACING_AFTER = 700;
 // Body paragraph trailing gap. 600 HWPUNIT (~2.1mm) read as "packed" on Hancom web
 // (the title↔section gap at 1300 looked right), so use ~1000 (~3.5mm) for a clear
 // but not airy para↔para rhythm.
@@ -1227,6 +1233,22 @@ const HANDLERS = {
     // auto-created trailing paragraph instead of splitParagraph-ing again.
     // Without this, every table emits a phantom blank line before the next
     // heading/paragraph (createTable trailing para + new split = 2 paras).
+    // Table vertical rhythm: rhwp leaves the table's wrapper paragraph at 0/0
+    // margins, so without this the gap BELOW a table is whatever the next
+    // element's spacingBefore happens to be (0 before body → table sticks;
+    // ~6mm before a heading) and the gap ABOVE is the previous element's
+    // spacingAfter — i.e. table spacing is neighbour-dependent and asymmetric
+    // (user: "표 위아래 간격이 다르고 표 아래 문단이 딱 붙어있다"). Give the
+    // wrapper the same spacingAfter as a body paragraph so table→next matches
+    // body→next exactly (the "uniform paragraph break" rhythm the body path
+    // documents); spacingBefore stays 0 so above-table = prev block's after.
+    applyParaProps(doc, { sec: cursor.sec, para: tableParaIdx, charOffset: 0 }, {
+      align: "left",
+      lineSpacing: BODY_LINE_SPACING,
+      spacingBefore: 0,
+      spacingAfter: BODY_SPACING_AFTER,
+    });
+
     const newParaCount = doc.getParagraphCount(cursor.sec);
     cursor.para = newParaCount - 1;
     cursor.charOffset = 0;
@@ -1291,12 +1313,13 @@ const HANDLERS = {
       const liFontIds = themeFontIds(doc, "body");
       if (liFontIds) liDefaults.fontIds = liFontIds;
       writeRunsAt(doc, cursor, runs, liDefaults);
-      // Tighter spacing for list items — 100 HWPUNIT after = ~0.35mm.
+      // List items breathe between each other but stay tighter than body
+      // paragraphs (700 HWPUNIT after ≈ 2.5mm) — 100 (≈0.35mm) read as packed.
       applyParaProps(doc, cursor, {
         align: "left",
-        lineSpacing: 120,
+        lineSpacing: LIST_LINE_SPACING,
         spacingBefore: 0,
-        spacingAfter: 100,
+        spacingAfter: LIST_SPACING_AFTER,
       });
     }
     log.push(`append_bullet_list (${items.length} items)`);
@@ -1315,9 +1338,9 @@ const HANDLERS = {
       writeRunsAt(doc, cursor, runs, liDefaults);
       applyParaProps(doc, cursor, {
         align: "left",
-        lineSpacing: 120,
+        lineSpacing: LIST_LINE_SPACING,
         spacingBefore: 0,
-        spacingAfter: 100,
+        spacingAfter: LIST_SPACING_AFTER,
       });
     });
     log.push(`append_numbered_list (${items.length} items)`);
@@ -2609,13 +2632,15 @@ async function patchHwpxParaSpacing(filePath) {
       const c = (hu) => Math.round((hu / 283.46) * mult);
       return `<hh:margin><hc:intent value="${c(I)}" unit="HWPUNIT"/><hc:left value="${c(L)}" unit="HWPUNIT"/><hc:right value="${c(R)}" unit="HWPUNIT"/><hc:prev value="${c(P)}" unit="HWPUNIT"/><hc:next value="${c(N)}" unit="HWPUNIT"/></hh:margin>`;
     };
-    // UNIT NOTE (2026-06-17, unresolved): emit case = mm×100, default = mm×200
-    // (matches Hancom-native structure exactly per round-trip diff). BUT Hancom
-    // ignores the emitted case value and re-derives it on its own — round-trip
-    // case is FIXED (~mm×50) regardless of whether we emit ×1 or ×2, and the
-    // web render is identical. So neither ½ nor ×2 corrects the size. The exact
-    // Hancom unit mapping needs precise reverse-engineering (para-shape N mm →
-    // stored case, several N) before a real fix. Keeping native ×100/×200 for now.
+    // UNIT (2026-06-17, GT-RESOLVED): emit case = mm×100, default = mm×200 — this
+    // is exactly Hancom-native (실험1: para-shape N mm → stored case = N×100,
+    // default = N×200, no hidden factor). These values now survive Hancom web
+    // round-trip 1:1 thanks to the version.xml xmlVersion 1.2→1.5 fix in
+    // patchHwpxStubFingerprint. The earlier "Hancom ignores case / round-trip is
+    // a fixed ~mm×50" note was WRONG — that halving was caused solely by
+    // xmlVersion="1.2" (legacy-doc rescale), not by the case value. So the input
+    // HWPUNIT margins (HEADING_DEFAULTS, BODY_SPACING_AFTER) now render at their
+    // true mm size on Hancom; tune those constants, not this conversion.
     const sw = `<hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">${mk(100)}${ls}</hp:case><hp:default>${mk(200)}${ls}</hp:default></hp:switch>`;
     let out = pp;
     // pull autoSpacing out (re-inserted right before the switch, native order)
