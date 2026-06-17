@@ -2879,19 +2879,34 @@ function opInsertChart(doc, op) {
       doc.write(hpf, s);
     }
   }
+  // INLINE wrap means the chart is a character in the text flow (treatAsChar=1),
+  // so it stays right where it's inserted instead of floating to wherever it fits
+  // (the cause of charts drifting onto a later page). Other wraps stay floating.
+  const inlineChar = wrap === 'INLINE';
   const chart = `<hp:chart id="${freshId()}" zOrder="0" numberingType="PICTURE" textWrap="${wrap}" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" chartIDRef="${partName}">`
     + `<hp:sz width="${cw}" widthRelTo="ABSOLUTE" height="${ch}" heightRelTo="ABSOLUTE" protect="0"/>`
-    + `<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="${cy}" horzOffset="${cx}"/>`
+    + `<hp:pos treatAsChar="${inlineChar ? 1 : 0}" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="${inlineChar ? 'PARA' : 'COLUMN'}" vertAlign="TOP" horzAlign="LEFT" vertOffset="${cy}" horzOffset="${cx}"/>`
     + `<hp:outMargin left="${cmargin}" right="${cmargin}" top="${cmargin}" bottom="${cmargin}"/></hp:chart>`;
   const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
-  const names = doc.sectionNames();
-  const last = names[names.length - 1];
+  // Place after paragraph `index` (so a chart lands next to its reference text),
+  // or append to the end when index is omitted / out of range.
+  const paras = doc.paragraphs();
+  const idx = Number.isInteger(op.index) ? op.index : null;
+  if (idx != null && idx >= 0 && idx < paras.length) {
+    const { section, el } = paras[idx];
+    const charPrId = (el.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+    const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${chart}</hp:run></hp:p>`;
+    const sxml = doc.read(section);
+    doc.write(section, sxml.slice(0, el.end) + para + sxml.slice(el.end));
+    return { inserted: true, part: partName, chartEl: spec.el, series: series.length, cats: cat.length, afterIndex: idx };
+  }
+  const last = doc.sectionNames().slice(-1)[0];
   let xml = doc.read(last);
   const charPrId = (scanTopLevel(xml, 'hp:p').slice(-1)[0]?.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
   const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${chart}</hp:run></hp:p>`;
   xml = /<\/hs:sec>\s*$/.test(xml) ? xml.replace(/<\/hs:sec>\s*$/, para + '</hs:sec>') : xml + para;
   doc.write(last, xml);
-  return { inserted: true, part: partName, chartEl: spec.el, series: series.length, cats: cat.length };
+  return { inserted: true, part: partName, chartEl: spec.el, series: series.length, cats: cat.length, appended: true };
 }
 
 // Insert a drawing shape (도형): rectangle / ellipse / line. Structure mirrors
