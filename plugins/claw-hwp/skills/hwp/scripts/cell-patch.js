@@ -3463,6 +3463,8 @@ export function insertEndnoteInPlace(filePath, ops) {
 // alignment). Section0-only — no DocInfo change.
 const PAGENUM_FOOTER_CHAR_HEX = '1000746f6f6600000000000000001000'; // 0x0010 + 'foot' + 0x0010
 const PAGENUM_FOOT_CTRL_HEX    = '746f6f660000000001000000';          // CTRL_HEADER 'foot' body
+const PAGENUM_HEADER_CHAR_HEX = '10006461656800000000000000001000'; // 0x0010 + 'head' + 0x0010 (GT pn_header)
+const PAGENUM_HEAD_CTRL_HEX    = '646165680000000001000000';          // CTRL_HEADER 'head' body
 const PAGENUM_ONTA_HEX         = '6f6e7461000000000100000000000000'; // auto-number CTRL, note-type 0
 const ALIGN_BITS = { justify: 0, left: 1, right: 2, center: 3, distribute: 4 };
 
@@ -3489,10 +3491,73 @@ function readFooterMarginFromPageDef(records, raw) {
   return 0x109c; // sensible default (~15mm)
 }
 
+// PAGE_DEF header margin (HWPUNIT) — offset 24.
+function readHeaderMarginFromPageDef(records, raw) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= 28) return raw.readUInt32LE(r.dataOff + 24);
+  }
+  return 0x109c;
+}
+
+// Return the DocInfo para_shape index whose alignment matches `align`, creating
+// one (a clone of para_shape 0 with the alignment set) if none exists. Writes
+// the modified DocInfo back to the file. Used by the page-number op so its
+// auto-number paragraph can be left/center/right regardless of what alignments
+// the document already happens to define.
+async function ensureAlignedParaShapeInFile(filePath, align) {
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRC = () => rootChain || (rootChain = walkChain(fat, entries[0].start));
+  const diEntry = findStreamEntry(entries, ['DocInfo']);
+  const inMini = diEntry.size < 4096;
+  let chain, comp;
+  if (inMini) { const rc = ensureRC(); chain = walkChain(minifat, diEntry.start); comp = readMiniChainBytes(buf, chain, rc, ssz, mssz, diEntry.size); }
+  else { chain = walkChain(fat, diEntry.start); comp = readChainBytes(buf, chain, ssz, diEntry.size); }
+  let diRaw = Buffer.from(inflateRawSync(comp));
+
+  const want = ALIGN_BITS[align];
+  const bodies = readParaShapeBodies(diRaw);
+  for (let i = 0; i < bodies.length; i++) if (((bodies[i].readUInt32LE(0) >> 2) & 7) === want) return i;
+  if (bodies.length === 0) return 0;
+
+  const newBody = buildParaShapeBody(bodies[0], { alignment: align });
+  const r = appendParaShapeToDocInfo(diRaw, newBody);
+  diRaw = r.newDi;
+
+  let newComp;
+  if (inMini) {
+    const rc = ensureRC();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, diRaw, chain);
+    buf = ext.buf; newComp = ext.compressed;
+    if (ext.promoted) { writeChainBytes(buf, ext.newRegularChain, ssz, newComp); buf.writeInt32LE(ext.newRegularChain[0], diEntry.entryFileOffset + 0x74); }
+    else { writeMiniChainBytes(buf, ext.miniChain, ext.rootChain, ssz, mssz, newComp); }
+  } else {
+    const ext = deflateAndFitWithExpansion(diRaw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; newComp = ext.compressed; writeChainBytes(buf, ext.chain, ssz, newComp);
+  }
+  buf.writeUInt32LE(newComp.length, diEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+  writeFileSync(filePath, buf);
+  return r.newPsId;
+}
+
 // Insert a page number in the footer. Each op: { align?: "left"|"center"|"right" }
 export async function insertPageNumberInPlace(filePath, ops) {
   if (!Array.isArray(ops) || ops.length === 0) {
     return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  // Pre-pass: ensure DocInfo has a para_shape for each requested alignment
+  // (appends one if missing) so the auto-number paragraph aligns reliably.
+  // This writes DocInfo, so it must run before we read the body buffer below.
+  const alignToIdx = {};
+  for (const op of ops) {
+    const align = (op.align && ALIGN_BITS[op.align] !== undefined) ? op.align : 'center';
+    if (!(align in alignToIdx)) alignToIdx[align] = await ensureAlignedParaShapeInFile(filePath, align);
   }
 
   let buf = readFileSync(filePath);
@@ -3529,13 +3594,15 @@ export async function insertPageNumberInPlace(filePath, ops) {
   const summary = [];
   for (const op of ops) {
     const align = (op.align && ALIGN_BITS[op.align] !== undefined) ? op.align : 'center';
+    const where = op.where === 'header' ? 'header' : 'footer'; // default footer (back-compat)
+    const isHeader = where === 'header';
     const records = parseRecords(raw);
     const textWidth = readTextWidthFromPageDef(records, raw);
-    const footerMargin = readFooterMarginFromPageDef(records, raw);
-    const paraShape = findParaShapeByAlign(buf, align);
+    const margin = isHeader ? readHeaderMarginFromPageDef(records, raw) : readFooterMarginFromPageDef(records, raw);
+    const paraShape = alignToIdx[align];
 
-    // The footer attaches to the section's first top-level paragraph that has
-    // a level-1 PARA_TEXT.
+    // The header/footer attaches to the section's first top-level paragraph
+    // that has a level-1 PARA_TEXT.
     const clusters = findClusterBoundaries(records);
     let cluster = null, ptRec = null;
     for (const c of clusters) {
@@ -3550,20 +3617,20 @@ export async function insertPageNumberInPlace(filePath, ops) {
     const paraHeaderRec = records[cluster.startIdx];
     const noteInstanceId = pickFreshInstanceId(records, raw);
 
-    // 1) Insert the footer char right before the paragraph's EOP (last 2 bytes).
-    const footerChar = Buffer.from(PAGENUM_FOOTER_CHAR_HEX, 'hex');
+    // 1) Insert the header/footer char right before the paragraph's EOP.
+    const hfChar = Buffer.from(isHeader ? PAGENUM_HEADER_CHAR_HEX : PAGENUM_FOOTER_CHAR_HEX, 'hex');
     const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
     const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length; // before EOP
-    const newBody = Buffer.concat([oldBody.slice(0, insAt), footerChar, oldBody.slice(insAt)]);
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), hfChar, oldBody.slice(insAt)]);
     const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
 
-    // 2) Footer cluster.
-    const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, 12), Buffer.from(PAGENUM_FOOT_CTRL_HEX, 'hex')]);
+    // 2) Header/footer cluster (header listAttr 0x00, footer 0x40).
+    const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, 12), Buffer.from(isHeader ? PAGENUM_HEAD_CTRL_HEX : PAGENUM_FOOT_CTRL_HEX, 'hex')]);
     const lh = Buffer.alloc(34);
     lh.writeUInt32LE(1, 0);          // nParas
-    lh.writeUInt32LE(0x40, 4);       // attr
+    lh.writeUInt32LE(isHeader ? 0x00 : 0x40, 4); // attr
     lh.writeUInt32LE(textWidth >>> 0, 8);
-    lh.writeUInt32LE(footerMargin >>> 0, 12);
+    lh.writeUInt32LE(margin >>> 0, 12);
     const listHeader = Buffer.concat([buildRecordHeader(TAG_LIST_HEADER, 2, 34), lh]);
     const ph = Buffer.alloc(24);
     ph.writeUInt32LE(((0x80000000 | 9) >>> 0), 0); // char_count 9 (autonum 8 + EOP), last-para flag
@@ -3592,7 +3659,7 @@ export async function insertPageNumberInPlace(filePath, ops) {
     raw = Buffer.concat([raw.slice(0, clusterEndOff), footerCluster, raw.slice(clusterEndOff)]);
     raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
 
-    summary.push({ section: 0, where: 'footer', align });
+    summary.push({ section: 0, where, align });
   }
 
   // Deflate + write back.
