@@ -1233,19 +1233,20 @@ const HANDLERS = {
     // auto-created trailing paragraph instead of splitParagraph-ing again.
     // Without this, every table emits a phantom blank line before the next
     // heading/paragraph (createTable trailing para + new split = 2 paras).
-    // Table vertical rhythm: rhwp leaves the table's wrapper paragraph at 0/0
-    // margins, so without this the gap BELOW a table is whatever the next
-    // element's spacingBefore happens to be (0 before body → table sticks;
-    // ~6mm before a heading) and the gap ABOVE is the previous element's
-    // spacingAfter — i.e. table spacing is neighbour-dependent and asymmetric
-    // (user: "표 위아래 간격이 다르고 표 아래 문단이 딱 붙어있다"). Give the
-    // wrapper the same spacingAfter as a body paragraph so table→next matches
-    // body→next exactly (the "uniform paragraph break" rhythm the body path
-    // documents); spacingBefore stays 0 so above-table = prev block's after.
+    // Table vertical rhythm: give the table's WRAPPER PARAGRAPH normal block
+    // margins (before == after == body gap) and zero the table's own outMargin
+    // (patchHwpxTableOutMargin). Hancom COLLAPSES adjacent paragraph margins
+    // (GT: 10mm-after + 10mm-before renders 10mm, not 20mm), so with om=0 the
+    // table behaves like a paragraph: the gap above/below it is max(neighbour's
+    // margin, table's margin). A heading after a table then gets max(table 3.5mm,
+    // heading 6mm) = 6mm — the SAME gap a heading gets after body text — so the
+    // two read identically (user: 표 뒤 제목과 본문 뒤 제목 간격이 같아야 한다).
+    // The earlier outMargin approach ADDED on top of the collapsed gap (sum),
+    // which over-spaced 표→heading.
     applyParaProps(doc, { sec: cursor.sec, para: tableParaIdx, charOffset: 0 }, {
       align: "left",
       lineSpacing: BODY_LINE_SPACING,
-      spacingBefore: 0,
+      spacingBefore: BODY_SPACING_AFTER,
       spacingAfter: BODY_SPACING_AFTER,
     });
 
@@ -2660,33 +2661,26 @@ async function patchHwpxParaSpacing(filePath) {
   return n;
 }
 
-// Table vertical breathing via the table's OWN outMargin (top/bottom), NOT
-// paragraph spacing. GT (2026-06-17, native-table round-trip + render matrix):
-//   1. Hancom web does NOT render the paragraph spacing of the element AFTER a
-//      table — a heading right below a table loses its spacingBefore entirely
-//      (it touches the table border); the table wrapper's own spacingAfter is
-//      swallowed too. Only the table object's <hp:outMargin bottom> shows below.
-//   2. ABOVE a table, the PRECEDING body paragraph's spacingAfter DOES render
-//      and ADDS to outMargin.top — so a body→table gap came out roughly double
-//      a table→heading gap (user: "표 아래가 훨씬 작은데 위보다?"). A heading
-//      before a table, by contrast, has its spacingAfter swallowed, so a
-//      heading→table gap came out too tight.
-// Fix for a uniform, symmetric gap regardless of neighbour type:
-//   • set every top-level table's outMargin top = bottom = TABLE_OUTMARGIN_TB;
-//   • neutralise the preceding top-level paragraph's spacingAfter (clone its
-//     paraPr with next=0 and repoint just that paragraph) so the above-gap is
-//     outMargin.top alone — matching the below-gap (outMargin.bottom).
-// Net: every table sits with the same ~3.5mm above and below, whether wrapped
-// by body text or section headings.
-// top == bottom: Hancom web FORCES table outMargin symmetric on import (GT: sent
-// top=1000/bottom=1500, Hancom stored bottom=1000), so an asymmetric value is a
-// no-op. The gap above a table still renders ~1.5–2mm larger than below because
-// Hancom paints the preceding paragraph's line-height trailing (150% body line
-// spacing) above the table but does NOT mirror the following paragraph's leading
-// below — an irreducible line-metric artifact, not a spacing bug.
-const TABLE_OUTMARGIN_TOP = 1000;    // HWPUNIT ≈ 3.5mm
-const TABLE_OUTMARGIN_BOTTOM = 1000; // forced equal to top by Hancom on import
-async function patchHwpxTableOutMargin(filePath, top = TABLE_OUTMARGIN_TOP, bottom = TABLE_OUTMARGIN_BOTTOM) {
+// Zero each top-level table's outMargin (top/bottom) so a table's vertical
+// spacing comes purely from its WRAPPER PARAGRAPH's margins (set in
+// append_table), which COLLAPSE with neighbours like any paragraph.
+// GT (2026-06-17): Hancom COLLAPSES adjacent paragraph margins — a 10mm-after
+// next to a 10mm-before renders 10mm, not 20mm ("둘 중 큰 값으로 대체", the user's
+// rule). But the table object's <hp:outMargin> is NOT a paragraph margin: any
+// non-zero value ADDS on top of the collapsed paragraph gap (sum), so an inflated
+// outMargin over-spaced tables and made 표→heading ≠ body→heading. Zeroing it and
+// giving the wrapper paragraph normal block margins lets the table collapse like
+// a paragraph: 표→heading = max(table 3.5mm, heading 6mm) = 6mm = body→heading.
+// left/right preserved (horizontal cell padding is unaffected).
+//
+// UPDATE (GT, render-mapped): below a table Hancom EATS paragraph margins (both
+// the wrapper's after AND the next element's before) and renders ONLY
+// outMargin.bottom; above a table the preceding paragraph's margin DOES render
+// (+ outMargin.top). So om=0 makes 표→heading touch. To make 표→heading match
+// body→heading (≈6mm, the heading's collapsed section gap), set outMargin to that
+// gap so the below-table gap (=outMargin.bottom) equals it.
+const TABLE_OUTMARGIN = 1700; // HWPUNIT ≈ 6mm — matches a heading's section gap
+async function patchHwpxTableOutMargin(filePath) {
   const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
   const headerEntry = zip.file("Contents/header.xml");
   let header = headerEntry ? await headerEntry.async("string") : null;
@@ -2700,27 +2694,31 @@ async function patchHwpxTableOutMargin(filePath, top = TABLE_OUTMARGIN_TOP, bott
     let xml = await zip.file(name).async("string");
     let changed = false;
 
-    // 1. outMargin top = bottom on each top-level table (left/right preserved).
+    // 1. outMargin top = bottom = TABLE_OUTMARGIN on each top-level table. The
+    //    below-table gap = outMargin.bottom (paragraph margins are eaten below a
+    //    table); set it to a heading's section gap so 표→heading == body→heading.
     const xml2 = xml.replace(/<hp:tbl\b[\s\S]*?<hp:tr\b/g, (seg) =>
       seg.replace(/<hp:outMargin\b[^>]*\/>/, (m) => {
         const left = (m.match(/left="(\d+)"/) || [])[1] ?? "283";
         const right = (m.match(/right="(\d+)"/) || [])[1] ?? "283";
         total++;
-        return `<hp:outMargin left="${left}" right="${right}" top="${top}" bottom="${bottom}"/>`;
+        return `<hp:outMargin left="${left}" right="${right}" top="${TABLE_OUTMARGIN}" bottom="${TABLE_OUTMARGIN}"/>`;
       }),
     );
     if (xml2 !== xml) { xml = xml2; changed = true; }
 
-    // 2. zero spacingAfter of the top-level paragraph immediately before each
-    //    table (clone its paraPr so other paragraphs sharing the id keep theirs).
+    // 2. Above a table, the preceding paragraph's margin DOES render and would
+    //    ADD to outMargin.top (sum) — the user's rule is max, not sum. Neutralise
+    //    the preceding top-level paragraph's spacingAfter (clone its paraPr with
+    //    next=0, repoint only that paragraph) so the above-table gap is
+    //    outMargin.top alone — matching the below-table gap.
     if (header) {
       const regions = topLevelParaRegions(xml);
       const edits = [];
       for (let i = 1; i < regions.length; i++) {
-        const seg = xml.slice(regions[i].start, regions[i].end);
-        if (!/<hp:tbl\b/.test(seg)) continue;             // region i is a table
+        if (!/<hp:tbl\b/.test(xml.slice(regions[i].start, regions[i].end))) continue;
         const prevSeg = xml.slice(regions[i - 1].start, regions[i - 1].end);
-        if (/<hp:tbl\b/.test(prevSeg)) continue;          // prev is also a table
+        if (/<hp:tbl\b/.test(prevSeg)) continue;
         const ref = (prevSeg.match(/paraPrIDRef="(\d+)"/) || [])[1];
         if (!ref) continue;
         const src = header.match(new RegExp(`<hh:paraPr id="${ref}"[\\s\\S]*?</hh:paraPr>`));
@@ -2731,11 +2729,10 @@ async function patchHwpxTableOutMargin(filePath, top = TABLE_OUTMARGIN_TOP, bott
           .replace(/^<hh:paraPr id="\d+"/, `<hh:paraPr id="${cloneId}"`)
           .replace(/(<h[hc]:next\b[^>]*\bvalue=")(-?\d+)(")/g, "$10$3");
         header = header.replace("</hh:paraProperties>", clone + "</hh:paraProperties>");
-        header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + 1) + b);
+        header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (mm, a, n, b) => a + (Number(n) + 1) + b);
         headerChanged = true;
         edits.push({ region: regions[i - 1], cloneId });
       }
-      // apply paraPrIDRef repoints right-to-left so earlier offsets stay valid
       edits.sort((a, b) => b.region.start - a.region.start);
       for (const e of edits) {
         const seg = xml.slice(e.region.start, e.region.end).replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${e.cloneId}"`);
@@ -3366,14 +3363,6 @@ async function readStdin() {
   try {
     for (; opIdx < ops.length; opIdx++) {
       const op = ops[opIdx];
-      // A section heading placed DIRECTLY after a table loses its spacingBefore
-      // on Hancom web (the gap is eaten), so a new section crowds the table.
-      // Insert a spacer paragraph between table→heading so the heading keeps its
-      // full "space above heading" — user's model: 표→헤딩 = 헤딩위 간격 (the
-      // heading owns the section gap). table→body needs no spacer.
-      if (op.type === 'append_heading' && ops[opIdx - 1]?.type === 'append_table') {
-        HANDLERS.append_paragraph(doc, { text: ' ' }, cursor);
-      }
       const handler = HANDLERS[op.type];
       if (!handler) throw new Error(`unknown op type '${op.type}'`);
       handler(doc, op, cursor);
@@ -3496,13 +3485,13 @@ async function readStdin() {
     }
   }
 
-  // Tables breathe via their own outMargin (Hancom eats table-adjacent paragraph
-  // spacing — see patchHwpxTableOutMargin). Symmetric top/bottom so a table has
-  // a consistent gap above and below whether followed by body or a heading.
+  // Tables: zero outMargin so the wrapper paragraph's margins (set in
+  // append_table) collapse with neighbours like any paragraph — see
+  // patchHwpxTableOutMargin. Keeps 표→heading == body→heading (collapse, not sum).
   if (ext === ".hwpx") {
     try {
       const n = await patchHwpxTableOutMargin(outPath);
-      if (n > 0) log.push(`hwpx_patch: ${n} table outMargin top=${TABLE_OUTMARGIN_TOP} bottom=${TABLE_OUTMARGIN_BOTTOM}`);
+      if (n > 0) log.push(`hwpx_patch: ${n} table outMargin → 0 (collapse via wrapper para)`);
     } catch (err) {
       log.push(`hwpx_tableoutmargin_patch failed: ${err.message}`);
     }
