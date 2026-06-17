@@ -257,6 +257,37 @@ function uniformRunStyle(runs) {
   return isDefault ? null : first;
 }
 
+// Paragraphs whose runs carry MIXED char styling (e.g. "일반 **굵게** 일반", or
+// explicit runs with different bold/colour/font). rhwp's .hwpx serializer
+// COALESCES every run in a paragraph into ONE run (dropping mid-paragraph char
+// shapes), so inline bold/colour/font set at create time silently vanish — even
+// though rhwp DOES create the per-run <hh:charPr> in header.xml. We re-split the
+// coalesced run back into per-run <hp:run>s post-export (patchHwpxMixedRuns).
+const mixedRunPatches = [];
+
+// Returns ordered per-run style segments {text,height,bold,italic,underline,
+// color,font} for a paragraph that needs re-splitting, else null. Null when:
+// fewer than 2 text runs (rhwp keeps a single run fine), or all runs share one
+// style (uniformRunStyle / native handling covers that). So this fires exactly
+// for the "multiple distinct styles in one paragraph" case uniformRunStyle skips.
+function mixedRunSegments(runs) {
+  const styled = (runs || []).filter((r) => r && r.text);
+  if (styled.length < 2) return null;
+  const seg = styled.map((r) => {
+    const pt = r.fontSize ?? r.size ?? r.size_pt;
+    return {
+      text: String(r.text),
+      height: pt != null ? Math.round(Number(pt) * 100) : 1000,
+      bold: !!r.bold, italic: !!r.italic, underline: !!r.underline,
+      color: normalizeHexColor(r.color ?? r.textColor ?? "#000000"),
+      font: r.font_family ?? r.fontFamily ?? "",
+    };
+  });
+  const keyOf = (s) => `${s.height}:${s.bold}:${s.italic}:${s.underline}:${s.color}:${s.font}`;
+  if (new Set(seg.map(keyOf)).size < 2) return null; // uniform → not our job
+  return seg;
+}
+
 function startNewParagraph(doc, cursor) {
   // First write goes into the existing empty paragraph; later writes split a
   // new paragraph at the current cursor position.
@@ -805,9 +836,16 @@ const HANDLERS = {
     if (bFontIds) bodyDefaults.fontIds = bFontIds;
     writeRunsAt(doc, cursor, runs, bodyDefaults);
     // rhwp drops the run's charPrIDRef on .hwpx export — track uniform run
-    // styling so we can re-link it post-export (same fix as headings).
+    // styling so we can re-link it post-export (same fix as headings). A
+    // paragraph is EITHER uniform (re-link one charPr) OR mixed (re-split into
+    // per-run charPrs) — never both.
     const bstyle = uniformRunStyle(runs);
-    if (bstyle) bodyStylePatches.push({ paraIdx: cursor.para, ...bstyle });
+    if (bstyle) {
+      bodyStylePatches.push({ paraIdx: cursor.para, ...bstyle });
+    } else {
+      const seg = mixedRunSegments(runs);
+      if (seg) mixedRunPatches.push({ paraIdx: cursor.para, segments: seg });
+    }
     applyParaProps(doc, cursor, {
       align: op.align,
       lineSpacing: op.line_spacing ?? BODY_LINE_SPACING,
@@ -2311,6 +2349,90 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
   return fixed;
 }
 
+// Re-split paragraphs whose mixed-style runs rhwp coalesced into ONE run on
+// .hwpx export (inline **bold**, per-run colour/font, etc.). For each tracked
+// paragraph we rebuild the single coalesced text run as a sequence of per-
+// segment <hp:run>s, each pointing at the header <hh:charPr> that matches that
+// segment's style (rhwp DID create those charPrs; it just dropped the per-run
+// references). HEAVILY GUARDED: if the paragraph isn't the expected single
+// plain-text coalesced run (count != 1, markup inside <hp:t>, text drift, or any
+// segment's charPr missing) we leave it untouched — worst case is the prior
+// coalesced output, never corruption.
+async function patchHwpxMixedRuns(filePath, patches) {
+  if (!patches.length) return 0;
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const headerEntry = zip.file("Contents/header.xml");
+  const sectionEntry = zip.file("Contents/section0.xml");
+  if (!headerEntry || !sectionEntry) return 0;
+  const headerXml = await headerEntry.async("string");
+  const sectionXml = await sectionEntry.async("string");
+
+  // face id → name + charPr lookups (font-agnostic `lookup`, font-keyed `lookupFull`).
+  const faceById = new Map();
+  const hangulBlock = (/<hh:fontface lang="HANGUL"[^>]*>[\s\S]*?<\/hh:fontface>/.exec(headerXml) || [])[0] || "";
+  for (const fm of hangulBlock.matchAll(/<hh:font id="(\d+)"[^>]*\bface="([^"]*)"/g)) faceById.set(fm[1], fm[2]);
+  const charPrRe = /<hh:charPr\b[^>]*?(?:\/>|>(?:[^<]|<(?!\/hh:charPr>))*?<\/hh:charPr>)/g;
+  const lookup = new Map();
+  const lookupFull = new Map();
+  for (const m of headerXml.matchAll(charPrRe)) {
+    const s = m[0];
+    const id = (/\bid="(\d+)"/.exec(s) || [])[1];
+    const height = (/\bheight="(\d+)"/.exec(s) || [])[1];
+    if (!id || !height) continue;
+    const color = ((/\btextColor="([^"]*)"/.exec(s) || [])[1] || "#000000").toUpperCase();
+    const base = `${height}:${/<hh:bold\b/.test(s) ? 1 : 0}:${/<hh:italic\b/.test(s) ? 1 : 0}:${/<hh:underline\b/.test(s) ? 1 : 0}:${color}`;
+    if (!lookup.has(base)) lookup.set(base, id);
+    const faceId = (/<hh:fontRef\s+hangul="(\d+)"/.exec(s) || [])[1];
+    const face = faceById.get(faceId) || "";
+    if (!lookupFull.has(`${base}:${face}`)) lookupFull.set(`${base}:${face}`, id);
+  }
+
+  const escXml = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const unescXml = (t) => t.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  const segCharPr = (sg) => {
+    const base = `${sg.height}:${sg.bold ? 1 : 0}:${sg.italic ? 1 : 0}:${sg.underline ? 1 : 0}:${sg.color.toUpperCase()}`;
+    return (sg.font && lookupFull.get(`${base}:${sg.font}`)) || lookup.get(base) || null;
+  };
+
+  const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
+  const regions = [];
+  for (const m of sectionXml.matchAll(pRe)) regions.push({ start: m.index, end: m.index + m[0].length });
+  let xml = sectionXml;
+  let fixed = 0;
+  for (let i = patches.length - 1; i >= 0; i--) {
+    const p = patches[i];
+    if (p.paraIdx < 0 || p.paraIdx >= regions.length) continue;
+    const ids = p.segments.map(segCharPr);
+    if (ids.some((x) => !x)) continue;                 // a segment style isn't in header → bail
+    const region = regions[p.paraIdx];
+    const body = xml.slice(region.start, region.end);
+    // Collect text-bearing runs; expect exactly one (the coalesced run).
+    const runRe = /<hp:run\b[^>]*>([\s\S]*?)<\/hp:run>/g;
+    const textRuns = [];
+    let mm;
+    while ((mm = runRe.exec(body)) !== null) {
+      const tm = /<hp:t>([\s\S]*?)<\/hp:t>/.exec(mm[1]);
+      if (tm) textRuns.push({ t: tm[1], start: mm.index, end: mm.index + mm[0].length });
+    }
+    if (textRuns.length !== 1) continue;               // not the simple coalesced shape
+    const run = textRuns[0];
+    if (/<hp:/.test(run.t)) continue;                  // markup inside <hp:t> → leave alone
+    if (unescXml(run.t) !== p.segments.map((s) => s.text).join("")) continue; // text drift → bail
+    const rebuilt = p.segments
+      .map((s, k) => `<hp:run charPrIDRef="${ids[k]}"><hp:t>${escXml(s.text)}</hp:t></hp:run>`)
+      .join("");
+    const newBody = body.slice(0, run.start) + rebuilt + body.slice(run.end);
+    xml = xml.slice(0, region.start) + newBody + xml.slice(region.end);
+    fixed++;
+  }
+
+  if (fixed > 0) {
+    zip.file("Contents/section0.xml", xml);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return fixed;
+}
+
 // Remap the default char shape (charPr id=0) to the theme body font. rhwp
 // resets a fair number of run charPrIDRefs to "0" on .hwpx export — notably
 // in-table-cell runs (applyCharFormatInCell creates a styled charPr in
@@ -3008,6 +3130,18 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: fixed ${n} body run charPrIDRef`);
     } catch (err) {
       log.push(`hwpx_bodystyle_patch failed: ${err.message}`);
+    }
+  }
+
+  // Re-split mixed-style paragraphs rhwp coalesced into one run (inline
+  // **bold**, per-run colour/font). Runs after the uniform re-link (disjoint
+  // paragraph sets) and before the default-font remap.
+  if (ext === ".hwpx" && mixedRunPatches.length > 0) {
+    try {
+      const n = await patchHwpxMixedRuns(outPath, mixedRunPatches);
+      if (n > 0) log.push(`hwpx_patch: re-split ${n} mixed-run paragraph(s)`);
+    } catch (err) {
+      log.push(`hwpx_mixedrun_patch failed: ${err.message}`);
     }
   }
 
