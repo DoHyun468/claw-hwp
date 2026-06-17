@@ -2273,6 +2273,10 @@ async function readStdin() {
   // paragraph; same infra as page-number, no DocInfo write). See cell-patch.js
   // insertHeaderFooterTextInPlace.
   const HEADERFOOTER_OPS = new Set(['insert_header_text', 'insert_footer_text']);
+  // 셀 너비/높이 같게 (raw-patch — make a whole table's columns/rows equal;
+  // length-preserving LIST_HEADER width/height edit, no DocInfo write).
+  // See cell-patch.js equalizeTableInPlace.
+  const EQUALIZE_OPS = new Set(['equalize_table_columns', 'equalize_table_rows']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2302,7 +2306,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2602,6 +2606,15 @@ async function readStdin() {
         const hfSummary = await insertHeaderFooterTextInPlace(outPath, hfOps);
         subModes.push(`header_footer:${hfSummary.mode || 'in-place'}`);
         for (const e of hfSummary) allEdits.push({ kind: 'header_footer', ...e });
+      }
+      const eqOps = ops.filter((o) => EQUALIZE_OPS.has(o.type)).map((o) => ({
+        ...o, dim: o.type === 'equalize_table_rows' ? 'height' : 'width',
+      }));
+      if (eqOps.length > 0) {
+        const { equalizeTableInPlace } = await import('./cell-patch.js');
+        const eqSummary = await equalizeTableInPlace(outPath, eqOps);
+        subModes.push(`equalize:${eqSummary.mode || 'in-place'}`);
+        for (const e of eqSummary) allEdits.push({ kind: 'equalize', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

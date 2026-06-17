@@ -5947,6 +5947,124 @@ export async function applyCellPropertyInPlace(filePath, ops) {
   return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
 }
 
+// ── 셀 너비/높이 같게 (equalize table columns / rows) raw-patch ────────────
+//
+// GT-first (eqw_1row.hwp, table-op equal-width on a single-row table): making
+// a uniform table's columns equal is a clean width set — each column becomes
+// tableWidth / cols, total preserved (verified: 19567+28623 → 24095+24095).
+// No re-grid: re-gridding (column-boundary union) only happens when a PARTIAL
+// selection misaligns rows; equalizing the WHOLE table keeps every row
+// aligned, so it stays a length-preserving LIST_HEADER width@16 / height@20
+// edit. Merged cells get span × the equal unit. Section0-only, no DocInfo.
+//
+// Each op: { section?, para?, control?, dim: 'width'|'height' }.
+export async function equalizeTableInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', equalized_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`equalize_table: only section 0 is supported (got ${op.section})`);
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    const dim = op.dim === 'height' ? 'height' : 'width';
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cols = secRaw.readUInt16LE(tableRec.dataOff + 6);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    if (dim === 'width') {
+      // Total = sum of widths of the cells in row 0 (covers all columns).
+      let total = 0;
+      for (const c of cells) if (c.row === 0) total += secRaw.readUInt32LE(c.lhDataOff + 16);
+      if (cols < 1 || total < 1) { summary.push({ para, control: ctrl, dim, cols, skipped: true }); continue; }
+      const unit = Math.floor(total / cols);
+      const rem = total - unit * cols; // give the remainder to the last column
+      for (const c of cells) {
+        let w = c.colSpan * unit;
+        if (c.col + c.colSpan >= cols) w += rem;
+        secRaw.writeUInt32LE(w >>> 0, c.lhDataOff + 16);
+      }
+      summary.push({ para, control: ctrl, dim, cols, unit });
+    } else {
+      let total = 0;
+      for (const c of cells) if (c.col === 0) total += secRaw.readUInt32LE(c.lhDataOff + 20);
+      if (rows < 1 || total < 1) { summary.push({ para, control: ctrl, dim, rows, skipped: true }); continue; }
+      const unit = Math.floor(total / rows);
+      const rem = total - unit * rows;
+      for (const c of cells) {
+        let h = c.rowSpan * unit;
+        if (c.row + c.rowSpan >= rows) h += rem;
+        secRaw.writeUInt32LE(h >>> 0, c.lhDataOff + 20);
+      }
+      summary.push({ para, control: ctrl, dim, rows, unit });
+    }
+  }
+
+  // Deflate + write Section0 (length-preserving — only width/height fields).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', equalized_count: summary.length });
+}
+
 // The TAG_TABLE record (table grid: rows, cols, and the per-row cell-count
 // array at body offset 18) for the table at (sectionParaIdx, controlIdx).
 function findTableRecord(records, sectionParaIdx, controlIdx) {
