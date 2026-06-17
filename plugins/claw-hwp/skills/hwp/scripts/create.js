@@ -2271,6 +2271,10 @@ async function readStdin() {
   // alignment references an existing matching para_shape, no DocInfo write).
   // See cell-patch.js insertPageNumberInPlace.
   const PAGENUM_OPS = new Set(['insert_page_number']);
+  // 다단 (raw-patch — patch the section's 'cold' column-def control to N
+  // columns). For editing existing docs; new docs can use setup_columns on the
+  // rhwp create path. See cell-patch.js setColumnsInPlace.
+  const SET_COLUMNS_OPS = new Set(['set_columns']);
   // 스타일 적용 (raw-patch — repoint a paragraph's style + para_shape to a
   // named style; length-preserving, no DocInfo write). See cell-patch.js
   // applyNamedStyleInPlace.
@@ -2326,7 +2330,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2624,6 +2628,13 @@ async function readStdin() {
         const pnSummary = await insertPageNumberInPlace(outPath, pageNumOps);
         subModes.push(`page_number:${pnSummary.mode || 'in-place'}`);
         for (const e of pnSummary) allEdits.push({ kind: 'page_number', ...e });
+      }
+      const setColumnsOps = ops.filter((o) => SET_COLUMNS_OPS.has(o.type));
+      if (setColumnsOps.length > 0) {
+        const { setColumnsInPlace } = await import('./cell-patch.js');
+        const scSummary = await setColumnsInPlace(outPath, setColumnsOps);
+        subModes.push(`set_columns:${scSummary.mode || 'in-place'}`);
+        for (const e of scSummary) allEdits.push({ kind: 'set_columns', ...e });
       }
       const styleOps = ops.filter((o) => STYLE_OPS.has(o.type));
       if (styleOps.length > 0) {

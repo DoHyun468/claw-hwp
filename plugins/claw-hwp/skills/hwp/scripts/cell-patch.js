@@ -3699,6 +3699,87 @@ export async function insertPageNumberInPlace(filePath, ops) {
 }
 
 
+// ── 다단 (multi-column) raw-patch ─────────────────────────────────────────
+// GT-first (claw-hancomdocs `columns --count N` on a .hwp): the section's
+// column layout lives in the "cold" (단 정의) CTRL_HEADER, a fixed 16-byte
+// record: id "dloc" + attribute(u16) + gap(u16) + 8 reserved bytes. The
+// attribute is 0x1000 (same-width flag) | (count << 2) | type(bits 0-1, 0 =
+// 일반/newspaper). GT-confirmed: 1단=0x1004 gap0, 2단=0x1008 gap2268(8mm),
+// 3단=0x100c gap1134(4mm). Every section already has a 1-단 cold control, so
+// we just patch the count + gap in place (length-preserving, Section0-only,
+// no DocInfo change). The body reflows into N columns.
+const TAG_CTRL_HEADER_COLD = 0x47;
+export async function setColumnsInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const count = [1, 2, 3].includes(op.count) ? op.count : 2;
+    const gapHu = op.spacing_mm != null ? Math.round(op.spacing_mm * 283.46) : (count === 1 ? 0 : count === 3 ? 1134 : 2268);
+    let patched = false;
+    for (const r of parseRecords(raw)) {
+      if (r.tag === TAG_CTRL_HEADER_COLD && r.size >= 8 && raw.slice(r.dataOff, r.dataOff + 4).toString('latin1') === 'dloc') {
+        raw.writeUInt16LE((0x1000 | (count << 2)) & 0xFFFF, r.dataOff + 4); // same-width | count | type 0
+        raw.writeUInt16LE(gapHu & 0xFFFF, r.dataOff + 6);                   // 단 사이 간격
+        patched = true;
+        break; // first section's column definition
+      }
+    }
+    if (!patched) throw new Error('set_columns: no column-definition (cold) control found in Section0');
+    summary.push({ section: 0, count, spacing_mm: op.spacing_mm ?? (count === 1 ? 0 : count === 3 ? 4 : 8) });
+  }
+
+  // Deflate + write back (length-preserving patch, but re-deflate to be safe).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, chain);
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart; newCompressed = ext.compressed;
+    if (ext.promoted) { chain = ext.newRegularChain; writeChainBytes(buf, chain, ssz, newCompressed); buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74); }
+    else { rootChain = ext.rootChain; chain = ext.miniChain; writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed); }
+  } else {
+    const ext = deflateAndFitWithExpansion(raw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain; newCompressed = ext.compressed; writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── 머리말 / 꼬리말 텍스트 (header / footer text) raw-patch ────────────────
 //
 // Derived from the verified page-number footer/header control structure
