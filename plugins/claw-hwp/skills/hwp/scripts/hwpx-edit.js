@@ -1986,20 +1986,85 @@ function ensureCleanAlignParaPr(doc, align) {
   return newPpId;
 }
 
+// Like ensureCleanAlignParaPr but also bakes margin (indent / left / right /
+// spacingBefore / spacingAfter, all in HWPUNIT ≈283.46/mm) and lineSpacing
+// (percent) into the Hancom-native hp:switch so they survive Hancom web — a
+// plain <hh:margin> paraPr is stripped to 0 on open. Units (GT 한컴 para-shape):
+// hp:case = mm×100, hp:default = mm×200; lineSpacing(%) is copied verbatim into
+// both branches. Always injects from the stub when any margin/lineSpacing is set
+// (an existing paraPr won't match those exact values); reuses for align-only.
+function ensureCleanParaPr(doc, opts) {
+  const al = opts.align ? String(opts.align).toUpperCase() : null;
+  if (al && !ALIGN_VALUES.has(al)) throw new Error(`apply_paragraph_style: align must be one of ${[...ALIGN_VALUES].join('/')}`);
+  const hasBox = ['indent', 'marginLeft', 'marginRight', 'spacingBefore', 'spacingAfter', 'lineSpacing'].some((k) => opts[k] != null);
+  const headerName = doc.headerName();
+  if (!headerName) return null;
+  let header = doc.read(headerName);
+  if (al && !hasBox) {
+    for (const pp of scanTopLevel(header, 'hh:paraPr')) {
+      const h = (pp.inner.match(/<hh:heading\s+type="([^"]+)"/) || [])[1];
+      const a = (pp.inner.match(/<hh:align\b[^>]*horizontal="([^"]+)"/) || [])[1];
+      if (h === 'NONE' && a === al && paraPrIsPlain(pp.inner)) return getAttr(pp.attrs, 'id');
+    }
+  }
+  const stubPath = path.join(__dirname, 'templates', 'hancom_native_stub.hwpx');
+  if (!fs.existsSync(stubPath)) return null;
+  let stubFiles;
+  try { stubFiles = unzipSync(new Uint8Array(fs.readFileSync(stubPath))); } catch { return null; }
+  const stubHeader = strFromU8(stubFiles['Contents/header.xml'] || new Uint8Array());
+  const tmpl = (stubHeader.match(/<hh:paraPr id="2"[^>]*>[\s\S]*?<\/hh:paraPr>/) || [])[0];
+  if (!tmpl) return null;
+  const ids = [...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map((m) => Number(m[1]));
+  const newPpId = String((ids.length ? Math.max(...ids) : 0) + 1);
+  let clean = tmpl
+    .replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${newPpId}"`)
+    .replace(/<hh:heading\s+type="[^"]*"\s+idRef="[^"]*"\s+level="[^"]*"\/>/, '<hh:heading type="NONE" idRef="0" level="0"/>');
+  if (al) clean = clean.replace(/<hh:align\b[^>]*\/>/, `<hh:align horizontal="${al}" vertical="BASELINE"/>`);
+  if (hasBox) {
+    const c = (v, mult) => Math.round((Number(v || 0) / 283.46) * mult);
+    const mk = (mult) => `<hh:margin><hc:intent value="${c(opts.indent, mult)}" unit="HWPUNIT"/><hc:left value="${c(opts.marginLeft, mult)}" unit="HWPUNIT"/><hc:right value="${c(opts.marginRight, mult)}" unit="HWPUNIT"/><hc:prev value="${c(opts.spacingBefore, mult)}" unit="HWPUNIT"/><hc:next value="${c(opts.spacingAfter, mult)}" unit="HWPUNIT"/></hh:margin>`;
+    clean = clean.replace(/(<hp:case\b[^>]*>)<hh:margin>[\s\S]*?<\/hh:margin>/, `$1${mk(100)}`);
+    clean = clean.replace(/(<hp:default>)<hh:margin>[\s\S]*?<\/hh:margin>/, `$1${mk(200)}`);
+    if (opts.lineSpacing != null) {
+      clean = clean.replace(/<hh:lineSpacing\b[^>]*\/>/g, `<hh:lineSpacing type="PERCENT" value="${opts.lineSpacing}" unit="HWPUNIT"/>`);
+    }
+  }
+  header = header.replace('</hh:paraProperties>', clean + '</hh:paraProperties>');
+  header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + 1) + b);
+  if (!/<hh:head[^>]*xmlns:hwpunitchar=/.test(header)) {
+    header = header.replace(/(<hh:head[^>]*?xmlns:ooxmlchart="[^"]+")/, '$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"');
+  }
+  doc.write(headerName, header);
+  return newPpId;
+}
+
 function opApplyParagraphStyle(doc, index, style) {
   const headerName = doc.headerName();
   if (!headerName) throw new Error('apply_paragraph_style: Contents/header.xml missing');
-  // Web-safe fast path: a plain alignment change (no indent/lineSpacing/spacing).
-  // Reuse/inject a clean native-structured aligned paraPr so Hancom web keeps it.
-  if (style.align && style.indent === undefined && style.lineSpacing === undefined) {
-    const pprId = ensureCleanAlignParaPr(doc, style.align);
+  // Web-safe path: align / indent / margins / spacing / lineSpacing baked into a
+  // Hancom-native hp:switch paraPr so Hancom web keeps them (a plain paraPr is
+  // stripped to 0 on open). background_color / page_break_before / keep_with_next
+  // aren't part of the switch — those still take the clone path below.
+  const nativeOpts = {
+    align: style.align,
+    indent: style.indent,
+    marginLeft: style.margin_left ?? style.marginLeft,
+    marginRight: style.margin_right ?? style.marginRight,
+    spacingBefore: style.spacing_before ?? style.spacingBefore,
+    spacingAfter: style.spacing_after ?? style.spacingAfter,
+    lineSpacing: style.line_spacing ?? style.lineSpacing,
+  };
+  const wantsNative = Object.values(nativeOpts).some((v) => v != null);
+  const noExtras = style.background_color == null && style.page_break_before == null && style.keep_with_next == null;
+  if (wantsNative && noExtras) {
+    const pprId = ensureCleanParaPr(doc, nativeOpts);
     if (pprId != null) {
       const paras0 = doc.paragraphs();
       if (index < 0 || index >= paras0.length) throw new Error(`apply_paragraph_style: index ${index} out of range`);
       const { section, el } = paras0[index];
       const newOpen = el.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${pprId}"`);
       doc.write(section, spliceEl(doc.read(section), el, `<hp:p${newOpen}>${dropLinesegs(el.inner)}</hp:p>`));
-      return { index, paraPrId: pprId, align: String(style.align).toUpperCase(), webSafe: true };
+      return { index, paraPrId: pprId, webSafe: true };
     }
     // no stub available → fall through to the clone path
   }
