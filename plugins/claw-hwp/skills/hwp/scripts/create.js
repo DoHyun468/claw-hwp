@@ -264,18 +264,31 @@ function charPrStyleFromXml(s, faceById) {
   const g = (re, d) => { const m = re.exec(s); return m ? m[1] : d; };
   let shade = (g(/\bshadeColor="([^"]*)"/, "NONE") || "NONE").toUpperCase();
   if (shade === "NONE" || shade === "#FFFFFF") shade = "NONE";
-  const st = /<hh:strikeout\b[^>]*type="([^"]*)"/.exec(s);
   return {
     height: g(/\bheight="(\d+)"/, "1000"),
     bold: /<hh:bold\b/.test(s), italic: /<hh:italic\b/.test(s),
     underline: /<hh:underline\b[^>]*type="(?!NONE)/.test(s),
-    strike: !!(st && st[1] !== "NONE"),
+    // GT: 취소선은 shape 로 제어 (SOLID=보임, NONE=안보임), type 아님.
+    strike: /<hh:strikeout\b[^>]*shape="(?!NONE)/.test(s),
     color: g(/\btextColor="([^"]*)"/, "#000000").toUpperCase(),
     shade,
     spacing: Number(g(/<hh:spacing\b[^>]*hangul="(-?\d+)"/, "0")),
     ratio: Number(g(/<hh:ratio\b[^>]*hangul="(\d+)"/, "100")),
     font: faceById.get(g(/<hh:fontRef\s+hangul="(\d+)"/, "")) || "",
   };
+}
+
+// Inject a Hancom-native strikeout (shape="SOLID") into a charPr XML. GT (한컴
+// format-text --strike → download): 취소선 is controlled by `shape` (SOLID=on,
+// NONE=off), NOT `type`, and sits after <hh:underline> (or <hh:offset>). rhwp
+// never emits a strikeout charPr on the .hwpx create path, so for a strike run we
+// clone the equivalent non-strike charPr and splice this tag in.
+function injectStrikeout(charPrXml) {
+  const tag = '<hh:strikeout shape="SOLID" color="#000000"/>';
+  if (/<hh:strikeout\b/.test(charPrXml)) return charPrXml.replace(/<hh:strikeout\b[^>]*\/>/, tag);
+  if (/<hh:underline\b[^>]*\/>/.test(charPrXml)) return charPrXml.replace(/(<hh:underline\b[^>]*\/>)/, `$1${tag}`);
+  if (/<hh:offset\b[^>]*\/>/.test(charPrXml)) return charPrXml.replace(/(<hh:offset\b[^>]*\/>)/, `$1${tag}`);
+  return charPrXml.replace(/<\/hh:charPr>/, `${tag}</hh:charPr>`);
 }
 
 // Returns the uniform char style of `runs` when every text run shares the same
@@ -2332,15 +2345,21 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
   const charPrRe = /<hh:charPr\b[^>]*?(?:\/>|>(?:[^<]|<(?!\/hh:charPr>))*?<\/hh:charPr>)/g;
   const lookup = new Map();
   const lookupFull = new Map();
+  const charPrById = new Map();
+  let maxCharId = 0;
   for (const m of headerXml.matchAll(charPrRe)) {
     const s = m[0];
     const id = (/\bid="(\d+)"/.exec(s) || [])[1];
     if (!id) continue;
+    charPrById.set(id, s);
+    if (Number(id) > maxCharId) maxCharId = Number(id);
     const st = charPrStyleFromXml(s, faceById);
     const base = styleBaseKey(st);
     if (!lookup.has(base)) lookup.set(base, id);
     if (!lookupFull.has(`${base}:${st.font}`)) lookupFull.set(`${base}:${st.font}`, id);
   }
+  const headerSynth = [];
+  let nextCharId = maxCharId + 1;
 
   const pRe = /<hp:p\b[^>]*>[\s\S]*?<\/hp:p>/g;
   const regions = [];
@@ -2353,7 +2372,20 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
     const base = styleBaseKey(p);
     // Explicit font → match the charPr with that font; otherwise fall back to
     // the font-agnostic match (font-less styled paragraphs).
-    const targetId = (p.font && lookupFull.get(`${base}:${p.font}`)) || lookup.get(base);
+    let targetId = (p.font && lookupFull.get(`${base}:${p.font}`)) || lookup.get(base);
+    // Strike paragraph with no strikeout charPr (rhwp create-path) → synthesize
+    // from the non-strike equivalent (same as the mixed-run path).
+    if (!targetId && p.strike) {
+      const cb = styleBaseKey({ ...p, strike: false });
+      const coreId = (p.font && lookupFull.get(`${cb}:${p.font}`)) || lookup.get(cb);
+      if (coreId != null && charPrById.has(coreId)) {
+        targetId = String(nextCharId++);
+        const nx = injectStrikeout(charPrById.get(coreId).replace(/\bid="\d+"/, `id="${targetId}"`));
+        headerSynth.push(nx);
+        charPrById.set(targetId, nx);
+        lookup.set(base, targetId);
+      }
+    }
     if (!targetId) continue;
     const region = regions[p.paraIdx];
     const body = xml.slice(region.start, region.end);
@@ -2368,6 +2400,11 @@ async function patchHwpxBodyRunStyles(filePath, patches) {
 
   if (fixed > 0) {
     zip.file("Contents/section0.xml", xml);
+    if (headerSynth.length) {
+      let nh = headerXml.replace("</hh:charProperties>", headerSynth.join("") + "</hh:charProperties>");
+      nh = nh.replace(/(<hh:charProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + headerSynth.length) + b);
+      zip.file("Contents/header.xml", nh);
+    }
     fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
   }
   return fixed;
@@ -2398,15 +2435,21 @@ async function patchHwpxMixedRuns(filePath, patches) {
   const charPrRe = /<hh:charPr\b[^>]*?(?:\/>|>(?:[^<]|<(?!\/hh:charPr>))*?<\/hh:charPr>)/g;
   const lookup = new Map();
   const lookupFull = new Map();
+  const charPrById = new Map();
+  let maxCharId = 0;
   for (const m of headerXml.matchAll(charPrRe)) {
     const s = m[0];
     const id = (/\bid="(\d+)"/.exec(s) || [])[1];
     if (!id) continue;
+    charPrById.set(id, s);
+    if (Number(id) > maxCharId) maxCharId = Number(id);
     const st = charPrStyleFromXml(s, faceById);
     const base = styleBaseKey(st);
     if (!lookup.has(base)) lookup.set(base, id);
     if (!lookupFull.has(`${base}:${st.font}`)) lookupFull.set(`${base}:${st.font}`, id);
   }
+  const headerSynth = [];     // synthesized charPrs to append to header
+  let nextCharId = maxCharId + 1;
 
   const escXml = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const unescXml = (t) => t.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
@@ -2414,12 +2457,23 @@ async function patchHwpxMixedRuns(filePath, patches) {
     const base = styleBaseKey(sg);
     if (sg.font && lookupFull.has(`${base}:${sg.font}`)) return lookupFull.get(`${base}:${sg.font}`);
     if (lookup.has(base)) return lookup.get(base);
-    // Fallback: rhwp sometimes fails to emit a charPr for a rarely-used attr
-    // (e.g. strikethrough on the create path). Rather than abandon the WHOLE
-    // paragraph's re-split (which would lose bold/colour/highlight on every
-    // OTHER run too), drop the unmatched extras and match on the core
-    // size+weight+colour so the run keeps what IS available — only the
-    // un-emitted attribute is lost.
+    // Strike run: rhwp never emits a strikeout charPr on the create path, so
+    // synthesize one — clone the equivalent NON-strike charPr and inject the
+    // native <hh:strikeout shape="SOLID"> (GT reverse-engineered).
+    if (sg.strike) {
+      const cb = styleBaseKey({ ...sg, strike: false });
+      const coreId = (sg.font && lookupFull.get(`${cb}:${sg.font}`)) || lookup.get(cb);
+      if (coreId != null && charPrById.has(coreId)) {
+        const newId = String(nextCharId++);
+        const nx = injectStrikeout(charPrById.get(coreId).replace(/\bid="\d+"/, `id="${newId}"`));
+        headerSynth.push(nx);
+        charPrById.set(newId, nx);
+        lookup.set(base, newId);
+        return newId;
+      }
+    }
+    // Last-resort fallback: match the core size+weight+colour so the run keeps
+    // what IS available even if one attribute couldn't be resolved/synthesized.
     const core = styleBaseKey({ ...sg, strike: false, shade: "NONE", spacing: 0, ratio: 100 });
     if (lookup.has(core)) return lookup.get(core);
     return null;
@@ -2459,6 +2513,11 @@ async function patchHwpxMixedRuns(filePath, patches) {
 
   if (fixed > 0) {
     zip.file("Contents/section0.xml", xml);
+    if (headerSynth.length) {
+      let nh = headerXml.replace("</hh:charProperties>", headerSynth.join("") + "</hh:charProperties>");
+      nh = nh.replace(/(<hh:charProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + headerSynth.length) + b);
+      zip.file("Contents/header.xml", nh);
+    }
     fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
   }
   return fixed;
