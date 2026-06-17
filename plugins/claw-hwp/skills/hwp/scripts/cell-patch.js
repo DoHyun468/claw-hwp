@@ -5177,6 +5177,13 @@ function buildCharShapeBody(base, style) {
   const buf = Buffer.alloc(outSize);
   base.copy(buf, 0, 0, Math.min(base.length, outSize));
 
+  // face-ids: 7 WORDs at offset 0-13 (one per language slot). When a font is
+  // requested the caller resolves it to 7 face-ids via findOrCreateFaceNameIds
+  // and passes them here; otherwise the base's face-ids are inherited.
+  if (Array.isArray(style.faceIds) && style.faceIds.length === 7) {
+    for (let i = 0; i < 7; i++) buf.writeUInt16LE(style.faceIds[i] & 0xffff, i * 2);
+  }
+
   // attr u32 at offset 46 — start from base, clear managed bits, then OR
   // requested flags. This way unmanaged fields (outline / shadow /
   // emboss / engrave / emphasis_dot / kerning) inherited from base are
@@ -5292,6 +5299,84 @@ function appendCharShapeToDocInfo(diRaw, body) {
   const oldCount = newDi.readUInt32LE(off);
   newDi.writeUInt32LE(oldCount + 1, off);
   return { newDi, newCsId: csCount };
+}
+
+// ── Font (글꼴) registration for raw-patch text styling ────────────────────
+// HWP keeps fonts in a DocInfo FACE_NAME table grouped by 7 language slots
+// (Korean, Latin, Hanja, Japanese, Other, Symbol, User), stored contiguously
+// slot-by-slot. A CHAR_SHAPE carries 7 face-ids (one per slot) indexing into
+// each slot's sub-list. To apply an arbitrary font we register it in every
+// slot (so every script renders in it) and point the new CHAR_SHAPE's 7
+// face-ids at it. ID_MAPPINGS holds the per-slot font counts at array indices
+// 1..7 (right after BIN_DATA at index 0).
+const TAG_FACE_NAME = 0x13;
+const ID_MAPPINGS_FACE_NAME_OFFSET = 1 * 4; // first (Korean) FACE_NAME count
+
+// Minimal FACE_NAME record body: attribute=0 (no substitute / type / base
+// font) + nameLen(WORD, in WCHARs) + UTF-16LE name. Valid for any installed
+// font — Hancom renders by name; the optional substitute font only matters
+// when the face is absent on the rendering system.
+function buildFaceNameBody(name) {
+  const nm = Buffer.from(name, 'utf16le');
+  const body = Buffer.alloc(3 + nm.length);
+  body.writeUInt8(0, 0);
+  body.writeUInt16LE(name.length, 1);
+  nm.copy(body, 3);
+  return body;
+}
+
+// Ensure `fontName` exists in all 7 FACE_NAME language slots; returns the
+// updated DocInfo buffer and the 7 face-ids to write into a CHAR_SHAPE.
+function findOrCreateFaceNameIds(diRaw, fontName) {
+  let idMapOff = -1;
+  for (const r of walkRecords(diRaw)) { if (r.tag === TAG_ID_MAPPINGS) { idMapOff = r.dataOff; break; } }
+  if (idMapOff < 0) throw new Error('apply_text_style(font): HWPTAG_ID_MAPPINGS not found');
+  const counts = [];
+  for (let i = 0; i < 7; i++) counts.push(diRaw.readUInt32LE(idMapOff + ID_MAPPINGS_FACE_NAME_OFFSET + i * 4));
+
+  const faces = [];
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === TAG_FACE_NAME) {
+      const len = diRaw.readUInt16LE(r.dataOff + 1);
+      faces.push({ name: diRaw.slice(r.dataOff + 3, r.dataOff + 3 + len * 2).toString('utf16le'), headOff: r.headOff, endOff: r.dataOff + r.size });
+    }
+  }
+  if (faces.length === 0) throw new Error('apply_text_style(font): no FACE_NAME records in DocInfo');
+
+  // Per-slot insert offset (end of slot's run) and current font names.
+  const faceIds = new Array(7);
+  const inserts = [];
+  let i = 0;
+  let prevEnd = faces[0].headOff;
+  for (let s = 0; s < 7; s++) {
+    const cnt = counts[s];
+    const slot = faces.slice(i, i + cnt);
+    const insOff = cnt > 0 ? slot[slot.length - 1].endOff : prevEnd;
+    const existing = slot.findIndex((f) => f.name === fontName);
+    if (existing >= 0) {
+      faceIds[s] = existing;
+    } else {
+      faceIds[s] = cnt;
+      const body = buildFaceNameBody(fontName);
+      inserts.push({ offset: insOff, bytes: Buffer.concat([buildRecordHeader(TAG_FACE_NAME, 0, body.length), body]), slot: s });
+    }
+    if (cnt > 0) prevEnd = slot[slot.length - 1].endOff;
+    i += cnt;
+  }
+  if (inserts.length === 0) return { newDi: diRaw, faceIds };
+
+  // Splice in descending offset order so earlier offsets stay valid.
+  let out = diRaw;
+  for (const ins of [...inserts].sort((a, b) => b.offset - a.offset)) {
+    out = Buffer.concat([out.slice(0, ins.offset), ins.bytes, out.slice(ins.offset)]);
+  }
+  // Bump per-slot ID_MAPPINGS counts (ID_MAPPINGS precedes FACE_NAME, so its
+  // offset is unaffected by the splices above).
+  for (const ins of inserts) {
+    const off = idMapOff + ID_MAPPINGS_FACE_NAME_OFFSET + ins.slot * 4;
+    out.writeUInt32LE(out.readUInt32LE(off) + 1, off);
+  }
+  return { newDi: out, faceIds };
 }
 
 // Locate the target string in Section0 raw. Returns the FIRST occurrence:
@@ -5586,14 +5671,26 @@ export async function applyTextStyleInPlace(filePath, ops) {
 
     // Determine base CharShape (the one active at the target start).
     const baseCsId = csIdAtOffset(hit.paraCharShapeRec, secRaw, hit.start);
+
+    // Font: register the requested face in DocInfo's FACE_NAME table (every
+    // language slot) and resolve it to 7 face-ids for the new CharShape. This
+    // mutates diRaw, so it must run before readCharShapeBodies below.
+    const fontName = op.font_family || op.fontFamily || op.font;
+    let faceIds = null;
+    if (typeof fontName === 'string' && fontName.length > 0) {
+      const fr = findOrCreateFaceNameIds(diRaw, fontName);
+      diRaw = fr.newDi;
+      faceIds = fr.faceIds;
+    }
+
     const csBodies = readCharShapeBodies(diRaw);
     if (baseCsId >= csBodies.length) {
       throw new Error(`apply_text_style: base csId ${baseCsId} out of range (have ${csBodies.length})`);
     }
-    // Build new CharShape from base + style overlay.
-    // Apply size=pt → fontSize, font_family handling (Phase B v1: defer fontId resolution).
+    // Build new CharShape from base + style overlay (incl. resolved font face-ids).
     const styleInput = { ...op };
     if (op.size != null && styleInput.fontSize == null) styleInput.fontSize = op.size;
+    if (faceIds) styleInput.faceIds = faceIds;
     const newBody = buildCharShapeBody(csBodies[baseCsId], styleInput);
 
     // Dedup: if a CharShape with identical body already exists, reuse it.
