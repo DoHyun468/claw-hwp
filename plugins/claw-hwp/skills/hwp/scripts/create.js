@@ -2265,6 +2265,10 @@ async function readStdin() {
   // alignment references an existing matching para_shape, no DocInfo write).
   // See cell-patch.js insertPageNumberInPlace.
   const PAGENUM_OPS = new Set(['insert_page_number']);
+  // 스타일 적용 (raw-patch — repoint a paragraph's style + para_shape to a
+  // named style; length-preserving, no DocInfo write). See cell-patch.js
+  // applyNamedStyleInPlace.
+  const STYLE_OPS = new Set(['apply_style']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2294,7 +2298,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...STYLE_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2578,6 +2582,13 @@ async function readStdin() {
         const pnSummary = await insertPageNumberInPlace(outPath, pageNumOps);
         subModes.push(`page_number:${pnSummary.mode || 'in-place'}`);
         for (const e of pnSummary) allEdits.push({ kind: 'page_number', ...e });
+      }
+      const styleOps = ops.filter((o) => STYLE_OPS.has(o.type));
+      if (styleOps.length > 0) {
+        const { applyNamedStyleInPlace } = await import('./cell-patch.js');
+        const stSummary = await applyNamedStyleInPlace(outPath, styleOps);
+        subModes.push(`apply_style:${stSummary.mode || 'in-place'}`);
+        for (const e of stSummary) allEdits.push({ kind: 'apply_style', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

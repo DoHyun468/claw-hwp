@@ -2984,8 +2984,9 @@ const NOTE_AUTONUM_HEX     = '12006f6e746100000000000000001200'; // 0x0012 + 'on
 
 const TAG_STYLE_DI = 0x1a;  // HWPTAG_STYLE in DocInfo
 
-// Read a named style (e.g. "Footnote" / "Endnote"): its index (0-based among
-// STYLE records) plus the para_shape and char_shape ids it references.
+// Read a named style by its Korean OR English name: its index (0-based among
+// STYLE records) plus the para_shape and char_shape ids it references. The
+// returned `found` flag distinguishes a real match from the {0,0,0} fallback.
 function resolveNoteStyle(buf, styleName) {
   const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
   let sidx = 0;
@@ -2993,17 +2994,138 @@ function resolveNoteStyle(buf, styleName) {
     if (r.tag !== TAG_STYLE_DI) continue;
     const sb = di.slice(r.dataOff, r.dataOff + r.size);
     const nlen = sb.readUInt16LE(0);
-    let off = 2 + nlen * 2;
+    let off = 2;
+    const kor = sb.slice(off, off + nlen * 2).toString('utf16le'); off += nlen * 2;
     const elen = sb.readUInt16LE(off); off += 2;
     const eng = sb.slice(off, off + elen * 2).toString('utf16le'); off += elen * 2;
     // off → prop(u8) next(u8) lang(u16) paraShape(u16) charShape(u16)
-    if (eng === styleName) {
-      return { index: sidx, paraShape: sb.readUInt16LE(off + 4), charShape: sb.readUInt16LE(off + 6) };
+    if (eng === styleName || kor === styleName) {
+      return { index: sidx, paraShape: sb.readUInt16LE(off + 4), charShape: sb.readUInt16LE(off + 6), found: true };
     }
     sidx++;
   }
-  // Fallback: no such named style (very unusual) — use style 0 / shape 0.
-  return { index: 0, paraShape: 0, charShape: 0 };
+  // Fallback: no such named style — use style 0 / shape 0.
+  return { index: 0, paraShape: 0, charShape: 0, found: false };
+}
+
+// List every style's (korean, english) names — used to report choices when a
+// requested style name isn't found.
+function listStyleNames(buf) {
+  const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
+  const names = [];
+  for (const r of parseRecords(di)) {
+    if (r.tag !== TAG_STYLE_DI) continue;
+    const sb = di.slice(r.dataOff, r.dataOff + r.size);
+    const nlen = sb.readUInt16LE(0);
+    const kor = sb.slice(2, 2 + nlen * 2).toString('utf16le');
+    const elen = sb.readUInt16LE(2 + nlen * 2);
+    const eng = sb.slice(4 + nlen * 2, 4 + nlen * 2 + elen * 2).toString('utf16le');
+    names.push(kor || eng);
+  }
+  return names;
+}
+
+// Apply a named paragraph style to the paragraph containing `anchor`. This is
+// a length-preserving PARA_HEADER edit: style id (offset 10) and para_shape id
+// (offset 8) are repointed to the resolved style. Character shapes are left
+// as-is (matching Hancom's 스타일 combo, which sets paragraph-level style only).
+export async function applyNamedStyleInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', applied_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('apply_style: an "anchor" string is required');
+    if (!op.style || typeof op.style !== 'string') throw new Error('apply_style: a "style" name is required');
+    const style = resolveNoteStyle(buf, op.style);
+    if (!style.found) {
+      throw new Error(`apply_style: style not found: ${JSON.stringify(op.style)} (available: ${listStyleNames(buf).join(', ')})`);
+    }
+    const records = parseRecords(raw);
+    const clusters = findClusterBoundaries(records);
+    let phRec = null;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag === TAG_PARA_TEXT && r.level === 1 &&
+            raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf) !== -1) {
+          phRec = records[c.startIdx]; break;
+        }
+      }
+      if (phRec) break;
+    }
+    if (!phRec) throw new Error(`apply_style: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    // Length-preserving: para_shape id @8 (u16), style id @10 (u8).
+    raw.writeUInt16LE(style.paraShape & 0xFFFF, phRec.dataOff + 8);
+    raw.writeUInt8(style.index & 0xFF, phRec.dataOff + 10);
+    summary.push({ section: 0, anchor: op.anchor, style: op.style, style_index: style.index });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.applied_count = summary.length;
+  return result;
 }
 
 // Build a note (footnote/endnote) content cluster (6 records).
