@@ -7274,6 +7274,14 @@ const COMP_HATCH_STYLE_OFF = 221; // fill pattern (hatch) style, u32 (0xFFFFFFFF
 const FILL_PATTERN = {
   horizontal: 0, vertical: 1, 'down-diagonal': 2, 'up-diagonal': 3, grid: 4, cross: 5,
 };
+// Line arrow endpoints (선 끝모양). GT-confirmed on a Hancom-native line: head
+// style @205, tail style @206 (enum), and a flag byte @207 whose 0x10 bit = "has
+// arrow". none 0 / triangle 1 / line 2 / sharp 3 / diamond 4 / circle 5 / square 6.
+// (Arrows are a line/connector property — Hancom ignores them on closed shapes.)
+const COMP_ARROW_HEAD_OFF = 205;
+const COMP_ARROW_TAIL_OFF = 206;
+const COMP_ARROW_FLAG_OFF = 207;
+const ARROW_STYLE = { none: 0, triangle: 1, line: 2, sharp: 3, diamond: 4, circle: 5, square: 6 };
 
 // Each drawing object = its gso CTRL_HEADER + the SHAPE_COMPONENT (0x4c) that
 // immediately follows it (holds the inline fill/line).
@@ -7304,8 +7312,14 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
     if ((op.section ?? 0) !== 0) throw new Error(`set_object_property: only section 0 is supported (got ${op.section})`);
     const has = op.fill != null || op.border_color != null || op.border_width_mm != null
       || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null
-      || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null;
-    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / border_type / fill_pattern / margins / margin_mm / wrap / fill_transparency is required');
+      || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null
+      || op.arrow_start != null || op.arrow_end != null;
+    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / border_type / fill_pattern / arrow_start / arrow_end / margins / margin_mm / wrap / fill_transparency is required');
+    for (const k of ['arrow_start', 'arrow_end']) {
+      if (op[k] != null && ARROW_STYLE[String(op[k]).toLowerCase()] == null) {
+        throw new Error(`set_object_property: ${k} must be one of ${Object.keys(ARROW_STYLE).join(' / ')}`);
+      }
+    }
     if (op.fill_transparency != null && (op.fill_transparency < 0 || op.fill_transparency > 100)) {
       throw new Error('set_object_property: fill_transparency must be 0-100');
     }
@@ -7377,8 +7391,24 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
       rec.wrap = String(op.wrap).toLowerCase();
     }
     if (op.fill != null || op.border_color != null || op.border_width_mm != null
-        || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null) {
+        || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null
+        || op.arrow_start != null || op.arrow_end != null) {
       if (!comp) throw new Error(`set_object_property: no SHAPE_COMPONENT for object ${idx} (fill/border need a shape)`);
+      if (op.arrow_start != null) {
+        secRaw.writeUInt8(ARROW_STYLE[String(op.arrow_start).toLowerCase()], comp.dataOff + COMP_ARROW_HEAD_OFF);
+        rec.arrow_start = String(op.arrow_start).toLowerCase();
+      }
+      if (op.arrow_end != null) {
+        secRaw.writeUInt8(ARROW_STYLE[String(op.arrow_end).toLowerCase()], comp.dataOff + COMP_ARROW_TAIL_OFF);
+        rec.arrow_end = String(op.arrow_end).toLowerCase();
+      }
+      if (op.arrow_start != null || op.arrow_end != null) {
+        const head = secRaw.readUInt8(comp.dataOff + COMP_ARROW_HEAD_OFF);
+        const tail = secRaw.readUInt8(comp.dataOff + COMP_ARROW_TAIL_OFF);
+        let flag = secRaw.readUInt8(comp.dataOff + COMP_ARROW_FLAG_OFF);
+        flag = (head || tail) ? (flag | 0x10) : (flag & ~0x10);
+        secRaw.writeUInt8(flag & 0xFF, comp.dataOff + COMP_ARROW_FLAG_OFF);
+      }
       if (op.border_type != null) {
         secRaw.writeUInt8(BORDER_TYPE[String(op.border_type).toLowerCase()], comp.dataOff + COMP_BORDER_TYPE_OFF);
         rec.border_type = String(op.border_type).toLowerCase();
