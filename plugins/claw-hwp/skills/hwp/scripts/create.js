@@ -2232,6 +2232,9 @@ async function readStdin() {
   // Table-level properties (outer margin) via raw-patch — patches the table
   // CTRL_HEADER " lbt" directly (no DocInfo change). See applyTablePropertyInPlace.
   const TABLE_PROP_OPS = new Set(['set_table_property']);
+  // Drawing-object (shape/image) properties (fill / border / outer margin) via
+  // raw-patch — patches the gso CTRL_HEADER + SHAPE_COMPONENT. See applyObjectPropertyInPlace.
+  const OBJECT_PROP_OPS = new Set(['set_object_property']);
   // Table structure: merge a rectangular block of cells (raw-patch — sets the
   // top-left cell's span, deletes the absorbed cell clusters, fixes the TABLE
   // row-size array). See cell-patch.js mergeCellsInPlace.
@@ -2333,7 +2336,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2540,6 +2543,13 @@ async function readStdin() {
         const tpSummary = await applyTablePropertyInPlace(outPath, tablePropOps);
         subModes.push(`table_prop:${tpSummary.mode || 'in-place'}`);
         for (const e of tpSummary) allEdits.push({ kind: 'table_prop', ...e });
+      }
+      const objectPropOps = ops.filter((o) => OBJECT_PROP_OPS.has(o.type));
+      if (objectPropOps.length > 0) {
+        const { applyObjectPropertyInPlace } = await import('./cell-patch.js');
+        const opSummary = await applyObjectPropertyInPlace(outPath, objectPropOps);
+        subModes.push(`object_prop:${opSummary.mode || 'in-place'}`);
+        for (const e of opSummary) allEdits.push({ kind: 'object_prop', ...e });
       }
       const mergeOps = ops.filter((o) => MERGE_OPS.has(o.type));
       if (mergeOps.length > 0) {

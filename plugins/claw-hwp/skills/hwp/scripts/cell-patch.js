@@ -7236,6 +7236,161 @@ export async function applyTablePropertyInPlace(filePath, ops) {
   return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
 }
 
+// ── 객체(그림/도형) 속성 (object fill / border / outer margin) raw-patch ────
+//
+// GT-first (claw-hancomdocs object-prop --fill/--border/--border-width/--margin
+// on a gso shape, downloaded as .hwp and diffed vs a round-trip baseline). A
+// drawing object = a gso CTRL_HEADER (ctrl_id ' osg' = "gso " reversed, a
+// CommonObjAttr like the table's ' lbt') followed by a SHAPE_COMPONENT (0x4c)
+// that carries the inline fill + line. GT-confirmed offsets:
+//   gso CTRL_HEADER  off 28-35 = outer margin, 4× u16 L/R/T/B HWPUNIT (same
+//                                layout as the table outer margin)
+//   SHAPE_COMPONENT  off 196 = border (line) color, u32 BGR (0x00BBGGRR)
+//                    off 200 = border (line) width, u16 HWPUNIT
+//                    off 213 = fill color, u32 BGR
+// Verified: --fill #FF0000 → 0x000000FF @213, --border #0000FF → 0x00FF0000
+// @196, --border-width 2mm → 566 @200, --margin 4mm → 1133×4 @28. Section 0 only.
+//
+// Each op: { object_index?, fill?, border_color?, border_width_mm?,
+//            margins?:[l,r,t,b] | margin_mm? }.
+const GSO_CTRL_ID = ' osg'; // "gso " stored reversed (little-endian ctrl_id)
+const GSO_OUTMARGIN_OFF = 28;
+const COMP_BORDER_COLOR_OFF = 196;
+const COMP_BORDER_WIDTH_OFF = 200;
+const COMP_FILL_OFF = 213;
+
+// Each drawing object = its gso CTRL_HEADER + the SHAPE_COMPONENT (0x4c) that
+// immediately follows it (holds the inline fill/line).
+function findGsoObjects(records, secRaw) {
+  const out = [];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1 && r.size >= GSO_OUTMARGIN_OFF + 8
+        && secRaw.slice(r.dataOff, r.dataOff + 4).toString('latin1') === GSO_CTRL_ID) {
+      let comp = null;
+      for (let j = i + 1; j < records.length; j++) {
+        const rj = records[j];
+        if (rj.tag === TAG_PARA_HEADER && rj.level === 0) break;
+        if (rj.tag === TAG_CTRL_HEADER && rj.level === 1) break;
+        if (rj.tag === TAG_SHAPE_COMPONENT) { comp = rj; break; }
+      }
+      out.push({ ctrl: r, comp });
+    }
+  }
+  return out;
+}
+
+export async function applyObjectPropertyInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`set_object_property: only section 0 is supported (got ${op.section})`);
+    const has = op.fill != null || op.border_color != null || op.border_width_mm != null
+      || Array.isArray(op.margins) || op.margin_mm != null;
+    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / margins / margin_mm is required');
+    if (Array.isArray(op.margins) && op.margins.length !== 4) {
+      throw new Error('set_object_property: margins must be [left,right,top,bottom] (4 values, mm)');
+    }
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const mm = (v) => Math.round(v * HWPUNIT_PER_MM);
+  const summary = [];
+  for (const op of ops) {
+    const records = parseRecords(secRaw);
+    const objs = findGsoObjects(records, secRaw);
+    const idx = op.object_index ?? 0;
+    if (idx < 0 || idx >= objs.length) {
+      throw new Error(`set_object_property: object_index ${idx} out of range (found ${objs.length} drawing object(s))`);
+    }
+    const { ctrl, comp } = objs[idx];
+    const rec = { op: 'set_object_property', object_index: idx };
+    if (Array.isArray(op.margins) || op.margin_mm != null) {
+      const margins = Array.isArray(op.margins)
+        ? op.margins
+        : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
+      for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, ctrl.dataOff + GSO_OUTMARGIN_OFF + i * 2);
+      rec.margins_mm = margins;
+    }
+    if (op.fill != null || op.border_color != null || op.border_width_mm != null) {
+      if (!comp) throw new Error(`set_object_property: no SHAPE_COMPONENT for object ${idx} (fill/border need a shape)`);
+      if (op.fill != null && op.fill !== 'none') {
+        secRaw.writeUInt32LE(parseColorBGR(op.fill) >>> 0, comp.dataOff + COMP_FILL_OFF);
+        rec.fill = op.fill;
+      }
+      if (op.border_color != null) {
+        secRaw.writeUInt32LE(parseColorBGR(op.border_color) >>> 0, comp.dataOff + COMP_BORDER_COLOR_OFF);
+        rec.border_color = op.border_color;
+      }
+      if (op.border_width_mm != null) {
+        secRaw.writeUInt16LE(mm(op.border_width_mm) & 0xFFFF, comp.dataOff + COMP_BORDER_WIDTH_OFF);
+        rec.border_width_mm = op.border_width_mm;
+      }
+    }
+    summary.push(rec);
+  }
+
+  // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
+}
+
 // ── 셀 너비/높이 같게 (equalize table columns / rows) raw-patch ────────────
 //
 // GT-first (eqw_1row.hwp, table-op equal-width on a single-row table): making
