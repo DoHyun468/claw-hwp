@@ -1610,6 +1610,12 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
       if (typeof op.label !== 'string' || op.label.length === 0) {
         throw new Error("set_cell_text_by_label: 'label' is required");
       }
+      // When NO offset is given, auto-target the value cell right after the label
+      // (col + the label cell's colSpan) — so "set_cell_text_by_label(상호, …)"
+      // fills the empty cell next to 상호 instead of overwriting the label, and a
+      // label that spans 2 cols (대표자 c6-7) still lands on c8. Pass an explicit
+      // col_offset/row_offset (incl. 0 to overwrite the label cell) to override.
+      const autoTarget = (op.row_offset == null && op.col_offset == null);
       const rowOff = op.row_offset ?? 0;
       const colOff = op.col_offset ?? 0;
       const occurrence = op.occurrence ?? 0;
@@ -1641,7 +1647,9 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
       const hit = hits[occurrence];
       out.push({
         section: hit.sec, para: hit.para, control: hit.ctrl,
-        row: hit.cell.row + rowOff, col: hit.cell.col + colOff, text,
+        row: hit.cell.row + (autoTarget ? 0 : rowOff),
+        col: hit.cell.col + (autoTarget ? (hit.cell.colSpan ?? 1) : colOff),
+        text,
       });
     }
     return out;
