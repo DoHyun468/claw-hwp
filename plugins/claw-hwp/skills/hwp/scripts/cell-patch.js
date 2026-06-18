@@ -7258,6 +7258,7 @@ const GSO_OUTMARGIN_OFF = 28;
 const COMP_BORDER_COLOR_OFF = 196;
 const COMP_BORDER_WIDTH_OFF = 200;
 const COMP_FILL_OFF = 213;
+const COMP_FILL_ALPHA_OFF = 229; // fill transparency: alpha byte = round(t% × 255/100)
 
 // Each drawing object = its gso CTRL_HEADER + the SHAPE_COMPONENT (0x4c) that
 // immediately follows it (holds the inline fill/line).
@@ -7287,8 +7288,11 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
   for (const op of ops) {
     if ((op.section ?? 0) !== 0) throw new Error(`set_object_property: only section 0 is supported (got ${op.section})`);
     const has = op.fill != null || op.border_color != null || op.border_width_mm != null
-      || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null;
-    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / margins / margin_mm / wrap is required');
+      || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null || op.fill_transparency != null;
+    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / margins / margin_mm / wrap / fill_transparency is required');
+    if (op.fill_transparency != null && (op.fill_transparency < 0 || op.fill_transparency > 100)) {
+      throw new Error('set_object_property: fill_transparency must be 0-100');
+    }
     if (Array.isArray(op.margins) && op.margins.length !== 4) {
       throw new Error('set_object_property: margins must be [left,right,top,bottom] (4 values, mm)');
     }
@@ -7350,7 +7354,7 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
       secRaw.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | bits) >>> 0, ctrl.dataOff + 4);
       rec.wrap = String(op.wrap).toLowerCase();
     }
-    if (op.fill != null || op.border_color != null || op.border_width_mm != null) {
+    if (op.fill != null || op.border_color != null || op.border_width_mm != null || op.fill_transparency != null) {
       if (!comp) throw new Error(`set_object_property: no SHAPE_COMPONENT for object ${idx} (fill/border need a shape)`);
       if (op.fill != null && op.fill !== 'none') {
         secRaw.writeUInt32LE(parseColorBGR(op.fill) >>> 0, comp.dataOff + COMP_FILL_OFF);
@@ -7363,6 +7367,12 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
       if (op.border_width_mm != null) {
         secRaw.writeUInt16LE(mm(op.border_width_mm) & 0xFFFF, comp.dataOff + COMP_BORDER_WIDTH_OFF);
         rec.border_width_mm = op.border_width_mm;
+      }
+      // Fill transparency (0-100%): alpha byte = round(t × 255/100). GT-confirmed
+      // (--fill-transparency 60 → 153 @229). 0 = opaque.
+      if (op.fill_transparency != null) {
+        secRaw.writeUInt8(Math.round(op.fill_transparency * 255 / 100) & 0xFF, comp.dataOff + COMP_FILL_ALPHA_OFF);
+        rec.fill_transparency = op.fill_transparency;
       }
     }
     summary.push(rec);
