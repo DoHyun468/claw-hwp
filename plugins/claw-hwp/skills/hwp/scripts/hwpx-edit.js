@@ -1724,7 +1724,11 @@ function opSetCellMargin(doc, tableIndex, row, col, opts) {
       const cm = cur ? applyMm(cur, want)
         : `<hp:cellMargin left="${want.left ?? 0}" right="${want.right ?? 0}" top="${want.top ?? 0}" bottom="${want.bottom ?? 0}"/>`;
       const tcInner = cur ? tc.inner.replace(cur, cm) : tc.inner + cm;   // append after cellSz if absent
-      trInner = spliceEl(trInner, tc, `<hp:tc${tc.attrs}>${tcInner}</hp:tc>`);
+      // hasMargin="1" tells Hancom to use THIS cell's cellMargin; hasMargin="0"
+      // (the default) makes the cell ignore its cellMargin and inherit the table's
+      // inMargin — so without this the per-cell margin is silently dropped on render.
+      const tcAttrs = setOrAddAttr(tc.attrs, 'hasMargin', '1');
+      trInner = spliceEl(trInner, tc, `<hp:tc${tcAttrs}>${tcInner}</hp:tc>`);
       touched++;
     }
     inner = spliceEl(inner, tr, `<hp:tr${tr.attrs}>${trInner}</hp:tr>`);

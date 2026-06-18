@@ -3546,13 +3546,23 @@ async function readStdin() {
     }
   }
 
-  // Layout-cache strip removed (was Hancom-Docs-incompatible via sheetjs
-  // CFB.write inside stripHwpLayoutCache). Hop's save flow does not strip
-  // either — `tauri-bridge.ts:writeCurrentHwpToPath` writes
-  // `super.exportHwp()` verbatim. The PARA_LINESEG / <hp:linesegarray>
-  // placeholder values rhwp emits still cause our local renderer to
-  // mis-place text occasionally, but that's a renderer concern not a
-  // save-path one. See CLAUDE.md for the principle.
+  // Strip rhwp's <hp:linesegarray> layout cache from .hwpx sections. rhwp pre-fills
+  // cached line positions (placeholder vertpos/vertsize, e.g. table-cell paras get
+  // vertsize=1000 + a garbage cellSz width="1"). Hancom web TRUSTS that cache for
+  // the first render and pins text to it — which is why a cell's <hp:cellMargin>
+  // (셀 안 여백) was stored but NOT shown (GT debug 2026-06-18: Hancom-native tables
+  // carry NO linesegarray and DO render cellMargin; our rhwp tables carried it and
+  // didn't). Stripping it makes Hancom recompute layout from paraPr/cell props on
+  // open — exactly what Hancom does on its own save. .hwpx only (pure XML); the .hwp
+  // CFB variant stays disabled (sheetjs CFB.write was Hancom-Docs-incompatible).
+  if (ext === ".hwpx") {
+    try {
+      const n = await stripHwpxLayoutCache(outPath);
+      if (n > 0) log.push(`hwpx_patch: stripped ${n} linesegarray layout-cache block(s)`);
+    } catch (err) {
+      log.push(`hwpx_layoutcache_strip failed: ${err.message}`);
+    }
+  }
 
   let verify = null;
   try {
