@@ -916,6 +916,22 @@ function opInsertTable(doc, index, rows, cols, cells) {
     tblMeta = FALLBACK_TBL_META;
   }
 
+  // Size the new table to fit the page. Cloning a source table inherits its
+  // per-cell width, which OVERFLOWS when the new table has more columns than the
+  // source (GT 2026-06-18: a 4-col table cloning a 3-col table's 56mm cells →
+  // 4×56 = 224mm cellSz-sum vs a 168mm <hp:sz> → inconsistent, so Hancom uses the
+  // sum and runs off the page). Rescale every column to an equal width that fits
+  // min(source table width, page text width), and make <hp:sz> match the sum so
+  // column widths and table width stay consistent.
+  {
+    const pageW = pageTextWidth(doc, srcSection);
+    const szM = tblMeta.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/);
+    const srcTableW = szM && Number(szM[1]) > 0 ? Number(szM[1]) : pageW;
+    const cellW = Math.max(1, Math.round(Math.min(srcTableW, pageW) / cols));
+    cellTemplateInner = cellTemplateInner.replace(/(<hp:cellSz\b[^>]*\bwidth=")\d+(")/, `$1${cellW}$2`);
+    tblMeta = tblMeta.replace(/(<hp:sz\b[^>]*\bwidth=")\d+(")/, `$1${cellW * cols}$2`);
+  }
+
   const cellTemplate = { attrs: cellTemplateAttrs, inner: cellTemplateInner };
   const templateRow = { attrs: templateRowAttrs };
 
@@ -2945,6 +2961,23 @@ function buildPic(doc, itemId, width, height) {
         // Don't inherit the template pic's caption — a fresh image has none, and
         // Hancom Docs rejects a stray caption cloned onto a new pic.
         .replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, '');
+      // Heal orgSz/imgDim=0 (rhwp/external pics ship 0 → Hancom renders nothing).
+      // Natural size from the cloned pic's imgClip, else its curSz.
+      const clip = pic.match(/<hp:imgClip\b[^>]*\bright="(\d+)"[^>]*\bbottom="(\d+)"/);
+      const cur = pic.match(/<hp:curSz\b[^>]*\bwidth="(\d+)"[^>]*\bheight="(\d+)"/);
+      const natW = clip ? clip[1] : (cur && cur[1] !== '0' ? cur[1] : (width || 28350));
+      const natH = clip ? clip[2] : (cur && cur[2] !== '0' ? cur[2] : (height || 28350));
+      pic = pic
+        .replace(/<hp:orgSz\s+width="0"\s+height="0"\s*\/>/, `<hp:orgSz width="${natW}" height="${natH}"/>`)
+        .replace(/<hp:imgDim\s+dimwidth="0"\s+dimheight="0"\s*\/>/, `<hp:imgDim dimwidth="${natW}" dimheight="${natH}"/>`);
+      // Honor the requested display size (the cloned source's curSz/sz would
+      // otherwise win, ignoring the caller's width/height).
+      if (width && height) {
+        pic = pic
+          .replace(/<hp:curSz\b[^>]*\/>/, `<hp:curSz width="${width}" height="${height}"/>`)
+          .replace(/<hp:imgRect>[\s\S]*?<\/hp:imgRect>/, `<hp:imgRect><hc:pt0 x="0" y="0"/><hc:pt1 x="${width}" y="0"/><hc:pt2 x="${width}" y="${height}"/><hc:pt3 x="0" y="${height}"/></hp:imgRect>`)
+          .replace(/(<hp:sz\b[^>]*\bwidth=")\d+("[^>]*\bheight=")\d+/, `$1${width}$2${height}`);
+      }
       return pic;
     }
   }

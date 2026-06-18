@@ -2148,6 +2148,26 @@ async function patchHwpxPictures(filePath, patches) {
         `<hp:run charPrIDRef="${charPrIDRef}">${picXml}<hp:t/></hp:run>`,
     );
     if (newBody === body) {
+      // Newer rhwp serializers emit a native <hp:pic> in the paragraph instead
+      // of leaving an empty-text run (the pattern above). That native pic ships
+      // with <hp:orgSz width="0" height="0"/> (and sometimes imgDim 0) — Hancom
+      // renders nothing when the original size is 0 (invisible), so we patch it
+      // in place rather than failing. Natural size comes from the pic's own
+      // imgClip (the source pixel rect in HWPUNIT), falling back to curSz then
+      // the requested display size.
+      if (/<hp:pic\b/.test(body)) {
+        const clip = body.match(/<hp:imgClip\b[^>]*\bright="(\d+)"[^>]*\bbottom="(\d+)"/);
+        const cur = body.match(/<hp:curSz\b[^>]*\bwidth="(\d+)"[^>]*\bheight="(\d+)"/);
+        const natW = clip ? clip[1] : (cur && cur[1] !== "0" ? cur[1] : p.widthHwp);
+        const natH = clip ? clip[2] : (cur && cur[2] !== "0" ? cur[2] : p.heightHwp);
+        const fixed = body
+          .replace(/<hp:orgSz\s+width="0"\s+height="0"\s*\/>/g, `<hp:orgSz width="${natW}" height="${natH}"/>`)
+          .replace(/<hp:imgDim\s+dimwidth="0"\s+dimheight="0"\s*\/>/g, `<hp:imgDim dimwidth="${natW}" dimheight="${natH}"/>`);
+        xml = before + fixed + after;
+        // ok either way: pic exists; isEmbeded manifest fix (above) still applies.
+        applied.unshift({ ok: true, paraIdx: p.paraIdx, nativePicPatched: fixed !== body });
+        continue;
+      }
       applied.unshift({ ok: false, reason: `empty-run pattern not found at paraIdx ${p.paraIdx}` });
       continue;
     }
