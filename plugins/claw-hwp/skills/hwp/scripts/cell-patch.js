@@ -7259,6 +7259,14 @@ const COMP_BORDER_COLOR_OFF = 196;
 const COMP_BORDER_WIDTH_OFF = 200;
 const COMP_FILL_OFF = 213;
 const COMP_FILL_ALPHA_OFF = 229; // fill transparency: alpha byte = round(t% × 255/100)
+const COMP_BORDER_TYPE_OFF = 204; // line style byte = 0x40 | enum
+// GT-confirmed (object-prop --border-type, .hwp download). claw-hancomdocs already
+// corrects Hancom's UI dash↔dot combo swap, so these are the standard values —
+// no swap needed here.
+const BORDER_TYPE = {
+  solid: 0x41, dotted: 0x42, dashed: 0x43, 'dash-dot': 0x44,
+  'dash-dot-dot': 0x45, 'long-dash': 0x46, 'circle-dot': 0x47, double: 0x48,
+};
 
 // Each drawing object = its gso CTRL_HEADER + the SHAPE_COMPONENT (0x4c) that
 // immediately follows it (holds the inline fill/line).
@@ -7288,10 +7296,14 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
   for (const op of ops) {
     if ((op.section ?? 0) !== 0) throw new Error(`set_object_property: only section 0 is supported (got ${op.section})`);
     const has = op.fill != null || op.border_color != null || op.border_width_mm != null
-      || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null || op.fill_transparency != null;
-    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / margins / margin_mm / wrap / fill_transparency is required');
+      || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null
+      || op.fill_transparency != null || op.border_type != null;
+    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / border_type / margins / margin_mm / wrap / fill_transparency is required');
     if (op.fill_transparency != null && (op.fill_transparency < 0 || op.fill_transparency > 100)) {
       throw new Error('set_object_property: fill_transparency must be 0-100');
+    }
+    if (op.border_type != null && BORDER_TYPE[String(op.border_type).toLowerCase()] == null) {
+      throw new Error(`set_object_property: border_type must be one of ${Object.keys(BORDER_TYPE).join(' / ')}`);
     }
     if (Array.isArray(op.margins) && op.margins.length !== 4) {
       throw new Error('set_object_property: margins must be [left,right,top,bottom] (4 values, mm)');
@@ -7354,8 +7366,13 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
       secRaw.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | bits) >>> 0, ctrl.dataOff + 4);
       rec.wrap = String(op.wrap).toLowerCase();
     }
-    if (op.fill != null || op.border_color != null || op.border_width_mm != null || op.fill_transparency != null) {
+    if (op.fill != null || op.border_color != null || op.border_width_mm != null
+        || op.fill_transparency != null || op.border_type != null) {
       if (!comp) throw new Error(`set_object_property: no SHAPE_COMPONENT for object ${idx} (fill/border need a shape)`);
+      if (op.border_type != null) {
+        secRaw.writeUInt8(BORDER_TYPE[String(op.border_type).toLowerCase()], comp.dataOff + COMP_BORDER_TYPE_OFF);
+        rec.border_type = String(op.border_type).toLowerCase();
+      }
       if (op.fill != null && op.fill !== 'none') {
         secRaw.writeUInt32LE(parseColorBGR(op.fill) >>> 0, comp.dataOff + COMP_FILL_OFF);
         rec.fill = op.fill;
