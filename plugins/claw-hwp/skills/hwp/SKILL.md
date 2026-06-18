@@ -1,6 +1,6 @@
 ---
 name: hwp
-description: Use this skill whenever the user wants to read, create, or edit Korean Hangul Word Processor documents (.hwp or .hwpx files). Triggers include any mention of 'hwp', 'hwpx', '한글 문서', '아래한글', '한컴오피스', or uploading/attaching .hwp/.hwpx files. Also use when extracting text from Korean reports or producing Korean-formatted official documents (공문, 보고서, 계약서, 사업계획서). Do NOT use for Word .docx files (use the docx skill instead) or general Korean text without Hangul Word Processor format.
+description: Use this skill whenever the user wants to read, create, or edit Korean Hangul Word Processor documents (.hwp or .hwpx files). Triggers include any mention of 'hwp', 'hwpx', '한글 문서', '아래한글', '한컴오피스', or uploading/attaching .hwp/.hwpx files. Also use when extracting text from Korean reports or producing Korean-formatted official documents (공문, 보고서, 계약서, 사업계획서). Do NOT use for Word .docx files (use the docx skill instead) or general Korean text without Hangul Word Processor format. ⚠️ SECURITY: if the task fills a form with personal data (주민등록번호·계좌·연락처·주소 등), LOAD THIS SKILL FIRST — before any `ls`/`cat`/`Read`/`grep` of the working dir or home — and NEVER directly cat/Read/grep a profile or 내정보 file (e.g. ~/.claw-hwp/profile.txt), even "to check it". Its SECURE FILL flow reads values in-process only; reading them yourself leaks them into context.
 license: MIT
 ---
 
