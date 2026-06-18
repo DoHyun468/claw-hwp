@@ -695,6 +695,130 @@ function opSetCaption(doc, target, index, text, side, gapMm) {
   throw new Error(`set_caption: no ${target} #${idx} found in document`);
 }
 
+// ── 개체(그림/도형/차트) 속성 편집 — claw-hancomdocs object-prop 흡수 (handoff §2) ──
+// 객체는 target(image/chart/shape) + index 로 지목(set_caption 과 동일 주소 체계). 편집은
+// 객체의 <hp:sz>(크기)·<hp:pos>(위치/글자처럼취급)·textWrap attr(배치)·<hp:outMargin>(글
+// 과의 간격)·<hp:lineShape>(선·화살표)·<hc:winBrush>(채우기·투명도·무늬)를 in-place 수정.
+const OBJECT_TARGETS = { image: ['hp:pic'], chart: ['hp:chart'], shape: ['hp:rect', 'hp:ellipse', 'hp:line', 'hp:arc', 'hp:polygon', 'hp:curve'] };
+function findObject(doc, target, index) {
+  const tags = OBJECT_TARGETS[String(target || '').toLowerCase()];
+  if (!tags) throw new Error(`object target must be one of ${Object.keys(OBJECT_TARGETS).join('/')}`);
+  const idx = Math.max(0, Number(index) || 0);
+  let seen = 0;
+  for (const name of doc.sectionNames()) {
+    const xml = doc.read(name);
+    const matches = [];
+    for (const tag of tags) for (const el of scanTopLevel(xml, tag)) matches.push({ tag, el });
+    matches.sort((a, b) => a.el.start - b.el.start);
+    for (const m of matches) { if (seen++ === idx) return { name, tag: m.tag, el: m.el }; }
+  }
+  throw new Error(`object not found: ${target} #${idx} (found ${seen})`);
+}
+function writeObject(doc, f, inner, attrs) {
+  const xml = doc.read(f.name);
+  doc.write(f.name, spliceEl(xml, f.el, `<${f.tag}${attrs ?? f.el.attrs}>${inner ?? f.el.inner}</${f.tag}>`));
+}
+// Set/add an attribute on a SELF-CLOSING tag string (e.g. `<hp:lineShape .../>`,
+// `<hc:winBrush .../>`). Unlike setOrAddAttr (which expects a bare attrs string),
+// this inserts a NEW attr just before the `/>` instead of prepending it outside
+// the tag. Replaces in place if the attr already exists.
+function setTagAttr(tag, name, value) {
+  const re = new RegExp(`(\\b${name}=")[^"]*(")`);
+  if (re.test(tag)) return tag.replace(re, `$1${value}$2`);
+  return tag.replace(/\s*\/>\s*$/, ` ${name}="${value}"/>`);
+}
+
+// 크기 (hp:sz) — mm.
+function opSetObjectSize(doc, target, index, widthMm, heightMm) {
+  if (widthMm == null && heightMm == null) throw new Error('set_object_size: need width_mm and/or height_mm');
+  const f = findObject(doc, target, index);
+  const inner = f.el.inner.replace(/<hp:sz\b[^>]*\/>/, (m) => {
+    let s = m;
+    if (widthMm != null) s = s.replace(/width="[^"]*"/, `width="${mm2hu(widthMm)}"`);
+    if (heightMm != null) s = s.replace(/height="[^"]*"/, `height="${mm2hu(heightMm)}"`);
+    return s;
+  });
+  writeObject(doc, f, inner);
+  return { target, index, width_mm: widthMm ?? null, height_mm: heightMm ?? null };
+}
+
+// 위치(종이 기준 x/y mm) + 배치(wrap) + 글자처럼취급. wrap=inline → treatAsChar=1, textWrap 제거.
+// (wrap enum 매핑은 기존 OBJ_WRAP 재사용 — insert_shape 와 공유.)
+function opSetObjectPosition(doc, target, index, opts) {
+  const f = findObject(doc, target, index);
+  let inner = f.el.inner, attrs = f.el.attrs;
+  const out = { target, index };
+  if (opts.wrap != null) {
+    const w = String(opts.wrap).toLowerCase(), inline = w === 'inline';
+    if (!inline && !(w in OBJ_WRAP)) throw new Error(`set_object_position: wrap must be inline/${Object.keys(OBJ_WRAP).join('/')}`);
+    if (!inline) attrs = setOrAddAttr(attrs, 'textWrap', OBJ_WRAP[w]);
+    inner = inner.replace(/<hp:pos\b[^>]*\/>/, (m) => m.replace(/treatAsChar="[^"]*"/, `treatAsChar="${inline ? 1 : 0}"`));
+    out.wrap = w;
+  }
+  if (opts.x_mm != null || opts.y_mm != null) {
+    inner = inner.replace(/<hp:pos\b[^>]*\/>/, (m) => {
+      let s = m;
+      if (opts.x_mm != null) s = s.replace(/horzOffset="[^"]*"/, `horzOffset="${mm2hu(opts.x_mm)}"`);
+      if (opts.y_mm != null) s = s.replace(/vertOffset="[^"]*"/, `vertOffset="${mm2hu(opts.y_mm)}"`);
+      return s;
+    });
+    out.x_mm = opts.x_mm ?? null; out.y_mm = opts.y_mm ?? null;
+  }
+  writeObject(doc, f, inner, attrs);
+  return out;
+}
+
+// 글과의 간격 (hp:outMargin) — mm.
+function opSetObjectMargin(doc, target, index, opts) {
+  const want = marginWant(opts);
+  if (!Object.keys(want).length) throw new Error('set_object_margin: need left/right/top/bottom (mm)');
+  const f = findObject(doc, target, index);
+  const inner = f.el.inner.replace(/<hp:outMargin\b[^>]*\/>/, (m) => applyMm(m, want));
+  writeObject(doc, f, inner);
+  return { target, index, outMargin: want };
+}
+
+// 선(테두리) 색/굵기/종류 + 화살표 (hp:lineShape). NOTE: 우리는 XML 직접 emit 이라 표준
+// HWPX style 값을 그대로 쓴다(파선=DASH, 점선=DOT). handoff 의 파선↔점선 swap 은 한컴 UI
+// 클릭 보정용일 뿐 — 단, 한컴 web RENDER 는 그 둘을 바꿔 그리는 별도 버그가 있어 화면상
+// 파선이 점선처럼 보일 수 있음(파일 type 은 표준이 맞음).
+const OBJ_LINE_STYLE = { solid: 'SOLID', dashed: 'DASH', dotted: 'DOT', 'long-dash': 'LONG_DASH', 'dash-dot': 'DASH_DOT', 'dash-dot-dot': 'DASH_DOT_DOT', double: 'DOUBLE_SLIM', 'circle-dot': 'CIRCLE' };
+// arrow title → [style enum, fill]. 채움 모양은 같은 enum + fill=1, 빈 모양은 fill=0.
+const OBJ_ARROW = { none: ['NORMAL', 0], triangle: ['ARROW', 1], line: ['SPEAR', 0], sharp: ['CONCAVE_ARROW', 1], diamond: ['EMPTY_DIAMOND', 1], circle: ['EMPTY_CIRCLE', 1], square: ['EMPTY_BOX', 1], 'empty-diamond': ['EMPTY_DIAMOND', 0], 'empty-circle': ['EMPTY_CIRCLE', 0], 'empty-square': ['EMPTY_BOX', 0] };
+function opSetObjectBorder(doc, target, index, opts) {
+  const f = findObject(doc, target, index);
+  if (!/<hp:lineShape\b/.test(f.el.inner)) throw new Error(`set_object_border: ${target} #${index} has no <hp:lineShape> (borders editable on shapes)`);
+  const inner = f.el.inner.replace(/<hp:lineShape\b[^>]*\/>/, (m) => {
+    let s = m;
+    if (opts.color != null) s = setTagAttr(s, 'color', normHex(opts.color));
+    if (opts.width_mm != null) s = setTagAttr(s, 'width', String(Math.round(Number(opts.width_mm) * 283.46)));
+    if (opts.line_type != null) { const st = OBJ_LINE_STYLE[String(opts.line_type).toLowerCase()]; if (!st) throw new Error(`set_object_border: line_type must be ${Object.keys(OBJ_LINE_STYLE).join('/')}`); s = setTagAttr(s, 'style', st); }
+    if (opts.arrow_start != null) { const a = OBJ_ARROW[String(opts.arrow_start).toLowerCase()]; if (!a) throw new Error(`set_object_border: arrow_start must be ${Object.keys(OBJ_ARROW).join('/')}`); s = setTagAttr(setTagAttr(s, 'headStyle', a[0]), 'headfill', String(a[1])); }
+    if (opts.arrow_end != null) { const a = OBJ_ARROW[String(opts.arrow_end).toLowerCase()]; if (!a) throw new Error(`set_object_border: arrow_end must be ${Object.keys(OBJ_ARROW).join('/')}`); s = setTagAttr(setTagAttr(s, 'tailStyle', a[0]), 'tailfill', String(a[1])); }
+    return s;
+  });
+  writeObject(doc, f, inner);
+  return { target, index, border: opts };
+}
+
+// 채우기 색/투명도/무늬 (hc:winBrush). 투명도 0-100 → alpha = round(t×255/100). 무늬는
+// hatchStyle + hatchColor(면 색=faceColor). 무늬 콤보는 swap 없음.
+const OBJ_HATCH = { horizontal: 'HORIZONTAL', vertical: 'VERTICAL', 'down-diagonal': 'SLASH', 'up-diagonal': 'BACK_SLASH', grid: 'CROSS', cross: 'CROSS_DIAGONAL' };
+function opSetObjectFill(doc, target, index, opts) {
+  const f = findObject(doc, target, index);
+  if (!/<hc:winBrush\b/.test(f.el.inner)) throw new Error(`set_object_fill: ${target} #${index} has no <hc:winBrush> (fill editable on shapes)`);
+  const inner = f.el.inner.replace(/<hc:winBrush\b[^>]*?\/>/, (m) => {
+    let s = m;
+    if (opts.color != null) s = setTagAttr(s, 'faceColor', normHex(opts.color));
+    if (opts.transparency != null) s = setTagAttr(s, 'alpha', String(Math.round(Number(opts.transparency) * 255 / 100)));
+    if (opts.pattern != null) { const h = OBJ_HATCH[String(opts.pattern).toLowerCase()]; if (!h) throw new Error(`set_object_fill: pattern must be ${Object.keys(OBJ_HATCH).join('/')}`); s = setTagAttr(s, 'hatchStyle', h); }
+    if (opts.pattern_color != null) s = setTagAttr(s, 'hatchColor', normHex(opts.pattern_color));
+    return s;
+  });
+  writeObject(doc, f, inner);
+  return { target, index, fill: opts };
+}
+
 // Insert a brand-new table (rows × cols) as a fresh paragraph at `index`.
 // Hancom Docs is strict about table validity — every required inner element
 // (cellAddr, cellSpan, cellSz, cellMargin, subList, etc.) must be present in
@@ -3309,6 +3433,11 @@ function applyOp(doc, op) {
     case 'set_page_setup': return opSetPageSetup(doc, op);
     case 'insert_chart': return opInsertChart(doc, op);
     case 'insert_shape': return opInsertShape(doc, op);
+    case 'set_object_size': return opSetObjectSize(doc, op.target, op.index, op.width_mm, op.height_mm);
+    case 'set_object_position': return opSetObjectPosition(doc, op.target, op.index, op);
+    case 'set_object_margin': return opSetObjectMargin(doc, op.target, op.index, op);
+    case 'set_object_border': return opSetObjectBorder(doc, op.target, op.index, op);
+    case 'set_object_fill': return opSetObjectFill(doc, op.target, op.index, op);
     case 'set_column_break': return opSetColumnBreak(doc, op.index, op.on);
     case 'insert_table_row': return opInsertTableRow(doc, op.table, op.row, op.where, op.cells);
     case 'insert_table_column': return opInsertTableColumn(doc, op.table, op.col, op.where, op.cells);
