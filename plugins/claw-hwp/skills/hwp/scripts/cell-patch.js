@@ -7086,13 +7086,27 @@ export async function applyCellPropertyInPlace(filePath, ops) {
 // Each op: { table_index?, margins?:[l,r,t,b] | margin_mm? }.
 const TABLE_CTRL_ID = ' lbt'; // "tbl " stored reversed (little-endian ctrl_id)
 const TABLE_OUTMARGIN_OFF = 28; // in-record offset of the 4 outer-margin u16s
+// Page-split mode = TABLE record (0x4d) attribute bits 0-1. GT-confirmed
+// (claw-hancomdocs table-cell-prop --page-split, .hwp download): none→0,
+// cell→1, table→2 (table == the default). 한컴 spec: 0 나누지않음 / 1 셀단위로나눔 / 2 나눔.
+const TABLE_PAGE_SPLIT = { none: 0, cell: 1, table: 2 };
 
-function findTableCtrlHeaders(records, secRaw) {
+// Each table = its CTRL_HEADER (" lbt", outer margin) + the TABLE record (0x4d,
+// rows/cols/attr) that follows it. Return both so one op can patch either.
+function findTables(records, secRaw) {
   const out = [];
-  for (const r of records) {
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
     if (r.tag === TAG_CTRL_HEADER && r.level === 1 && r.size >= TABLE_OUTMARGIN_OFF + 8
         && secRaw.slice(r.dataOff, r.dataOff + 4).toString('latin1') === TABLE_CTRL_ID) {
-      out.push(r);
+      let table = null;
+      for (let j = i + 1; j < records.length; j++) {
+        const rj = records[j];
+        if (rj.tag === TAG_PARA_HEADER && rj.level === 0) break;
+        if (rj.tag === TAG_CTRL_HEADER && rj.level === 1) break;
+        if (rj.tag === TAG_TABLE) { table = rj; break; }
+      }
+      out.push({ ctrl: r, table });
     }
   }
   return out;
@@ -7104,11 +7118,14 @@ export async function applyTablePropertyInPlace(filePath, ops) {
   }
   for (const op of ops) {
     if ((op.section ?? 0) !== 0) throw new Error(`set_table_property: only section 0 is supported (got ${op.section})`);
-    if (!Array.isArray(op.margins) && op.margin_mm == null) {
-      throw new Error('set_table_property: margins:[l,r,t,b] or margin_mm is required');
+    if (!Array.isArray(op.margins) && op.margin_mm == null && op.page_split == null) {
+      throw new Error('set_table_property: margins:[l,r,t,b] / margin_mm / page_split is required');
     }
     if (Array.isArray(op.margins) && op.margins.length !== 4) {
       throw new Error('set_table_property: margins must be [left,right,top,bottom] (4 values, mm)');
+    }
+    if (op.page_split != null && TABLE_PAGE_SPLIT[String(op.page_split).toLowerCase()] == null) {
+      throw new Error('set_table_property: page_split must be none / cell / table');
     }
   }
 
@@ -7143,17 +7160,29 @@ export async function applyTablePropertyInPlace(filePath, ops) {
   const summary = [];
   for (const op of ops) {
     const records = parseRecords(secRaw);
-    const tables = findTableCtrlHeaders(records, secRaw);
+    const tables = findTables(records, secRaw);
     const idx = op.table_index ?? 0;
     if (idx < 0 || idx >= tables.length) {
       throw new Error(`set_table_property: table_index ${idx} out of range (found ${tables.length} table(s))`);
     }
-    const o = tables[idx].dataOff;
-    const margins = Array.isArray(op.margins)
-      ? op.margins
-      : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
-    for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + TABLE_OUTMARGIN_OFF + i * 2);
-    summary.push({ op: 'set_table_property', table_index: idx, margins_mm: margins });
+    const { ctrl, table } = tables[idx];
+    const rec = { op: 'set_table_property', table_index: idx };
+    if (Array.isArray(op.margins) || op.margin_mm != null) {
+      const o = ctrl.dataOff;
+      const margins = Array.isArray(op.margins)
+        ? op.margins
+        : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
+      for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + TABLE_OUTMARGIN_OFF + i * 2);
+      rec.margins_mm = margins;
+    }
+    if (op.page_split != null) {
+      if (!table) throw new Error(`set_table_property: TABLE record not found for table_index ${idx}`);
+      const v = TABLE_PAGE_SPLIT[String(op.page_split).toLowerCase()];
+      const attr = secRaw.readUInt32LE(table.dataOff);
+      secRaw.writeUInt32LE(((attr & ~0x3) | v) >>> 0, table.dataOff);
+      rec.page_split = String(op.page_split).toLowerCase();
+    }
+    summary.push(rec);
   }
 
   // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
