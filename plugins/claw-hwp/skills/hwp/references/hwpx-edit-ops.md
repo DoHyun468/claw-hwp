@@ -93,7 +93,7 @@ Mirrors the 4-tab 표/셀 속성 dialog. Margin/size inputs are **mm** → HWPUN
 
 | Op | Required | Optional | Notes |
 |----|----------|----------|-------|
-| `set_cell_margin` | `table`, `row`, `col` | `to_row`, `to_col`, `left`, `right`, `top`, `bottom` (mm) | Sets the cell's `<hp:cellMargin>` (셀 안 여백). `to_row`/`to_col` apply to the `[row,col]..[to_row,to_col]` rectangle. Only the given sides change; others keep their value. |
+| `set_cell_margin` | `table`, `row`, `col` | `to_row`, `to_col`, `left`, `right`, `top`, `bottom` (mm) | Sets the cell's `<hp:cellMargin>` (셀 안 여백) **and `hasMargin="1"` on the cell** — without that flag (rhwp default `hasMargin="0"`) Hancom ignores the cell's own cellMargin and inherits the table's `<hp:inMargin>`, so the margin is silently dropped on render (GT-confirmed). `to_row`/`to_col` apply to the `[row,col]..[to_row,to_col]` rectangle. Only the given sides change. For a uniform table-wide padding you can instead use `set_table_inner_margin` (all `hasMargin="0"` cells inherit it). |
 | `set_table_margin` | `table` | `left`, `right`, `top`, `bottom` (mm) | Table's `<hp:outMargin>` (표 바깥 여백 = 표↔본문 간격). |
 | `set_table_inner_margin` | `table` | `left`, `right`, `top`, `bottom` (mm) | Table-level `<hp:inMargin>` (표 탭 '모든 셀에 적용되는 안 여백' 기본값). Doesn't override cells that already carry an explicit `cellMargin`. |
 | `set_table_size` | `table` | `width_mm`, `height_mm` | Resizes the whole table. **Scales every `<hp:cellSz>` proportionally** to hit the target (then updates `<hp:sz>`) — Hancom recomputes a table's `<hp:sz>` from its column-width sum, so setting `<hp:sz>` alone is ignored. Rectangular tables hit the target exactly; merged cells are approximate. |
