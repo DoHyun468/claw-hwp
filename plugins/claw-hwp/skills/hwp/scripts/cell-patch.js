@@ -2463,6 +2463,28 @@ function relevelCluster(cluster, delta) {
   return out;
 }
 
+// Set the gso object's outer top+bottom margin (개체 위/아래 여백) inside a built
+// cluster — finds the ' osg' CTRL_HEADER and writes u16 HWPUNIT at the top(@32)/
+// bottom(@34) slots of its CommonObjAttr outMargin (left@28/right@30 left as-is).
+// Used so objects dropped into a cell get a little vertical breathing room (the
+// cell row grows to fit). Left/right stay default per user.
+function setGsoOutMarginTopBottom(cluster, hu) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p);
+    const tag = h & 0x3ff; let size = (h >>> 20) & 0xfff; let hd = 4;
+    if (size === 0xfff) { size = cluster.readUInt32LE(p + 4); hd = 8; }
+    const body = p + hd;
+    if (tag === TAG_CTRL_HEADER && size >= 36 && cluster.slice(body, body + 4).toString('latin1') === GSO_CTRL_ID) {
+      cluster.writeUInt16LE(hu & 0xFFFF, body + 32);
+      cluster.writeUInt16LE(hu & 0xFFFF, body + 34);
+      return;
+    }
+    p += hd + size;
+  }
+}
+const CELL_OBJ_VMARGIN_HU = 283; // ~1 mm default top/bottom margin for in-cell objects
+
 // Inside a cell whose first paragraph is at `cellParaLevel` (2 for table cells):
 // set the last-paragraph flag (MSB of char_count) on the LAST PARA_HEADER of that
 // level within [startByte, endByte) and clear it on the earlier ones. Mirrors
@@ -4120,6 +4142,7 @@ export async function insertImageInPlace(filePath, ops) {
         if (!target) throw new Error(`insert_image: cell (row=${op.cell.row}, col=${op.cell.col}) not found in table at para ${para} control ${control}`);
         const cellCluster = relevelCluster(cluster, 2);
         cellCluster.writeUInt16LE(centerPsId & 0xFFFF, 12); // PARA_HEADER body off8 = para_shape_id (centered)
+        setGsoOutMarginTopBottom(cellCluster, CELL_OBJ_VMARGIN_HU); // top/bottom breathing room
         raw = Buffer.concat([raw.slice(0, target.endByte), cellCluster, raw.slice(target.endByte)]);
         const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
           .find((c) => c.row === op.cell.row && c.col === op.cell.col);
@@ -4536,7 +4559,9 @@ export async function insertShapeInPlace(filePath, ops) {
         buildRecordHeader(TAG_SHAPE_COMPONENT, 2, sc.length), sc,
         buildRecordHeader(kind.recTag, 3, rec.length), rec,
       ]);
-      raw = Buffer.concat([raw.slice(0, target.endByte), relevelCluster(shapePara, 2), raw.slice(target.endByte)]);
+      const shapeCell = relevelCluster(shapePara, 2);
+      setGsoOutMarginTopBottom(shapeCell, CELL_OBJ_VMARGIN_HU); // top/bottom breathing room
+      raw = Buffer.concat([raw.slice(0, target.endByte), shapeCell, raw.slice(target.endByte)]);
       const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
         .find((c) => c.row === op.cell.row && c.col === op.cell.col);
       const lhDataOff = t2.startByte + 4;
