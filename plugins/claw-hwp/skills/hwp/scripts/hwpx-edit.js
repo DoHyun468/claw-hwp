@@ -38,6 +38,11 @@
 //   set_table_size        { table, width_mm?, height_mm? }                  // 표 전체 크기 — 열/행 비례 스케일(한컴이 sz를 셀합으로 재계산하므로)
 //   set_table_props       { table, wrap?, page_split?, repeat_header? }     // wrap=inline|square|topbottom|front|behind; page_split=none|cell|table; repeat_header=bool(머리행 반복)
 //   set_title_cell        { table, row, col, on? }                          // <hp:tc header="1"> (머리 행 셀)
+//   set_object_size       { target, index, width_mm?, height_mm? }          // 그림/도형/차트 크기 (target=image|shape|chart)
+//   set_object_position   { target, index, x_mm?, y_mm?, wrap? }            // 위치(종이기준)+배치(wrap=inline|square|topbottom|front|behind)
+//   set_object_margin     { target, index, left?, right?, top?, bottom? }   // 객체↔글 간격(mm)
+//   set_object_border     { target, index, color?, width_mm?, line_type?, arrow_start?, arrow_end? }  // 선/화살표 (도형)
+//   set_object_fill       { target, index, color?, transparency?, pattern?, pattern_color? }          // 채우기 색/투명도/무늬 (도형)
 //   set_page_break        { index, on? }                                   // sets <hp:p pageBreak="1"> before paragraph index
 //   set_bullet_list       { index, char?, level? }                        // bullet (• default; char="▶"|"◯"|"□"|"★" etc. registers a new bullet entry)
 //   set_number_list       { index, level?, style? }                        // numbered list — `style: "korean"` → 1./가./1)/가); `style: "decimal"` → 1./1.1./1.1.1.; omit → use doc's existing numbering id=1 (varies by template)

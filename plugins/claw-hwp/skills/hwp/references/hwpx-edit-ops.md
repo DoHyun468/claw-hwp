@@ -100,6 +100,18 @@ Mirrors the 4-tab 표/셀 속성 dialog. Margin/size inputs are **mm** → HWPUN
 | `set_table_props` | `table` | `wrap` (`inline`/`square`/`topbottom`/`front`/`behind`), `page_split` (`none`/`cell`/`table`), `repeat_header` (bool) | `<hp:tbl textWrap=…/pageBreak=…/repeatHeader=…>`. `wrap:"inline"` = 글자처럼 취급 (`<hp:pos treatAsChar="1">`, no textWrap); others set textWrap + `treatAsChar="0"`. `page_split` maps `cell→TABLE`, `table→CELL`, `none→NONE` (Hancom's inverted naming, per GT). `repeat_header` repeats the header row across page breaks. |
 | `set_title_cell` | `table`, `row`, `col` | `on?` (default true) | Marks the cell as a header cell (`<hp:tc header="1">`). Hancom's UI only enables this on the top row, but the op accepts any cell. |
 
+### Object properties (그림·도형 속성 — image/shape/chart)
+
+Edit an existing object's geometry/border/fill. The object is addressed by `target` (`image`/`shape`/`chart`) + `index` (0-based, in document order — same scheme as `set_caption`). mm → HWPUNIT. GT: `handoff/shared/SHARED_op-inventory-for-GT.md` §2; round-trip-verified on Hancom (size/textWrap/lineShape/winBrush all preserved).
+
+| Op | Required | Optional | Notes |
+|----|----------|----------|-------|
+| `set_object_size` | `target`, `index` | `width_mm`, `height_mm` | Rewrites `<hp:sz>`. |
+| `set_object_position` | `target`, `index` | `x_mm`, `y_mm`, `wrap` (`inline`/`square`/`topbottom`/`front`/`behind`) | `<hp:pos>` horz/vertOffset (paper-relative) + `treatAsChar`; `wrap` sets the object's `textWrap` attr (`inline` = 글자처럼 취급, `treatAsChar="1"`). |
+| `set_object_margin` | `target`, `index` | `left`, `right`, `top`, `bottom` (mm) | `<hp:outMargin>` — gap between the object and surrounding text. |
+| `set_object_border` | `target`, `index` | `color`, `width_mm`, `line_type` (`solid`/`dashed`/`dotted`/`long-dash`/`dash-dot`/`dash-dot-dot`/`double`/`circle-dot`), `arrow_start`, `arrow_end` (`none`/`triangle`/`line`/`sharp`/`diamond`/`circle`/`square`/`empty-diamond`/`empty-circle`/`empty-square`) | `<hp:lineShape>` (shapes/lines). `line_type` is **not** `type` (that key is the op dispatch). Arrows apply to lines/open shapes only. ⚠️ Hancom web RENDER swaps `DASH`↔`DOT` visually (a `dashed` line looks dotted on screen) — the file's `style` is the standard value; trust it, not the screen. |
+| `set_object_fill` | `target`, `index` | `color`, `transparency` (0–100), `pattern` (`horizontal`/`vertical`/`down-diagonal`/`up-diagonal`/`grid`/`cross`), `pattern_color` | `<hc:winBrush>`: `faceColor` + `alpha` (= transparency×255/100) + `hatchStyle`/`hatchColor` (pattern). Shapes only. |
+
 ### Styling (clone-mutate-retarget in `header.xml`)
 
 | `type` | Args | Notes |
