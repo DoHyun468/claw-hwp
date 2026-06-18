@@ -40,6 +40,8 @@
 //   set_title_cell        { table, row, col, on? }                          // <hp:tc header="1"> (머리 행 셀)
 //   set_cell_image        { table, row, col, source, ext?, width_mm?, height_mm? }   // 이미지를 셀 안에(inline) — 셀폭 자동맞춤+가운데+사방 여백
 //   set_cell_shape        { table, row, col, shape, width_mm?, height_mm?, fill_color?, line_color?, line_width_mm? }  // 도형(rect/ellipse/line)을 셀 안에(inline)
+//   set_cell_chart        { table, row, col, chart_type?, cat?, series?, width_mm?, height_mm? }   // 차트를 셀 안에(inline) — insert_chart와 같은 데이터, 셀 자동맞춤
+//   set_cell_equation     { table, row, col, script, width_mm?, height_mm? }   // 수식을 셀 안에(inline)
 //   set_table_split_border{ table, line_type?, width_mm?, color? }          // 여러 쪽 자동분할 표 경계선(borderFill breakCellSeparateLine + diagonal, pageBreak=CELL)
 //   set_object_size       { target, index, width_mm?, height_mm? }          // 그림/도형/차트 크기 (target=image|shape|chart)
 //   set_object_position   { target, index, x_mm?, y_mm?, wrap? }            // 위치(종이기준)+배치(wrap=inline|square|topbottom|front|behind)
@@ -2835,6 +2837,96 @@ function opSetCellShape(doc, op) {
   return { table: op.table, row: op.row, col: op.col, shape, inCell: true };
 }
 
+// Usable page text width (HWPUNIT) = page width − left/right margins. Caps how
+// far a chart column may grow. Falls back to ~170mm (A4 portrait text width).
+function pageTextWidth(doc, section) {
+  try {
+    const xml = doc.read(section);
+    const pp = (xml.match(/<hp:pagePr\b[^>]*>/) || [''])[0];
+    const W = Number((pp.match(/\bwidth="(\d+)"/) || [, 59528])[1]);
+    const mg = (xml.match(/<hp:margin\b[^>]*\/?>/) || [''])[0];
+    const L = Number((mg.match(/\bleft="(\d+)"/) || [, 8504])[1]);
+    const R = Number((mg.match(/\bright="(\d+)"/) || [, 8504])[1]);
+    return Math.max(10000, W - L - R);
+  } catch { return 48188; }
+}
+
+// For chart/equation cells: these objects are sized by Hancom itself (a chart
+// from its data, an equation from its script), so they CANNOT be shrunk to fit
+// a narrow cell — they just clip (chart axes/legend collapse; a long formula is
+// cut off). Instead of shrinking we WIDEN the object's column until it fits the
+// target width — capped to the page text width. Sets the target column's
+// <hp:cellSz width> in every row + grows the table <hp:sz>; leaves other columns
+// untouched. Merged-cell tables are approximate (same caveat as set_table_size).
+function widenColumnForObject(doc, tableIndex, row, col, chartW, margin) {
+  const { section, el } = getTable(doc, tableIndex);
+  const rows = scanTopLevel(el.inner, 'hp:tr');
+  if (!rows.length) return;
+  const colWidthIn = (tr) => {
+    const tc = scanTopLevel(tr.inner, 'hp:tc')[col];
+    return tc ? Number((tc.inner.match(/<hp:cellSz width="(\d+)"/) || [, 0])[1]) : 0;
+  };
+  const oldColW = colWidthIn(rows[row]) || colWidthIn(rows[0]);
+  if (!(oldColW > 0)) return; // garbage cellSz → let fitToCell handle it
+  const neededCol = chartW + 2 * margin;
+  if (oldColW >= neededCol) return; // already wide enough
+  const tableW = scanTopLevel(rows[0].inner, 'hp:tc')
+    .reduce((a, tc) => a + Number((tc.inner.match(/<hp:cellSz width="(\d+)"/) || [, 0])[1]), 0);
+  const room = Math.max(0, pageTextWidth(doc, section) - tableW);
+  const allowedColW = Math.min(neededCol, oldColW + room);
+  if (allowedColW <= oldColW) return; // no page room → chart will clamp to current cell
+  let inner = el.inner;
+  for (let ri = rows.length - 1; ri >= 0; ri--) { // bottom-up so splice offsets stay valid
+    const tr = scanTopLevel(inner, 'hp:tr')[ri];
+    const tcs = scanTopLevel(tr.inner, 'hp:tc');
+    if (col < 0 || col >= tcs.length) continue;
+    const tc = tcs[col];
+    const newTc = `<hp:tc${tc.attrs}>${tc.inner.replace(/<hp:cellSz width="\d+"/, `<hp:cellSz width="${allowedColW}"`)}</hp:tc>`;
+    inner = spliceEl(inner, tr, `<hp:tr${tr.attrs}>${spliceEl(tr.inner, tc, newTc)}</hp:tr>`);
+  }
+  const newTableW = tableW - oldColW + allowedColW;
+  inner = inner.replace(/<hp:sz\b[^>]*\/>/, (m) =>
+    m.replace(/width="[^"]*"/, `width="${newTableW}"`).replace(/widthRelTo="[^"]*"/, 'widthRelTo="ABSOLUTE"'));
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${inner}</hp:tbl>`));
+}
+
+// 차트를 표 셀 안에 (inline). chart_type/cat/series + width_mm/height_mm.
+// 차트는 좁은 셀에서 깨지므로(축·범례 뭉개짐) 줄이는 대신 그 열을 차트가 읽힐 만큼 자동
+// 확장(페이지 폭 상한). 그 다음 좌우 cellMargin·상하 outMargin·가운데정렬은 셀 객체 공통.
+// 기본 크기 45×28mm. ⚠️ HWP 트랙 정합 필요 — 메모리 hwpx-cell-object-sizing-align-hwp.
+function opSetCellChart(doc, op) {
+  ensureCellObjPadding(doc, op.table, op.row, op.col); // 좌우 셀 안여백(대칭)
+  const toHu = (mm) => Math.round(Number(mm) * 283.46);
+  let w = op.width_mm != null ? toHu(op.width_mm) : toHu(45);
+  let h = op.height_mm != null ? toHu(op.height_mm) : toHu(28);
+  widenColumnForObject(doc, op.table, op.row, op.col, w, CELL_OBJ_MARGIN); // 좁으면 열 넓힘
+  [w, h] = fitToCell(doc, op.table, op.row, op.col, w, h);                  // 상한 걸렸을 때만 축소
+  let chartXml = buildChartObject(doc, op, w, h);
+  chartXml = withCellMargin(chartXml, CELL_OBJ_MARGIN); // 상하 여백
+  placeObjectInCell(doc, op.table, op.row, op.col, chartXml, 'set_cell_chart');
+  opSetCellAlign(doc, op.table, op.row, op.col, 'CENTER', 'CENTER'); // 셀 안에서 가운데
+  return { table: op.table, row: op.row, col: op.col, chart: true, width: w, height: h };
+}
+
+// 수식을 표 셀 안에 (inline). script(수식 문법) + optional width_mm/height_mm.
+// 한컴이 <hp:sz>를 script로 재계산하므로 셀이 좁으면 식이 잘림 → 차트와 동일하게 그 열을
+// 넉넉히 넓힌다(기본 목표폭 55mm, width_mm로 override, 페이지 폭 상한). sz는 클램프하지 않고
+// 한컴이 자연 크기로 그리게 둔다. 상하 여백 + 가운데정렬은 셀 객체 공통.
+function opSetCellEquation(doc, op) {
+  if (op.script == null || !String(op.script).trim()) throw new Error('set_cell_equation: script is required');
+  ensureCellObjPadding(doc, op.table, op.row, op.col); // 좌우 셀 안여백(대칭)
+  const toHu = (mm) => Math.round(Number(mm) * 283.46);
+  const eqColW = op.width_mm != null ? toHu(op.width_mm) : toHu(55); // 수식이 들어갈 목표 폭
+  widenColumnForObject(doc, op.table, op.row, op.col, eqColW, CELL_OBJ_MARGIN);
+  const w = op.width_mm != null ? toHu(op.width_mm) : 9200; // sz는 힌트(한컴이 script로 재계산)
+  const h = op.height_mm != null ? toHu(op.height_mm) : 2588;
+  let eqXml = buildEquationXml(String(op.script), w, h);
+  eqXml = withCellMargin(eqXml, CELL_OBJ_MARGIN); // 상하 여백 (수식 기본 outMargin 대체)
+  placeObjectInCell(doc, op.table, op.row, op.col, eqXml, 'set_cell_equation');
+  opSetCellAlign(doc, op.table, op.row, op.col, 'CENTER', 'CENTER'); // 셀 안에서 가운데
+  return { table: op.table, row: op.row, col: op.col, equation: true, script: String(op.script) };
+}
+
 // Build an inline <hp:pic> for a freshly-added image. Hancom Docs validates the
 // shape schema strictly (requires hp:renderingInfo, hp:shapeComment; rejects a
 // stray hp:caption), so we CLONE an existing pic from the document when one is
@@ -3196,18 +3288,24 @@ function opSetFieldValue(doc, name, value) {
 // font="HancomEQN", "Equation Version 60". The <hp:sz> is a render-size hint
 // Hancom recomputes from the script. Placed as its own new paragraph after
 // paragraph `index` (or appended to the last section when `index` is omitted).
-function opInsertEquation(doc, script, index) {
-  if (script == null || !String(script).trim()) throw new Error('insert_equation: script is required');
-  const scriptText = String(script);
-  const eq =
-    `<hp:equation id="${freshId()}" zOrder="0" numberingType="EQUATION" textWrap="TOP_AND_BOTTOM" ` +
+// Build the inline <hp:equation> XML (treatAsChar) for an equation script.
+// Shared by insert_equation and set_cell_equation. <hp:sz> is a render-size hint
+// Hancom recomputes from the script on open. Defaults match Hancom's own insert.
+function buildEquationXml(scriptText, width = 9200, height = 2588) {
+  return `<hp:equation id="${freshId()}" zOrder="0" numberingType="EQUATION" textWrap="TOP_AND_BOTTOM" ` +
     `textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" version="Equation Version 60" baseLine="71" ` +
     `textColor="#000000" baseUnit="1000" lineMode="CHAR" font="HancomEQN">` +
-    `<hp:sz width="9200" widthRelTo="ABSOLUTE" height="2588" heightRelTo="ABSOLUTE" protect="0"/>` +
+    `<hp:sz width="${width}" widthRelTo="ABSOLUTE" height="${height}" heightRelTo="ABSOLUTE" protect="0"/>` +
     `<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" ` +
     `vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>` +
     `<hp:outMargin left="56" right="56" top="0" bottom="0"/>` +
     `<hp:script>${xmlEscape(scriptText)}</hp:script></hp:equation>`;
+}
+
+function opInsertEquation(doc, script, index) {
+  if (script == null || !String(script).trim()) throw new Error('insert_equation: script is required');
+  const scriptText = String(script);
+  const eq = buildEquationXml(scriptText);
 
   // Equation sits in its own fresh PLAIN paragraph (paraPrIDRef="0"). Hancom's
   // own insert does the same — it does NOT inherit the anchor paragraph's
@@ -3422,8 +3520,47 @@ function buildChartSpace(spec, cat, series) {
 // Object wrap (배치): how text flows around a floating object.
 const OBJ_WRAP = { inline: 'INLINE', square: 'SQUARE', 어울림: 'SQUARE', topbottom: 'TOP_AND_BOTTOM', 자리차지: 'TOP_AND_BOTTOM', front: 'IN_FRONT_OF_TEXT', behind: 'BEHIND_TEXT' };
 function wrapVal(w, def) { return OBJ_WRAP[String(w == null ? '' : w).toLowerCase()] || def; }
-function opInsertChart(doc, op) {
+// Normalize a chart op's {chart_type, cat, series} into {spec, cat, series}.
+// Shared by insert_chart and set_cell_chart.
+function chartData(op) {
   const spec = chartSpec(op.chart_type);
+  const cat = Array.isArray(op.cat) ? op.cat.map(String) : ['항목 1', '항목 2', '항목 3'];
+  let series = Array.isArray(op.series) && op.series.length ? op.series : [{ name: '계열 1', values: cat.map(() => 0) }];
+  series = series.map((s, i) => ({ name: s.name != null ? String(s.name) : `계열 ${i + 1}`, values: Array.isArray(s.values) ? s.values : [] }));
+  if (spec.pie) series = [series[0]];
+  return { spec, cat, series };
+}
+
+// Create a Chart/chartN.xml chartSpace part (+ manifest entry) and return its
+// part name. Shared by insert_chart and set_cell_chart.
+function embedChartSpace(doc, spec, cat, series) {
+  let n = 1;
+  while (doc.files[`Chart/chart${n}.xml`]) n++;
+  const partName = `Chart/chart${n}.xml`;
+  doc.files[partName] = strToU8(buildChartSpace(spec, cat, series));
+  const hpf = doc.hpfName();
+  if (hpf) {
+    let s = doc.read(hpf);
+    if (!s.includes(`href="${partName}"`)) {
+      s = s.replace(/<\/opf:manifest>/, `<opf:item id="chart${n}" href="${partName}" media-type="application/xml"/></opf:manifest>`);
+      doc.write(hpf, s);
+    }
+  }
+  return partName;
+}
+
+// Build an inline (treatAsChar) <hp:chart> for a cell, w/h HWPUNIT. Reuses the
+// chart part/manifest pipeline; outMargin set later by the caller.
+function buildChartObject(doc, op, width, height) {
+  const { spec, cat, series } = chartData(op);
+  const partName = embedChartSpace(doc, spec, cat, series);
+  return `<hp:chart id="${freshId()}" zOrder="0" numberingType="PICTURE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" chartIDRef="${partName}">`
+    + `<hp:sz width="${width}" widthRelTo="ABSOLUTE" height="${height}" heightRelTo="ABSOLUTE" protect="0"/>`
+    + `<hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>`
+    + `<hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:chart>`;
+}
+
+function opInsertChart(doc, op) {
   const toHu = (mm) => Math.round(Number(mm) * 283.46);
   const cw = op.width_mm != null ? toHu(op.width_mm) : 32250;
   const ch = op.height_mm != null ? toHu(op.height_mm) : 18750;
@@ -3433,24 +3570,8 @@ function opInsertChart(doc, op) {
   const cmargin = op.margin_mm != null ? toHu(op.margin_mm) : 709;
   const cx = op.x_mm != null ? toHu(op.x_mm) : 0;
   const cy = op.y_mm != null ? toHu(op.y_mm) : 0;
-  const cat = Array.isArray(op.cat) ? op.cat.map(String) : ['항목 1', '항목 2', '항목 3'];
-  let series = Array.isArray(op.series) && op.series.length ? op.series : [{ name: '계열 1', values: cat.map(() => 0) }];
-  series = series.map((s, i) => ({ name: s.name != null ? String(s.name) : `계열 ${i + 1}`, values: Array.isArray(s.values) ? s.values : [] }));
-  if (spec.pie) series = [series[0]];
-  // unique Chart/ part name
-  let n = 1;
-  while (doc.files[`Chart/chart${n}.xml`]) n++;
-  const partName = `Chart/chart${n}.xml`;
-  doc.files[partName] = strToU8(buildChartSpace(spec, cat, series));
-  // manifest entry
-  const hpf = doc.hpfName();
-  if (hpf) {
-    let s = doc.read(hpf);
-    if (!s.includes(`href="${partName}"`)) {
-      s = s.replace(/<\/opf:manifest>/, `<opf:item id="chart${n}" href="${partName}" media-type="application/xml"/></opf:manifest>`);
-      doc.write(hpf, s);
-    }
-  }
+  const { spec, cat, series } = chartData(op);
+  const partName = embedChartSpace(doc, spec, cat, series);
   // INLINE wrap means the chart is a character in the text flow (treatAsChar=1),
   // so it stays right where it's inserted instead of floating to wherever it fits
   // (the cause of charts drifting onto a later page). Other wraps stay floating.
@@ -3645,6 +3766,8 @@ function applyOp(doc, op) {
       op.width_mm != null ? Math.round(Number(op.width_mm) * 283.46) : op.width,
       op.height_mm != null ? Math.round(Number(op.height_mm) * 283.46) : op.height);
     case 'set_cell_shape': return opSetCellShape(doc, op);
+    case 'set_cell_chart': return opSetCellChart(doc, op);
+    case 'set_cell_equation': return opSetCellEquation(doc, op);
     case 'set_column_break': return opSetColumnBreak(doc, op.index, op.on);
     case 'insert_table_row': return opInsertTableRow(doc, op.table, op.row, op.where, op.cells);
     case 'insert_table_column': return opInsertTableColumn(doc, op.table, op.col, op.where, op.cells);
