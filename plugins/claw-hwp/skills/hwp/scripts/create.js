@@ -1590,7 +1590,7 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
     const out = [];
     for (const op of ops) {
       if (op.type === 'set_cell_text') {
-        const sec = requireInt(op, 'section');
+        const sec = op.section ?? 0; // default section 0 — consistent with set_cell_background/border/etc.
         const para = requireInt(op, 'para');
         const ctrl = requireInt(op, 'control');
         const text = op.text ?? '';
@@ -1618,7 +1618,7 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
 
       const scoped = (op.section != null || op.para != null || op.control != null);
       const candidates = scoped
-        ? [{ sec: requireInt(op, 'section'), para: requireInt(op, 'para'), ctrl: requireInt(op, 'control') }]
+        ? [{ sec: op.section ?? 0, para: requireInt(op, 'para'), ctrl: requireInt(op, 'control') }]
         : enumerateTables(doc);
 
       const hits = [];
@@ -2307,6 +2307,12 @@ async function readStdin() {
   // keep it floating instead of the default like-char placement. Clean docs
   // only for now. See cell-patch.js insertChartInPlace.
   const CHART_OPS = new Set(['insert_chart']);
+  // 수식 (equation) — raw-patch into an existing doc / table cell (EQEDIT "deqe"
+  // control). op fields: script (Hancom equation source), anchor, or
+  // cell:{row,col,para?,control?} to drop it inside a cell (centered). NOTE:
+  // distinct from append_equation, which is the from-scratch rhwp-emit path.
+  // See cell-patch.js insertEquationInPlace.
+  const EQUATION_OPS = new Set(['insert_equation']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -2336,7 +2342,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS, ...EQUATION_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -2544,13 +2550,9 @@ async function readStdin() {
         subModes.push(`table_prop:${tpSummary.mode || 'in-place'}`);
         for (const e of tpSummary) allEdits.push({ kind: 'table_prop', ...e });
       }
-      const objectPropOps = ops.filter((o) => OBJECT_PROP_OPS.has(o.type));
-      if (objectPropOps.length > 0) {
-        const { applyObjectPropertyInPlace } = await import('./cell-patch.js');
-        const opSummary = await applyObjectPropertyInPlace(outPath, objectPropOps);
-        subModes.push(`object_prop:${opSummary.mode || 'in-place'}`);
-        for (const e of opSummary) allEdits.push({ kind: 'object_prop', ...e });
-      }
+      // NOTE: set_object_property is dispatched LATER (after the object-insert
+      // blocks below) so a single batch can insert a shape/chart and then style
+      // it — object inserts must run before the property edit can find them.
       const mergeOps = ops.filter((o) => MERGE_OPS.has(o.type));
       if (mergeOps.length > 0) {
         const { mergeCellsInPlace } = await import('./cell-patch.js');
@@ -2593,13 +2595,9 @@ async function readStdin() {
         subModes.push(`split:${spSummary.mode || 'in-place'}`);
         for (const e of spSummary) allEdits.push({ kind: 'split', ...e });
       }
-      const paraLineOps = ops.filter((o) => PARALINE_OPS.has(o.type));
-      if (paraLineOps.length > 0) {
-        const { insertParaLineInPlace } = await import('./cell-patch.js');
-        const plSummary = await insertParaLineInPlace(outPath, paraLineOps);
-        subModes.push(`para_line:${plSummary.mode || 'in-place'}`);
-        for (const e of plSummary) allEdits.push({ kind: 'para_line', ...e });
-      }
+      // insert_para_line is dispatched LATER (after the object-insert + table
+      // ops) — it adds a new body paragraph, which would shift the absolute
+      // para indices that table-cell-targeting ops rely on if it ran first.
       const fieldOps = ops.filter((o) => FIELD_OPS.has(o.type));
       if (fieldOps.length > 0) {
         const { insertFieldInPlace } = await import('./cell-patch.js');
@@ -2701,6 +2699,33 @@ async function readStdin() {
         const chSummary = await insertChartInPlace(outPath, chartOps);
         subModes.push(`chart:${chSummary.mode || 'in-place'}`);
         for (const e of chSummary) allEdits.push({ kind: 'chart', ...e });
+      }
+      const equationOps = ops.filter((o) => EQUATION_OPS.has(o.type));
+      if (equationOps.length > 0) {
+        const { insertEquationInPlace } = await import('./cell-patch.js');
+        const eqSummary = await insertEquationInPlace(outPath, equationOps);
+        subModes.push(`equation:${eqSummary.mode || 'in-place'}`);
+        for (const e of eqSummary) allEdits.push({ kind: 'equation', ...e });
+      }
+      // set_object_property runs AFTER the object-insert blocks above so an
+      // insert-then-style batch (e.g. insert_shape + set_object_property) finds
+      // the just-inserted object instead of running before it exists.
+      const objectPropOps = ops.filter((o) => OBJECT_PROP_OPS.has(o.type));
+      if (objectPropOps.length > 0) {
+        const { applyObjectPropertyInPlace } = await import('./cell-patch.js');
+        const opSummary = await applyObjectPropertyInPlace(outPath, objectPropOps);
+        subModes.push(`object_prop:${opSummary.mode || 'in-place'}`);
+        for (const e of opSummary) allEdits.push({ kind: 'object_prop', ...e });
+      }
+      // Body-paragraph inserts that shift absolute para indices run LAST (after
+      // every table-cell-targeting op) so they don't move a table out from under
+      // an op that addresses it by para index.
+      const paraLineOps = ops.filter((o) => PARALINE_OPS.has(o.type));
+      if (paraLineOps.length > 0) {
+        const { insertParaLineInPlace } = await import('./cell-patch.js');
+        const plSummary = await insertParaLineInPlace(outPath, paraLineOps);
+        subModes.push(`para_line:${plSummary.mode || 'in-place'}`);
+        for (const e of plSummary) allEdits.push({ kind: 'para_line', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');

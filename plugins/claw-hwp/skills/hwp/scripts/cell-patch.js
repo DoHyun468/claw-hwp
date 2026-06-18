@@ -818,10 +818,14 @@ async function resolveCellIndexes(filePath, edits) {
 // content it matches the original size well; if the patched content grew,
 // stronger compression usually claws back the difference.
 function deflateToFit(data, capacity) {
-  const levels = [
-    constants.Z_DEFAULT_COMPRESSION,
-    7, 8, 9,
-  ];
+  // Level 9 (max compression) first — NOT the zlib default (6). Hancom's HWP
+  // inflater rejects some valid level-6 bitstreams (content-dependent: the file
+  // opens nowhere, "손상/형식 오류"), while the same content deflated at level 9
+  // opens — and level 9 is what rhwp / Hancom themselves emit. Level 9 is also
+  // the smallest, so it fits whenever any lower level would. (GT-confirmed
+  // 2026-06-18: a table-row insert produced byte-identical records + CFB to an
+  // rhwp-valid file, differing ONLY in the Section0 deflate; level 9 fixed it.)
+  const levels = [9, 8, 7, constants.Z_DEFAULT_COMPRESSION];
   let best = null;
   for (const level of levels) {
     const out = deflateRawSync(data, { level });
@@ -4714,6 +4718,180 @@ export async function insertShapeInPlace(filePath, ops) {
 }
 
 
+// ── 수식 (equation: EQEDIT) raw-patch ─────────────────────────────────────
+// GT-first (Hancom 입력 › 수식, downloaded as .hwp & byte-reversed — no HWPX
+// conversion): an equation is a self-contained like-char control paragraph —
+//   PARA_HEADER + PARA_TEXT(inline eqedit char 0x000b "deqe") + PARA_CHAR_SHAPE
+//   + CTRL_HEADER "deqe" (CommonObjAttr, like-char) + EQEDIT(0x58) record.
+// The EQEDIT(0x58) record carries the script: 00000000 + u16(script char count)
+// + UTF-16(script) + a 72-byte GT-verbatim tail (base size 1000=10pt, color,
+// "Equation Version 60" / "HancomEQN" engine strings). Only the script region
+// varies. Default object size ~5200×1163 HWPUNIT. Section0-only (no BinData /
+// DocInfo). Centered (+ a default top/bottom margin) when dropped into a cell.
+const TAG_EQEDIT = 0x58;
+const EQ_PARA_TEXT_HEX = '0b006465716500000000000000000b000d00'; // eqedit inline char + EOP
+const EQ_CHAR_SHAPE_HEX = '0000000008000000';
+const EQ_DEQE_CTRL_HEX = '6465716511232a1c0000000000000000501400008b040000000000003800380000000000ca56a94200000000070018c2ddc2200085c7c8b2e4b22e00';
+const EQ_DATA_SUFFIX_HEX = 'e8030000000000005900000013004500710075006100740069006f006e002000560065007200730069006f006e002000360030000900480061006e0063006f006d00450051004e00';
+
+// Build a self-contained equation paragraph for `script` (the EQEDIT source,
+// e.g. "x^2 + y^2 = z^2"). psId = the paragraph's para_shape (alignment).
+// inst seeds a fresh instance id (deqe CTRL @36 = inst+0x10). cellMarginHu
+// (optional) sets the deqe CommonObjAttr top/bottom outMargin (off 32/34) so an
+// in-cell equation gets a little vertical breathing room (the row grows to fit).
+function buildEquationCluster(script, inst, psId, cellMarginHu) {
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(9, 0); ph.writeUInt32LE(0x800, 4);
+  ph.writeUInt16LE((psId || 0) & 0xFFFF, 8); // para_shape (alignment)
+  ph.writeUInt16LE(1, 12); ph.writeUInt32LE(inst >>> 0, 18);
+  const pt = Buffer.from(EQ_PARA_TEXT_HEX, 'hex');
+  const cs = Buffer.from(EQ_CHAR_SHAPE_HEX, 'hex');
+  const ch = Buffer.from(EQ_DEQE_CTRL_HEX, 'hex');
+  ch.writeUInt32LE((inst + 0x10) >>> 0, 36);
+  if (Number.isInteger(cellMarginHu)) {
+    ch.writeUInt16LE(cellMarginHu & 0xFFFF, 32); // deqe outMargin top
+    ch.writeUInt16LE(cellMarginHu & 0xFFFF, 34); // deqe outMargin bottom
+  }
+  const lenField = Buffer.alloc(2); lenField.writeUInt16LE(script.length & 0xFFFF, 0);
+  const eq = Buffer.concat([
+    Buffer.from('00000000', 'hex'), lenField, Buffer.from(script, 'utf16le'),
+    Buffer.from(EQ_DATA_SUFFIX_HEX, 'hex'),
+  ]);
+  return Buffer.concat([
+    buildRecordHeader(TAG_PARA_HEADER, 0, ph.length), ph,
+    buildRecordHeader(TAG_PARA_TEXT, 1, pt.length), pt,
+    buildRecordHeader(TAG_PARA_CHAR_SHAPE, 1, cs.length), cs,
+    buildRecordHeader(TAG_CTRL_HEADER, 1, ch.length), ch,
+    buildRecordHeader(TAG_EQEDIT, 2, eq.length), eq,
+  ]);
+}
+
+// Insert an equation. Each op: { script: string, anchor?: string,
+// cell?: {row, col, para?, control?} }. `script` is the EQEDIT (Hancom 수식)
+// source string. In a cell the equation is centered + given a default vertical
+// margin (matching insert_image/shape/chart). Size/spacing tuning is deferred
+// to the HWPX-team coordination (per user) — default object size goes in as-is.
+export async function insertEquationInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  // Equations dropped into a table cell are centered by default (user pref):
+  // make sure a centered ParaShape exists (DocInfo write) before Section0.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const script = (typeof op.script === 'string' && op.script.length) ? op.script : 'x^2 + y^2 = z^2';
+    const records = parseRecords(raw);
+    const inst = pickFreshInstanceId(records, raw);
+
+    if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+      // ── Drop the equation INSIDE a table cell — centered, with vertical margin.
+      // spliceGsoIntoCell re-levels +2, sets the centered para_shape, splices at
+      // the cell end, bumps nParagraphs, fixes the last-para flag. Its gso-margin
+      // step is a no-op for "deqe" (not ' osg'), so we pre-set the deqe outMargin.
+      const cluster = buildEquationCluster(script, inst, centerPsId, CELL_OBJ_VMARGIN_HU);
+      raw = spliceGsoIntoCell(raw, cluster, op.cell.para ?? 0, op.cell.control ?? 0, op.cell.row, op.cell.col, centerPsId);
+      summary.push({ section: 0, equation: script, cell: { row: op.cell.row, col: op.cell.col } });
+      continue;
+    }
+
+    // ── Body: insert as a new paragraph after the anchor (or last body para),
+    // cloning that paragraph's para_shape so the equation line matches its
+    // alignment.
+    const clusters = findClusterBoundaries(records);
+    let psId = 0, insertAt = raw.length;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const ab = Buffer.from(op.anchor, 'utf16le');
+      for (const c of clusters) {
+        let hit = false;
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; }
+        }
+        if (hit) {
+          psId = raw.readUInt16LE(records[c.startIdx].dataOff + 8);
+          insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length;
+          break;
+        }
+      }
+    } else {
+      const t = findLastSimpleBodyParagraph(records);
+      psId = raw.readUInt16LE(records[t.startIdx].dataOff + 8);
+      insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+    }
+    const cluster = buildEquationCluster(script, inst, psId);
+    raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+    normalizeLastParaFlag(raw);
+    summary.push({ section: 0, equation: script, anchor: op.anchor ?? null });
+  }
+
+  // Deflate + write back (mirror insert_shape's Section0-only path).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+  writeFileSync(filePath, buf);
+
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── 글상자 (text box) raw-patch ───────────────────────────────────────────
 // GT-first (Hancom's 입력 › 글상자): a text box is a rect gso object carrying
 // inner text. Same anchor-attach as insert_shape (inline gso char 0x000b in
@@ -8036,11 +8214,10 @@ export async function splitCellInPlace(filePath, ops) {
     for (const c of cells) if (c.row > R) secRaw.writeUInt16LE((c.row + N - 1) & 0xFFFF, c.lhDataOff + 10);
 
     // N−1 new blank cells at (R+1..R+N−1, C), cloned from an empty cell in col C
-    const tmpl = cells.find((c) => c.col === C && c.colSpan === 1 && c.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(c.startByte, c.endByte)))
-      || cells.find((c) => c.colSpan === 1 && c.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(c.startByte, c.endByte)));
-    if (!tmpl) throw new Error(`split_cell: no empty 1×1 cell to clone for the new cell(s)`);
+    const make = cellCloner(cells, secRaw, C);
+    if (!make) throw new Error(`split_cell: no plain 1×1 cell to clone for the new cell(s)`);
     const newCells = [];
-    for (let k = 1; k < N; k++) newCells.push(cloneCellCluster(secRaw.slice(tmpl.startByte, tmpl.endByte), R + k, C));
+    for (let k = 1; k < N; k++) newCells.push(make(R + k, C));
     const newCellsBuf = Buffer.concat(newCells);
     let insOff = null;
     for (const c of cells) { if (c.row >= R + 1) { insOff = c.startByte; break; } }
@@ -8115,6 +8292,74 @@ function cloneCellCluster(clusterBytes, newRow, newCol) {
   return out;
 }
 
+// Build a blank cell by cloning a cell (even a non-empty one) and stripping it
+// down to a single empty paragraph — the FALLBACK for a fully-populated table
+// with no empty 1×1 cell to clone. Keeps the source cell's width/borderFill (so
+// the new cell matches its column) but reduces its content to one empty
+// paragraph (char_count 1 = just the 0x000d EOP) so the result satisfies
+// isEmptyCellCluster. nParagraphs→1, col@8/row@10 rewritten to (newRow, newCol);
+// the first paragraph's PARA_CHAR_SHAPE / PARA_LINE_SEG are kept (so the cell
+// looks like a real Hancom cell — line layout is recomputed on render).
+function emptyCellClusterFromClone(clusterBytes, newRow, newCol) {
+  const recs = parseRecords(clusterBytes);
+  const lh = recs.find((r) => r.tag === TAG_LIST_HEADER && r.level === 2);
+  if (!lh) throw new Error('emptyCellClusterFromClone: no LIST_HEADER in cluster');
+  const phIdx = recs.findIndex((r) => r.tag === TAG_PARA_HEADER && r.level === 2 && r.headOff > lh.headOff);
+  if (phIdx < 0) throw new Error('emptyCellClusterFromClone: no cell paragraph');
+  // The first paragraph runs [phIdx, endIdx) — up to the next level-2 PARA_HEADER.
+  let endIdx = recs.length;
+  for (let i = phIdx + 1; i < recs.length; i++) { if (recs[i].tag === TAG_PARA_HEADER && recs[i].level === 2) { endIdx = i; break; } }
+  const out = [];
+  // LIST_HEADER record (verbatim) with nParagraphs→1 and the new grid address.
+  const lhRec = Buffer.from(clusterBytes.slice(lh.headOff, recs[phIdx].headOff));
+  const lhBody = lh.dataOff - lh.headOff;
+  lhRec.writeUInt16LE(1, lhBody + 0);                 // nParagraphs = 1
+  lhRec.writeUInt16LE(newCol & 0xFFFF, lhBody + 8);
+  lhRec.writeUInt16LE(newRow & 0xFFFF, lhBody + 10);
+  out.push(lhRec);
+  // Keep ONLY the first paragraph, reduced to a real Hancom EMPTY-cell shape:
+  //   PARA_HEADER (char_count 1) + PARA_CHAR_SHAPE + PARA_LINE_SEG, NO PARA_TEXT.
+  // A genuine empty cell paragraph OMITS the PARA_TEXT record entirely (just the
+  // implicit 0x000d EOP) and keeps its line seg; emitting a PARA_TEXT or dropping
+  // the line seg makes Hancom reject the file. The line seg is cloned from the
+  // source cell (same column → right width); Hancom recomputes layout on open.
+  for (let i = phIdx; i < endIdx; i++) {
+    const r = recs[i];
+    if (r.tag === TAG_PARA_TEXT) continue;               // omit — empty para has no text record
+    const recBytes = Buffer.from(clusterBytes.slice(r.headOff, r.dataOff + r.size));
+    const bodyOff = r.dataOff - r.headOff;
+    if (r.tag === TAG_PARA_HEADER) {
+      const flag = recBytes.readUInt32LE(bodyOff) & 0x80000000;
+      recBytes.writeUInt32LE((flag | 1) >>> 0, bodyOff); // char_count = 1 (keep last-para flag)
+      out.push(recBytes);
+    } else {
+      out.push(recBytes);                                 // PARA_CHAR_SHAPE / PARA_LINE_SEG as-is
+    }
+  }
+  return Buffer.concat(out);
+}
+
+// Pick a cloneable 1×1 cell + a builder for a new blank cell. The source MUST
+// carry the column's real width: rhwp emits header-row cells with a degenerate
+// width (1 HWPUNIT), and dropping a width-1 cell into a DATA row makes Hancom
+// reject the table as a grid-width mismatch (the data rows say the column is
+// ~20977, the new row says 1). So we pick the WIDEST 1×1 cell in `preferCol`
+// (the representative full-width cell), and clone it verbatim if it is already
+// empty, else clone+empty it. Returns make(row,col) → Buffer, or null if the
+// table has no plain 1×1 cell to clone.
+function cellCloner(cells, secRaw, preferCol) {
+  const width = (c) => secRaw.readUInt32LE(c.lhDataOff + 16);
+  const oneByOne = cells.filter((c) => c.colSpan === 1 && c.rowSpan === 1);
+  const inCol = oneByOne.filter((c) => c.col === preferCol);
+  const pool = inCol.length ? inCol : oneByOne;
+  if (!pool.length) return null;
+  const src = pool.reduce((a, b) => (width(b) > width(a) ? b : a)); // widest = real column width
+  const bytes = secRaw.slice(src.startByte, src.endByte);
+  return isEmptyCellCluster(bytes)
+    ? (row, col) => cloneCellCluster(bytes, row, col)
+    : (row, col) => emptyCellClusterFromClone(bytes, row, col);
+}
+
 /**
  * Insert a blank table row (`insert_table_row`) into an existing `.hwp` via
  * raw-patch. Op: `{ section?, para?, control?, row, position? }` where
@@ -8174,9 +8419,9 @@ export async function insertTableRowInPlace(filePath, ops) {
     // synthesize the new row's blank cells (clone an empty 1×1 cell per column)
     const newClusters = [];
     for (let c = 0; c < cols; c++) {
-      const tmpl = cells.find((cc) => cc.col === c && cc.colSpan === 1 && cc.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(cc.startByte, cc.endByte)));
-      if (!tmpl) throw new Error(`insert_table_row: no empty 1×1 cell in column ${c} to clone as the new cell`);
-      newClusters.push(cloneCellCluster(secRaw.slice(tmpl.startByte, tmpl.endByte), insertRow, c));
+      const make = cellCloner(cells, secRaw, c);
+      if (!make) throw new Error(`insert_table_row: no plain 1×1 cell in the table to clone as the new cell`);
+      newClusters.push(make(insertRow, c));
     }
     const newCellsBuf = Buffer.concat(newClusters);
 
@@ -8307,13 +8552,11 @@ export async function insertTableColInPlace(filePath, ops) {
     for (let r = 0; r < rows; r++) {
       if (covered.has(r)) continue;
       // prefer an empty cell from the REFERENCE column (op.col) so the new
-      // column inherits a sensible width, then the same row, then any.
-      const empty1x1 = (cc) => cc.colSpan === 1 && cc.rowSpan === 1 && isEmptyCellCluster(secRaw.slice(cc.startByte, cc.endByte));
-      let tmpl = cells.find((cc) => cc.col === op.col && empty1x1(cc))
-        || cells.find((cc) => cc.row === r && empty1x1(cc))
-        || cells.find((cc) => empty1x1(cc));
-      if (!tmpl) throw new Error(`insert_table_col: no empty 1×1 cell to clone for row ${r}`);
-      const cluster = cloneCellCluster(secRaw.slice(tmpl.startByte, tmpl.endByte), r, newCol);
+      // column inherits a sensible width; if the table has no empty 1×1 cell at
+      // all, cellCloner clones any 1×1 cell and empties it.
+      const make = cellCloner(cells, secRaw, op.col);
+      if (!make) throw new Error(`insert_table_col: no plain 1×1 cell to clone for row ${r}`);
+      const cluster = make(r, newCol);
       let off = null;
       for (const cc of cells) { if (cc.row === r && cc.col >= newCol) { off = cc.startByte; break; } }
       if (off == null) { const rc = cells.filter((cc) => cc.row === r); off = rc.length ? rc[rc.length - 1].endByte : (tableRec.dataOff + tableRec.size); }
