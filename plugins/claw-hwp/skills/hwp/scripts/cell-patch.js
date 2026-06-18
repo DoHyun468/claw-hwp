@@ -7287,10 +7287,13 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
   for (const op of ops) {
     if ((op.section ?? 0) !== 0) throw new Error(`set_object_property: only section 0 is supported (got ${op.section})`);
     const has = op.fill != null || op.border_color != null || op.border_width_mm != null
-      || Array.isArray(op.margins) || op.margin_mm != null;
-    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / margins / margin_mm is required');
+      || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null;
+    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / margins / margin_mm / wrap is required');
     if (Array.isArray(op.margins) && op.margins.length !== 4) {
       throw new Error('set_object_property: margins must be [left,right,top,bottom] (4 values, mm)');
+    }
+    if (op.wrap != null && TABLE_WRAP[String(op.wrap).toLowerCase()] == null) {
+      throw new Error('set_object_property: wrap must be inline / square / topbottom / behind / front');
     }
   }
 
@@ -7338,6 +7341,14 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
         : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
       for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, ctrl.dataOff + GSO_OUTMARGIN_OFF + i * 2);
       rec.margins_mm = margins;
+    }
+    if (op.wrap != null) {
+      // Object text-wrap = the gso CTRL_HEADER attribute, GT-confirmed to use the
+      // SAME bit field as the table (mask 0x600001: bit0 like-char + bits 21-22).
+      const bits = TABLE_WRAP[String(op.wrap).toLowerCase()];
+      const attr = secRaw.readUInt32LE(ctrl.dataOff + 4);
+      secRaw.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | bits) >>> 0, ctrl.dataOff + 4);
+      rec.wrap = String(op.wrap).toLowerCase();
     }
     if (op.fill != null || op.border_color != null || op.border_width_mm != null) {
       if (!comp) throw new Error(`set_object_property: no SHAPE_COMPONENT for object ${idx} (fill/border need a shape)`);
