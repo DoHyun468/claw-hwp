@@ -1625,9 +1625,14 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
       for (const { sec, para, ctrl } of candidates) {
         const grid = describeTable(doc, sec, para, ctrl);
         if (!grid) continue;
+        // Strip whitespace (incl. \r\n between a cell's paragraphs and the
+        // full-width spaces Korean forms pad labels with) from BOTH sides before
+        // matching — a label like "사업장소재지" is often stored as two cell
+        // paragraphs "사업장\r소재지", and "사업자등록번호" as "사 업 자등록번호".
+        const norm = (s) => s.replace(/[\s　]+/g, '');
         for (const cell of grid.cells) {
-          const txt = caseSensitive ? cell.text : cell.text.toLowerCase();
-          const needle = caseSensitive ? op.label : op.label.toLowerCase();
+          const txt = norm(caseSensitive ? cell.text : cell.text.toLowerCase());
+          const needle = norm(caseSensitive ? op.label : op.label.toLowerCase());
           if (txt.includes(needle)) hits.push({ sec, para, ctrl, cell });
         }
       }
