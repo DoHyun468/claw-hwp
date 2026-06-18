@@ -39,7 +39,7 @@ each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `replace_text` | `find`, `replace` | **Global** (every occurrence, all sections). Matches text nodes (incl. nodes carrying inline controls like `<hp:fwSpace/>`/`<hp:tab/>`) AND placeholders **split across adjacent runs** (mixed formatting) — the cross-run replacement takes the first overlapped run's char shape, trailing overlapped runs are emptied. Object/table runs are never disturbed. Caveats: can't match a literal that itself spans a control or a line break, and `<`/`>`/`&` are stored escaped (match a distinctive substring on one side). |
+| `replace_text` | `find`, `replace` | **Global** (every occurrence, all sections). **Control- and run-aware:** matches a placeholder even when split by inline controls (`<hp:fwSpace/>` full-width space, `<hp:tab/>`, line break — common in Korean form titles/dates/author lines) and when split **across differently-formatted runs**; the replacement takes the first overlapped run's char shape, controls inside the match are dropped, object/table runs are never disturbed. Reaches table-cell text incl. nested tables. Only caveat: `<`/`>`/`&` are stored escaped (`&lt;` …) so a `find` literally containing them won't match — search without the brackets. |
 | `fill_template` | `values` (object `{ "{{k}}": "v" }`) | Multiple `replace_text` in one pass (same matching as above). Returns `total` + `perKey`. |
 | `set_paragraph_text` | `index`, `text` | Replaces the whole paragraph body with one run (keeps its first `charPrIDRef`). |
 | `set_field_value` | `name`, `value` | Sets text inside the first `<hp:fldBegin name=...>`…`<hp:fldEnd>` pair. `set: 0` if no such field. |

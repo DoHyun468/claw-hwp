@@ -222,73 +222,120 @@ function dropLinesegs(s) {
 // targets split across runs are not joined (same as Hancom's text replace).
 // Uses split/join per text node (not a re-scanning loop) so a replacement that
 // itself contains `find` — e.g. '홍길동' → '홍길동(수정)' — can't loop forever.
-// Replace `find` even when it spans several adjacent text-runs of one paragraph.
-// A placeholder typed with mixed formatting (e.g. a form title where "보고서 제목"
-// and "(HY…)" carry different char shapes) is stored as multiple <hp:run> siblings,
-// so the per-node pass in opReplaceText can't see it (the #1 template-fill miss).
-// We scan maximal runs of 2+ consecutive TEXT-ONLY runs (only <hp:t> children),
-// join their text, and splice the match: the replacement inherits the first
-// overlapped run's formatting; other overlapped runs are emptied. Runs holding
-// objects/tables (non-<hp:t> children) never match, so they're left intact.
+// Inline control elements Hancom embeds inside a text node, splitting the visible
+// string (full-width space, tab, line break, hyphen…). They carry no char in `find`,
+// so they're treated as zero-width when matching (a natural `find` still matches
+// across them) and only the ones inside a match are dropped.
+const INLINE_CTRL_SRC = '<hp:(?:fwSpace|tab|lineBreak|hyphen|nbSpace|titleMark|insertBegin|insertEnd)\\b[^>]*\\/>';
+
+// Tokenize a text+inline-control stream into [{t:1,raw}|{t:0,raw}] tokens, copying
+// any extra fields from `tag` (e.g. the source run index) onto each token.
+function tokenizeStream(stream, tag) {
+  const toks = []; const re = new RegExp(INLINE_CTRL_SRC, 'g'); let last = 0, m;
+  while ((m = re.exec(stream))) {
+    if (m.index > last) toks.push({ t: 1, raw: stream.slice(last, m.index), ...tag });
+    toks.push({ t: 0, raw: m[0], ...tag });
+    last = m.index + m[0].length;
+  }
+  if (last < stream.length) toks.push({ t: 1, raw: stream.slice(last), ...tag });
+  return toks;
+}
+
+// Splice every `find`→`replace` in a token list, matching against the control-
+// stripped text. Text/controls inside a match are dropped; the replacement lands in
+// the first overlapped TEXT token (keeping its tag, e.g. run index); tokens outside
+// the match are preserved. Returns {toks, count}.
+function spliceTokenList(toks, find, replace) {
+  let count = 0, guard = 0, cur = toks;
+  for (;;) {
+    if (guard++ > 4000) break;
+    const norm = cur.map((x) => (x.t ? x.raw : '')).join('');
+    const s = norm.indexOf(find); if (s < 0) break;
+    const e = s + find.length;
+    const out = []; let pos = 0, inserted = false;
+    for (const x of cur) {
+      if (!x.t) { if (!(pos > s && pos < e)) out.push(x); continue; } // control: drop only if strictly inside
+      const ts = pos, te = pos + x.raw.length; pos = te;
+      if (te <= s || ts >= e) { out.push(x); continue; } // text token outside the match
+      const before = ts < s ? x.raw.slice(0, s - ts) : '';
+      const after = te > e ? x.raw.slice(e - ts) : '';
+      const merged = before + (inserted ? '' : xmlEscape(replace)) + after;
+      inserted = true;
+      if (merged) out.push({ ...x, raw: merged });
+    }
+    cur = out; count++;
+  }
+  return { toks: cur, count };
+}
+
+// Control-aware replace inside one <hp:t> body (single node). See INLINE_CTRL_SRC.
+function spliceNodeTokens(content, find, replace) {
+  const r = spliceTokenList(tokenizeStream(content, null), find, replace);
+  return { content: r.toks.map((x) => x.raw).join(''), count: r.count };
+}
+
+// Replace `find` even when it spans several <hp:t> nodes / adjacent text-runs of a
+// paragraph — a placeholder typed with mixed formatting, or a name/date/author line
+// sprinkled with <hp:fwSpace/> across runs (both very common in Korean forms), is
+// stored as multiple <hp:run> siblings so the per-node pass can't see it. We group
+// maximal runs of consecutive TEXT runs (a run with no nested run and no embedded
+// object), flatten their text+controls into one token list, splice, and rebuild each
+// run — the replacement inherits the first overlapped run's formatting; emptied runs
+// keep an empty <hp:t/>. Object/table runs are never grouped, so they stay intact;
+// cell-paragraph runs ARE reached (so a split label inside a table cell still fills).
 function replaceTextAcrossRuns(xml, find, replace) {
-  const TEXTRUN = '<hp:run\\b[^>]*>(?:<hp:t(?:\\s[^>]*)?>[^<]*<\\/hp:t>)+<\\/hp:run>';
-  const SEQ = new RegExp(`(?:${TEXTRUN}\\s*){2,}`, 'g');
-  const esc = xmlEscape(replace);
-  let count = 0;
-  const out = xml.replace(SEQ, (group) => {
-    const runRe = new RegExp(TEXTRUN, 'g');
-    const runs = [];
-    let m;
-    while ((m = runRe.exec(group))) {
-      const runXml = m[0];
-      runs.push({
-        open: runXml.match(/^<hp:run\b[^>]*>/)[0],
-        text: [...runXml.matchAll(/<hp:t(?:\s[^>]*)?>([^<]*)<\/hp:t>/g)].map((x) => x[1]).join(''),
-      });
-    }
-    let full = runs.map((r) => r.text).join('');
-    if (!full.includes(find)) return group;
-    let guard = 0;
-    while (full.includes(find) && guard++ < 1000) {
-      const s = full.indexOf(find), e = s + find.length;
-      let pos = 0, inserted = false;
-      for (const r of runs) {
-        const rs = pos, re = pos + r.text.length; pos = re;
-        if (re <= s || rs >= e) continue; // this run doesn't overlap the match
-        const before = rs < s ? r.text.slice(0, s - rs) : '';
-        const after = re > e ? r.text.slice(e - rs) : '';
-        r.text = before + (inserted ? '' : esc) + after; // replacement only on the first overlap
-        inserted = true;
-      }
-      full = runs.map((r) => r.text).join('');
-      count++;
-    }
-    return runs.map((r) => `${r.open}<hp:t>${r.text}</hp:t></hp:run>`).join('');
-  });
+  const RUN = /<hp:run\b[^>]*>(?:(?!<\/?hp:run\b)[\s\S])*?<\/hp:run>/g;
+  const OBJ = /<hp:(?:pic|chart|tbl|ellipse|rect|line|arc|polygon|curve|equation|container|ole|video|textart|connectLine|compose|dutmal|drawText)\b/;
+  const isText = (r) => r.includes('<hp:t') && !OBJ.test(r);
+  const runs = []; let m;
+  while ((m = RUN.exec(xml))) runs.push({ start: m.index, end: m.index + m[0].length, raw: m[0] });
+  if (!runs.length) return { xml, count: 0 };
+  // Group consecutive text runs separated only by whitespace (same paragraph).
+  const groups = []; let g = null;
+  for (const r of runs) {
+    if (isText(r.raw) && g && /^\s*$/.test(xml.slice(g.end, r.start))) { g.runs.push(r); g.end = r.end; }
+    else if (isText(r.raw)) { g = { runs: [r], start: r.start, end: r.end }; groups.push(g); }
+    else g = null;
+  }
+  let count = 0, out = xml;
+  for (let gi = groups.length - 1; gi >= 0; gi--) { // last→first so byte offsets stay valid
+    const grp = groups[gi];
+    let toks = []; const opens = [];
+    grp.runs.forEach((r, idx) => {
+      const open = r.raw.match(/^<hp:run\b[^>]*>/)[0];
+      opens.push(open);
+      const inner = r.raw.slice(open.length, r.raw.length - '</hp:run>'.length);
+      const stream = inner.replace(/<hp:t(?:\s[^>]*)?>/g, '').replace(/<\/hp:t>/g, ''); // text + inline controls
+      toks = toks.concat(tokenizeStream(stream, { run: idx }));
+    });
+    if (!toks.map((x) => (x.t ? x.raw : '')).join('').includes(find)) continue;
+    const r = spliceTokenList(toks, find, replace);
+    count += r.count;
+    const byRun = grp.runs.map(() => []);
+    for (const x of r.toks) byRun[x.run].push(x.raw);
+    const rebuilt = grp.runs.map((_, idx) => `${opens[idx]}<hp:t>${byRun[idx].join('')}</hp:t></hp:run>`).join('');
+    out = out.slice(0, grp.start) + rebuilt + out.slice(grp.end);
+  }
   return { xml: out, count };
 }
 
 function opReplaceText(doc, find, replace) {
   if (!find) throw new Error('replace_text: "find" is required and non-empty');
-  // Capture the WHOLE <hp:t> body, not [^<]* — Hancom embeds inline controls in
-  // text nodes (<hp:fwSpace/> full-width space, <hp:tab/>, <hp:lineBreak/>…), and
-  // [^<]* stops at the first one, so it would miss (and corrupt) any node that
-  // carries them. [\s\S]*? still stops at the node's own </hp:t> (hp:t can't nest).
-  // A plain `find` that doesn't itself contain a control matches the text on
-  // either side of one; a placeholder split BY a control (e.g. "제목<fwSpace/>(…)")
-  // is replaced one side at a time — match a distinctive substring, not the whole
-  // multi-part label.
+  // Capture the WHOLE <hp:t> body ([\s\S]*?, not [^<]*) so inline controls inside
+  // it are visible to the splicer; spliceNodeTokens then matches THROUGH them
+  // (<hp:fwSpace/> etc. are zero-width for matching), so a natural `find` like
+  // "2017. 3. 28(금)" fills even though it's stored "2017.<hp:fwSpace/> 3. 28(금)".
   const nodeRe = /(<hp:t(?:\s[^>]*)?>)([\s\S]*?)(<\/hp:t>)/g;
   let total = 0;
   for (const name of doc.sectionNames()) {
     let changed = false;
-    // Pass 1 — match inside a single text node (fast, formatting-exact).
+    // Pass 1 — within a single text node (control-aware).
     let xml = doc.read(name).replace(nodeRe, (m, open, text, close) => {
-      if (!text.includes(find)) return m;
-      const parts = text.split(find);
-      total += parts.length - 1;
+      const r = spliceNodeTokens(text, find, replace);
+      if (!r.count) return m;
+      total += r.count;
       changed = true;
-      return open + parts.join(xmlEscape(replace)) + close;
+      return open + r.content + close;
     });
     // Pass 2 — match across adjacent text-runs (placeholder split by formatting).
     const cross = replaceTextAcrossRuns(xml, find, replace);
