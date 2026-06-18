@@ -222,19 +222,77 @@ function dropLinesegs(s) {
 // targets split across runs are not joined (same as Hancom's text replace).
 // Uses split/join per text node (not a re-scanning loop) so a replacement that
 // itself contains `find` — e.g. '홍길동' → '홍길동(수정)' — can't loop forever.
+// Replace `find` even when it spans several adjacent text-runs of one paragraph.
+// A placeholder typed with mixed formatting (e.g. a form title where "보고서 제목"
+// and "(HY…)" carry different char shapes) is stored as multiple <hp:run> siblings,
+// so the per-node pass in opReplaceText can't see it (the #1 template-fill miss).
+// We scan maximal runs of 2+ consecutive TEXT-ONLY runs (only <hp:t> children),
+// join their text, and splice the match: the replacement inherits the first
+// overlapped run's formatting; other overlapped runs are emptied. Runs holding
+// objects/tables (non-<hp:t> children) never match, so they're left intact.
+function replaceTextAcrossRuns(xml, find, replace) {
+  const TEXTRUN = '<hp:run\\b[^>]*>(?:<hp:t(?:\\s[^>]*)?>[^<]*<\\/hp:t>)+<\\/hp:run>';
+  const SEQ = new RegExp(`(?:${TEXTRUN}\\s*){2,}`, 'g');
+  const esc = xmlEscape(replace);
+  let count = 0;
+  const out = xml.replace(SEQ, (group) => {
+    const runRe = new RegExp(TEXTRUN, 'g');
+    const runs = [];
+    let m;
+    while ((m = runRe.exec(group))) {
+      const runXml = m[0];
+      runs.push({
+        open: runXml.match(/^<hp:run\b[^>]*>/)[0],
+        text: [...runXml.matchAll(/<hp:t(?:\s[^>]*)?>([^<]*)<\/hp:t>/g)].map((x) => x[1]).join(''),
+      });
+    }
+    let full = runs.map((r) => r.text).join('');
+    if (!full.includes(find)) return group;
+    let guard = 0;
+    while (full.includes(find) && guard++ < 1000) {
+      const s = full.indexOf(find), e = s + find.length;
+      let pos = 0, inserted = false;
+      for (const r of runs) {
+        const rs = pos, re = pos + r.text.length; pos = re;
+        if (re <= s || rs >= e) continue; // this run doesn't overlap the match
+        const before = rs < s ? r.text.slice(0, s - rs) : '';
+        const after = re > e ? r.text.slice(e - rs) : '';
+        r.text = before + (inserted ? '' : esc) + after; // replacement only on the first overlap
+        inserted = true;
+      }
+      full = runs.map((r) => r.text).join('');
+      count++;
+    }
+    return runs.map((r) => `${r.open}<hp:t>${r.text}</hp:t></hp:run>`).join('');
+  });
+  return { xml: out, count };
+}
+
 function opReplaceText(doc, find, replace) {
   if (!find) throw new Error('replace_text: "find" is required and non-empty');
-  const nodeRe = /(<hp:t(?:\s[^>]*)?>)([^<]*)(<\/hp:t>)/g;
+  // Capture the WHOLE <hp:t> body, not [^<]* — Hancom embeds inline controls in
+  // text nodes (<hp:fwSpace/> full-width space, <hp:tab/>, <hp:lineBreak/>…), and
+  // [^<]* stops at the first one, so it would miss (and corrupt) any node that
+  // carries them. [\s\S]*? still stops at the node's own </hp:t> (hp:t can't nest).
+  // A plain `find` that doesn't itself contain a control matches the text on
+  // either side of one; a placeholder split BY a control (e.g. "제목<fwSpace/>(…)")
+  // is replaced one side at a time — match a distinctive substring, not the whole
+  // multi-part label.
+  const nodeRe = /(<hp:t(?:\s[^>]*)?>)([\s\S]*?)(<\/hp:t>)/g;
   let total = 0;
   for (const name of doc.sectionNames()) {
     let changed = false;
-    const xml = doc.read(name).replace(nodeRe, (m, open, text, close) => {
+    // Pass 1 — match inside a single text node (fast, formatting-exact).
+    let xml = doc.read(name).replace(nodeRe, (m, open, text, close) => {
       if (!text.includes(find)) return m;
       const parts = text.split(find);
       total += parts.length - 1;
       changed = true;
       return open + parts.join(xmlEscape(replace)) + close;
     });
+    // Pass 2 — match across adjacent text-runs (placeholder split by formatting).
+    const cross = replaceTextAcrossRuns(xml, find, replace);
+    if (cross.count) { xml = cross.xml; total += cross.count; changed = true; }
     if (changed) doc.write(name, dropLinesegs(xml));
   }
   return { replaced: total };

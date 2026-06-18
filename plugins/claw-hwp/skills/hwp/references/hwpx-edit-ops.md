@@ -39,8 +39,8 @@ each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `replace_text` | `find`, `replace` | Replaces inside `<hp:t>` nodes only. A match must sit within one text node — targets split across runs (e.g. "산업"+"AI") are not joined. |
-| `fill_template` | `values` (object `{ "{{k}}": "v" }`) | Multiple `replace_text` in one pass. Returns `total` + `perKey`. |
+| `replace_text` | `find`, `replace` | **Global** (every occurrence, all sections). Matches text nodes (incl. nodes carrying inline controls like `<hp:fwSpace/>`/`<hp:tab/>`) AND placeholders **split across adjacent runs** (mixed formatting) — the cross-run replacement takes the first overlapped run's char shape, trailing overlapped runs are emptied. Object/table runs are never disturbed. Caveats: can't match a literal that itself spans a control or a line break, and `<`/`>`/`&` are stored escaped (match a distinctive substring on one side). |
+| `fill_template` | `values` (object `{ "{{k}}": "v" }`) | Multiple `replace_text` in one pass (same matching as above). Returns `total` + `perKey`. |
 | `set_paragraph_text` | `index`, `text` | Replaces the whole paragraph body with one run (keeps its first `charPrIDRef`). |
 | `set_field_value` | `name`, `value` | Sets text inside the first `<hp:fldBegin name=...>`…`<hp:fldEnd>` pair. `set: 0` if no such field. |
 

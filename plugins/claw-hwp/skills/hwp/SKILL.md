@@ -335,6 +335,33 @@ For `.hwp` input, route through `create.js`. When the path already exists and th
 
 **Output format default**: **keep the input's original format**. `.hwp` in → `.hwp` out (raw-patch via `cell-patch.js`, tables preserved). `.hwpx` in → `.hwpx` out (XML edit via `hwpx-edit.js`, tables preserved). Use `convert.js` only when the user explicitly requests a `.hwp ↔ .hwpx` format change — it routes through rhwp's serializer which drops tables.
 
+### "Fill in this form / 서식 / 양식 / 템플릿" — filling a template
+
+Filling a blank form (the user gives a `.hwp`/`.hwpx` template and wants the fields populated) is just in-place editing, but the failure modes are specific enough to call out. **The workflow is the same for both formats; only the engine caveats differ — so: common workflow first, then per-format notes.**
+
+#### Common (both `.hwp` and `.hwpx`)
+
+1. **Never start the payload with `setup_document`** on an existing file — that builds a brand-new blank doc and destroys the form (`create.js` refuses it unless `allow_overwrite:true`). Load the file and use fill ops.
+2. **Map the fields first.** Run `extract_text.js --format markdown <file>` (shows tables + text in document order) and `--inspect` (table / cell counts). For each value the user wants, decide: is the placeholder a **body paragraph** or a **table cell**, and what is its exact text?
+3. **Pick the tool by field type:** `replace_text {find, replace}` for inline placeholder text; cell ops for table cells (see per-format below).
+4. **Plain text only.** No markdown — `**bold**` lands as literal asterisks. Styling an existing form's cells is limited; if a styling op errors, report it as a limitation rather than faking it.
+5. **Verify** with `extract_text.js --format markdown` (did the values land?) **and a real 한컴 open** — placeholders are very often split mid-string, so always eyeball the render.
+
+**`replace_text` gotchas (both formats):**
+- **It's global** — replaces *every* occurrence of `find`. Boilerplate placeholder text that repeats (a font-name note, `○○○`, `_____`) changes everywhere. Use a **distinctive/unique** substring, or target the specific cell/index.
+- **It can't match across an inline control or an escaped char.** A placeholder broken by a full-width space (stored as `<hp:fwSpace/>`), a tab (`<hp:tab/>`), or a line break won't match as one literal; nor will text containing `<`, `>`, `&` (stored `&lt; &gt; &amp;`). **Fix: match a distinctive substring on ONE side** — e.g. fill `"보고서 제목"` and separately clear `"(주석)"`, instead of trying the whole `"보고서 제목 (주석)"`. (GT: a form title `보고서 제목<hp:fwSpace/>(…)` only fills when matched in two pieces.)
+
+#### `.hwpx` form notes
+- Engine = `hwpx-edit.js` (unpack → edit XML → repack): **surgical and 한컴-safe at any document size** (no round-trip serialization).
+- `replace_text` now also matches a placeholder **split across runs** (typed with mixed formatting) and one inside a **text node that carries inline controls** — the fill keeps the first run's look. It also reaches **table-cell** text.
+- **No `set_cell_text_by_label`** here — address cells by index: `set_cell_text {table, row, col, text}` (find the indices with `--format markdown`). `fill_template {values:{ "{{key}}": "값", … }}` batch-replaces `{{token}}`-style placeholders in one op.
+
+#### `.hwp` form notes
+- Engine = `create.js` raw-patch (`cell-patch.js`), byte-level in place: **text/cell fills are 한컴-safe at any size.**
+- **`set_cell_text_by_label`** is the easiest tool — finds a cell by its label text and writes the adjacent cell (`col_offset`/`row_offset`), no coordinates needed.
+- ⚠️ **`replace_text` does NOT enter table cells** here (rhwp's `searchText` skips `<hp:tbl>`). If it reports 0 matches on an anchor you can see, it's in a table → switch to `set_cell_text_by_label`.
+- ⚠️ **Adding new objects** (images, etc.) to a **large** form (50+ pages) via the rhwp round-trip isn't 한컴-safe — on big forms, fill text/cells only.
+
 ### "Show me what this looks like" / "Preview this HWP file"
 
 > ⚠️ **Preview is feedback, not verification.** This is our own lightweight renderer (rhwp WASM canvas) — fast and convenient for showing edits visually, but **NOT** a 한컴 compatibility check. It can show a file as fine that 한컴독스 silently rejects (round-trip strips, fingerprint issues, web-only mis-renders, silent attribute drops). **Real verification = 한컴독스 (web) or 한컴오피스 (desktop) only** — see the "Verifying in 한컴독스" section for the companion skill (`hancomdocs-capture`).
