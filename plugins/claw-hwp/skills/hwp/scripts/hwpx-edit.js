@@ -32,6 +32,12 @@
 //   set_cell_diagonal     { table, row, col, direction, color?, width? }   // direction = BACKSLASH | SLASH
 //   set_cell_align        { table, row, col, horizontal?, vertical? }      // horiz = LEFT/CENTER/RIGHT/JUSTIFY/DISTRIBUTE, vert = TOP/CENTER/BOTTOM
 //   set_cell_size         { table, row, col, width?, height? }             // HWP units
+//   set_cell_margin       { table, row, col, to_row?, to_col?, left?, right?, top?, bottom? }  // 셀 안 여백(mm); to_*로 범위
+//   set_table_margin      { table, left?, right?, top?, bottom? }           // 표 바깥 여백(mm) = 표↔본문 간격
+//   set_table_inner_margin{ table, left?, right?, top?, bottom? }           // 표 '모든 셀' 기본 안 여백(mm)
+//   set_table_size        { table, width_mm?, height_mm? }                  // 표 전체 크기 — 열/행 비례 스케일(한컴이 sz를 셀합으로 재계산하므로)
+//   set_table_props       { table, wrap?, page_split?, repeat_header? }     // wrap=inline|square|topbottom|front|behind; page_split=none|cell|table; repeat_header=bool(머리행 반복)
+//   set_title_cell        { table, row, col, on? }                          // <hp:tc header="1"> (머리 행 셀)
 //   set_page_break        { index, on? }                                   // sets <hp:p pageBreak="1"> before paragraph index
 //   set_bullet_list       { index, char?, level? }                        // bullet (• default; char="▶"|"◯"|"□"|"★" etc. registers a new bullet entry)
 //   set_number_list       { index, level?, style? }                        // numbered list — `style: "korean"` → 1./가./1)/가); `style: "decimal"` → 1./1.1./1.1.1.; omit → use doc's existing numbering id=1 (varies by template)
@@ -1677,6 +1683,159 @@ function opSetCellSize(doc, tableIndex, row, col, width, height) {
   return { table: tableIndex, row, col, width: w, height: h };
 }
 
+// ── 표/셀 속성 다이얼로그(기본·표·여백/캡션·셀)의 빈 칸 채우기 ────────────────
+// GT 구조: handoff/shared/SHARED_op-inventory-for-GT.md §1 (claw-hancomdocs 가
+// 한컴 web 에서 실측한 native XML). margin/size 입력은 mm(다이얼로그 단위) → HWPUNIT.
+const HU_PER_MM = 283.46;
+const mm2hu = (v) => Math.round(Number(v) * HU_PER_MM);
+
+// 표의 도형 메타(sz/pos/outMargin/inMargin)는 <hp:tbl> inner 의 맨 앞(첫 <hp:tr> 이전)에
+// 산다. 그 영역만 고쳐서, 셀 단위 <hp:cellMargin>/<hp:cellSz>(모양이 비슷)을 안 건드린다.
+function rewriteTblMeta(doc, tableIndex, opName, fn) {
+  const { section, el } = getTable(doc, tableIndex);
+  const trAt = el.inner.search(/<hp:tr\b/);
+  const head = trAt >= 0 ? el.inner.slice(0, trAt) : el.inner;
+  const rest = trAt >= 0 ? el.inner.slice(trAt) : '';
+  const newHead = fn(head);
+  if (newHead === head) throw new Error(`${opName}: table meta element not found`);
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${newHead}${rest}</hp:tbl>`));
+}
+function applyMm(xml, want) { let s = xml; for (const k of Object.keys(want)) s = s.replace(new RegExp(`${k}="[^"]*"`), `${k}="${want[k]}"`); return s; }
+function marginWant(opts) { const w = {}; for (const k of ['left', 'right', 'top', 'bottom']) if (opts[k] != null) w[k] = mm2hu(opts[k]); return w; }
+
+// 셀 안 여백 (cellMargin) — 선택 셀, 또는 [row,col]..[to_row,to_col] 범위.
+function opSetCellMargin(doc, tableIndex, row, col, opts) {
+  const want = marginWant(opts);
+  if (!Object.keys(want).length) throw new Error('set_cell_margin: need left/right/top/bottom (mm)');
+  const { section, el } = getTable(doc, tableIndex);
+  const rA = Math.min(row, opts.to_row ?? row), rB = Math.max(row, opts.to_row ?? row);
+  const cA = Math.min(col, opts.to_col ?? col), cB = Math.max(col, opts.to_col ?? col);
+  let inner = el.inner, touched = 0;
+  for (let ri = rB; ri >= rA; ri--) {                       // bottom-up: splice offsets stay valid
+    const rows = scanTopLevel(inner, 'hp:tr');
+    if (ri < 0 || ri >= rows.length) continue;
+    const tr = rows[ri];
+    let trInner = tr.inner;
+    for (let ci = cB; ci >= cA; ci--) {
+      const tcs = scanTopLevel(trInner, 'hp:tc');
+      if (ci < 0 || ci >= tcs.length) continue;
+      const tc = tcs[ci];
+      const cur = (tc.inner.match(/<hp:cellMargin\b[^>]*\/>/) || [])[0];
+      const cm = cur ? applyMm(cur, want)
+        : `<hp:cellMargin left="${want.left ?? 0}" right="${want.right ?? 0}" top="${want.top ?? 0}" bottom="${want.bottom ?? 0}"/>`;
+      const tcInner = cur ? tc.inner.replace(cur, cm) : tc.inner + cm;   // append after cellSz if absent
+      trInner = spliceEl(trInner, tc, `<hp:tc${tc.attrs}>${tcInner}</hp:tc>`);
+      touched++;
+    }
+    inner = spliceEl(inner, tr, `<hp:tr${tr.attrs}>${trInner}</hp:tr>`);
+  }
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${inner}</hp:tbl>`));
+  return { table: tableIndex, cells: touched, cellMargin: want };
+}
+
+// 표 바깥 여백 (outMargin) — 표↔본문 간격.
+function opSetTableMargin(doc, tableIndex, opts) {
+  const want = marginWant(opts);
+  if (!Object.keys(want).length) throw new Error('set_table_margin: need left/right/top/bottom (mm)');
+  rewriteTblMeta(doc, tableIndex, 'set_table_margin', (head) => {
+    const cur = (head.match(/<hp:outMargin\b[^>]*\/>/) || [])[0];
+    return cur ? head.replace(cur, applyMm(cur, want)) : head;
+  });
+  return { table: tableIndex, outMargin: want };
+}
+
+// 표 탭 '모든 셀에 적용되는 안 여백' (table-level inMargin 기본값).
+function opSetTableInnerMargin(doc, tableIndex, opts) {
+  const want = marginWant(opts);
+  if (!Object.keys(want).length) throw new Error('set_table_inner_margin: need left/right/top/bottom (mm)');
+  rewriteTblMeta(doc, tableIndex, 'set_table_inner_margin', (head) => {
+    const cur = (head.match(/<hp:inMargin\b[^>]*\/>/) || [])[0];
+    return cur ? head.replace(cur, applyMm(cur, want)) : head;
+  });
+  return { table: tableIndex, inMargin: want };
+}
+
+// 표 전체 너비/높이 (hp:sz). Hancom recomputes a table's <hp:sz> from the sum of
+// its column widths / row heights on open, so setting <hp:sz> alone is ignored
+// (GT round-trip: 120mm→Hancom rewrote it to the cell-width sum). To actually
+// resize, scale every cell's <hp:cellSz> proportionally to hit the target, then
+// update <hp:sz> to match. Rectangular tables resize exactly; merged cells are
+// approximate (same caveat as distribute_table).
+function opSetTableSize(doc, tableIndex, widthMm, heightMm) {
+  if (widthMm == null && heightMm == null) throw new Error('set_table_size: need width_mm and/or height_mm');
+  const { section, el } = getTable(doc, tableIndex);
+  const rows = scanTopLevel(el.inner, 'hp:tr');
+  if (!rows.length) throw new Error('set_table_size: table has no rows');
+  const curW = scanTopLevel(rows[0].inner, 'hp:tc')
+    .reduce((a, tc) => a + Number((tc.inner.match(/<hp:cellSz width="(\d+)"/) || [, 0])[1]), 0);
+  const curH = rows.reduce((a, r) => {
+    const c = scanTopLevel(r.inner, 'hp:tc')[0];
+    return a + Number((c && c.inner.match(/<hp:cellSz width="\d+" height="(\d+)"/) || [, 0])[1]);
+  }, 0);
+  const tgtW = widthMm != null ? mm2hu(widthMm) : curW;
+  const tgtH = heightMm != null ? mm2hu(heightMm) : curH;
+  const sw = widthMm != null && curW > 0 ? tgtW / curW : 1;
+  const sh = heightMm != null && curH > 0 ? tgtH / curH : 1;
+  let inner = el.inner.replace(/<hp:cellSz width="(\d+)" height="(\d+)"\/>/g, (m, w, h) =>
+    `<hp:cellSz width="${Math.round(Number(w) * sw)}" height="${Math.round(Number(h) * sh)}"/>`);
+  inner = inner.replace(/<hp:sz\b[^>]*\/>/, (m) => {
+    let s = m;
+    if (widthMm != null) s = s.replace(/width="[^"]*"/, `width="${tgtW}"`).replace(/widthRelTo="[^"]*"/, 'widthRelTo="ABSOLUTE"');
+    if (heightMm != null) s = s.replace(/height="[^"]*"/, `height="${tgtH}"`).replace(/heightRelTo="[^"]*"/, 'heightRelTo="ABSOLUTE"');
+    return s;
+  });
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${inner}</hp:tbl>`));
+  return { table: tableIndex, width_mm: widthMm ?? null, height_mm: heightMm ?? null, scaledCols: sw !== 1, scaledRows: sh !== 1 };
+}
+
+// 표 배치(textWrap)/쪽경계(pageBreak)/머리행 반복(repeatHeader). GT §1:
+// page_split cell→TABLE, table→CELL, none→NONE. wrap inline=글자처럼취급(treatAsChar=1).
+const TBL_WRAP = { square: 'SQUARE', topbottom: 'TOP_AND_BOTTOM', front: 'IN_FRONT_OF_TEXT', behind: 'BEHIND_TEXT' };
+const TBL_PAGESPLIT = { none: 'NONE', cell: 'TABLE', table: 'CELL' };
+function opSetTableProps(doc, tableIndex, opts) {
+  const { section, el } = getTable(doc, tableIndex);
+  let attrs = el.attrs, inner = el.inner;
+  const out = { table: tableIndex };
+  if (opts.wrap != null) {
+    const w = String(opts.wrap).toLowerCase();
+    const inline = w === 'inline';
+    if (!inline && !(w in TBL_WRAP)) throw new Error(`set_table_props: wrap must be inline/${Object.keys(TBL_WRAP).join('/')}`);
+    if (!inline) attrs = setOrAddAttr(attrs, 'textWrap', TBL_WRAP[w]);
+    const trAt = inner.search(/<hp:tr\b/); const head = inner.slice(0, trAt < 0 ? inner.length : trAt);
+    const pos = (head.match(/<hp:pos\b[^>]*\/>/) || [])[0];
+    if (pos) inner = inner.replace(pos, pos.replace(/treatAsChar="[^"]*"/, `treatAsChar="${inline ? 1 : 0}"`));
+    out.wrap = w;
+  }
+  if (opts.page_split != null) {
+    const p = String(opts.page_split).toLowerCase();
+    if (!(p in TBL_PAGESPLIT)) throw new Error(`set_table_props: page_split must be ${Object.keys(TBL_PAGESPLIT).join('/')}`);
+    attrs = setOrAddAttr(attrs, 'pageBreak', TBL_PAGESPLIT[p]);
+    out.page_split = p;
+  }
+  if (opts.repeat_header != null) {
+    attrs = setOrAddAttr(attrs, 'repeatHeader', opts.repeat_header === false ? '0' : '1');
+    out.repeat_header = opts.repeat_header !== false;
+  }
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${attrs}>${inner}</hp:tbl>`));
+  return out;
+}
+
+// 머리 행 셀 지정 — <hp:tc ... header="1"> (한컴 UI 의미상 머리 행만, 코드는 임의 셀 가능).
+function opSetTitleCell(doc, tableIndex, row, col, on) {
+  const { section, el } = getTable(doc, tableIndex);
+  const rows = scanTopLevel(el.inner, 'hp:tr');
+  if (row < 0 || row >= rows.length) throw new Error(`set_title_cell: row ${row} out of range`);
+  const tcs = scanTopLevel(rows[row].inner, 'hp:tc');
+  if (col < 0 || col >= tcs.length) throw new Error(`set_title_cell: col ${col} out of range`);
+  const tc = tcs[col];
+  const want = on === false ? '0' : '1';
+  const newAttrs = setOrAddAttr(tc.attrs, 'header', want);
+  const newRowInner = spliceEl(rows[row].inner, tc, `<hp:tc${newAttrs}>${tc.inner}</hp:tc>`);
+  const newTbl = `<hp:tbl${el.attrs}>${spliceEl(el.inner, rows[row], `<hp:tr${rows[row].attrs}>${newRowInner}</hp:tr>`)}</hp:tbl>`;
+  doc.write(section, spliceEl(doc.read(section), el, newTbl));
+  return { table: tableIndex, row, col, header: want === '1' };
+}
+
 // Distribute row heights / column widths evenly (셀 높이를/너비를 같게). Sums the
 // current row heights and column widths, divides by the count, and rewrites every
 // cell's <hp:cellSz>. mode: "width" / "height" / "both" (default). Best on
@@ -3115,6 +3274,12 @@ function applyOp(doc, op) {
     case 'set_cell_diagonal': return opSetCellDiagonal(doc, op.table, op.row, op.col, op.direction, op.color, op.width);
     case 'set_cell_align': return opSetCellAlign(doc, op.table, op.row, op.col, op.horizontal, op.vertical);
     case 'set_cell_size': return opSetCellSize(doc, op.table, op.row, op.col, op.width, op.height);
+    case 'set_cell_margin': return opSetCellMargin(doc, op.table, op.row, op.col, op);
+    case 'set_table_margin': return opSetTableMargin(doc, op.table, op);
+    case 'set_table_inner_margin': return opSetTableInnerMargin(doc, op.table, op);
+    case 'set_table_size': return opSetTableSize(doc, op.table, op.width_mm, op.height_mm);
+    case 'set_table_props': return opSetTableProps(doc, op.table, op);
+    case 'set_title_cell': return opSetTitleCell(doc, op.table, op.row, op.col, op.on);
     case 'set_page_break': return opSetPageBreak(doc, op.index, op.on);
     case 'set_bullet_list': return opSetParagraphList(doc, op.index, 'BULLET', op.level, { char: op.char });
     case 'set_number_list': return opSetParagraphList(doc, op.index, 'NUMBER', op.level, { style: op.style });
