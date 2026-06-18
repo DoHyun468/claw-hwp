@@ -2445,6 +2445,45 @@ function buildParaLineCluster(textWidth, paraInstanceId, gsoInstanceId) {
   return Buffer.concat(chunks);
 }
 
+// Shift every record's nesting level by `delta` (preserving tag + size). Used to
+// drop a body-built gso cluster (image/shape) into a table cell, whose paragraphs
+// sit two levels deeper than the body (cell PARA_HEADER = level 2 vs body level 0).
+function relevelCluster(cluster, delta) {
+  const out = Buffer.from(cluster);
+  let p = 0;
+  while (p + 4 <= out.length) {
+    const h = out.readUInt32LE(p);
+    let size = (h >>> 20) & 0xfff;
+    let hd = 4;
+    if (size === 0xfff) { size = out.readUInt32LE(p + 4); hd = 8; }
+    const level = (((h >>> 10) & 0x3ff) + delta) & 0x3ff;
+    out.writeUInt32LE(((h & ~(0x3ff << 10)) | (level << 10)) >>> 0, p);
+    p += hd + size;
+  }
+  return out;
+}
+
+// Inside a cell whose first paragraph is at `cellParaLevel` (2 for table cells):
+// set the last-paragraph flag (MSB of char_count) on the LAST PARA_HEADER of that
+// level within [startByte, endByte) and clear it on the earlier ones. Mirrors
+// normalizeLastParaFlag but scoped to a cell (whose paragraphs are level 2).
+function normalizeCellLastParaFlag(raw, startByte, endByte, cellParaLevel) {
+  const records = parseRecords(raw);
+  let lastIdx = -1;
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.headOff < startByte || r.headOff >= endByte) continue;
+    if (r.tag === TAG_PARA_HEADER && r.level === cellParaLevel) lastIdx = i;
+  }
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.headOff < startByte || r.headOff >= endByte) continue;
+    if (r.tag !== TAG_PARA_HEADER || r.level !== cellParaLevel || r.size < 4) continue;
+    const low = raw.readUInt32LE(r.dataOff) & 0x7FFFFFFF;
+    raw.writeUInt32LE(((i === lastIdx ? 0x80000000 : 0) | low) >>> 0, r.dataOff);
+  }
+}
+
 // Ensure exactly the last level-0 PARA_HEADER carries the last-paragraph
 // flag (MSB of char_count). Length-preserving in-place edit on `raw`.
 // Hancom moves this flag onto a newly-inserted trailing paragraph, and
@@ -4063,22 +4102,39 @@ export async function insertImageInPlace(filePath, ops) {
       const records = parseRecords(raw);
       const paraInst = pickFreshInstanceId(records, raw);
       const cluster = buildImagePicCluster(storageId, paraInst, (paraInst + 0x100) >>> 0);
-      // Insert after the anchor paragraph, else after the last simple paragraph.
-      let insertAt = raw.length;
-      const clusters = findClusterBoundaries(records);
-      if (op.anchor && typeof op.anchor === 'string') {
-        const ab = Buffer.from(op.anchor, 'utf16le');
-        for (const c of clusters) {
-          let hit = false;
-          for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } }
-          if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; }
-        }
+      if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+        // ── Insert into a table CELL — the image becomes a new (treat-as-char)
+        // paragraph inside the cell. The body-built gso cluster is dropped two
+        // levels deeper (cell paragraphs are level 2) and spliced at the cell's
+        // end; the cell's paragraph count is bumped and its last-para flag fixed.
+        const para = op.cell.para ?? 0, control = op.cell.control ?? 0;
+        const target = tableCellRecords(records, raw, para, control)
+          .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+        if (!target) throw new Error(`insert_image: cell (row=${op.cell.row}, col=${op.cell.col}) not found in table at para ${para} control ${control}`);
+        raw = Buffer.concat([raw.slice(0, target.endByte), relevelCluster(cluster, 2), raw.slice(target.endByte)]);
+        const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
+          .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+        const lhDataOff = t2.startByte + 4; // LIST_HEADER header = 4 bytes (body < 0xFFF)
+        raw.writeUInt16LE((raw.readUInt16LE(lhDataOff) + 1) & 0xFFFF, lhDataOff); // nParagraphs++
+        normalizeCellLastParaFlag(raw, t2.startByte, t2.endByte, 2);
       } else {
-        const t = findLastSimpleBodyParagraph(records);
-        insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+        // ── Insert into the body (after the anchor paragraph, else last simple). ──
+        let insertAt = raw.length;
+        const clusters = findClusterBoundaries(records);
+        if (op.anchor && typeof op.anchor === 'string') {
+          const ab = Buffer.from(op.anchor, 'utf16le');
+          for (const c of clusters) {
+            let hit = false;
+            for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } }
+            if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; }
+          }
+        } else {
+          const t = findLastSimpleBodyParagraph(records);
+          insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+        }
+        raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+        normalizeLastParaFlag(raw);
       }
-      raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
-      normalizeLastParaFlag(raw);
 
       let newComp;
       if (secInMini) {
