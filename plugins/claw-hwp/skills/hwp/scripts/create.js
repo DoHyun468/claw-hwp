@@ -207,6 +207,13 @@ const log = [];
 // reference-shaped picture run after export.
 const imagePatches = [];
 
+// Per-table outMargin overrides, in document (append_table) order. Each entry is
+// { before, after } in HWPUNIT (or null to use the default). patchHwpxTableOutMargin
+// consumes these in order so a caller can set spacing_before / spacing_after on an
+// individual table. The below-table gap is outMargin.bottom; above is outMargin.top
+// (Hancom renders table top/bottom ~symmetrically — it clamps an asymmetric pair).
+const tableSpacingSpecs = [];
+
 // Tracks headings emitted by append_heading. rhwp's HWPX serializer correctly
 // creates the <hh:charPr> definition (large height + bold) in header.xml but
 // then writes the heading run with charPrIDRef="0" (default body), so the
@@ -965,11 +972,14 @@ const HANDLERS = {
     });
     // Headings: left-aligned (justify makes 16pt headings look weird with
     // the inter-word stretch), tight line spacing, generous before/after.
+    // spacing_before / spacing_after (HWPUNIT, ~283/mm) override the per-level
+    // defaults so a caller can tune a heading's section gap. Headings are normal
+    // paragraphs, so these margins COLLAPSE with neighbours (gap = the larger).
     applyParaProps(doc, cursor, {
       align: op.align ?? "left",
-      lineSpacing: HEADING_LINE_SPACING,
-      spacingBefore: def.spacingBefore,
-      spacingAfter: def.spacingAfter,
+      lineSpacing: op.line_spacing ?? HEADING_LINE_SPACING,
+      spacingBefore: op.spacing_before ?? def.spacingBefore,
+      spacingAfter: op.spacing_after ?? def.spacingAfter,
     });
     applyParaBorders(doc, cursor, op);
     log.push(`append_heading L${level} (${cursor.charOffset} chars)`);
@@ -1249,6 +1259,14 @@ const HANDLERS = {
       spacingBefore: BODY_SPACING_AFTER,
       spacingAfter: BODY_SPACING_AFTER,
     });
+    // Record this table's spacing override (HWPUNIT) for patchHwpxTableOutMargin,
+    // which sets the table's outMargin (the lever Hancom actually renders above /
+    // below a table). null → use TABLE_OUTMARGIN default. Order matches the
+    // top-level <hp:tbl> order in the section, so the Nth table gets the Nth spec.
+    tableSpacingSpecs.push({
+      before: op.spacing_before ?? null,
+      after: op.spacing_after ?? null,
+    });
 
     const newParaCount = doc.getParagraphCount(cursor.sec);
     cursor.para = newParaCount - 1;
@@ -1396,6 +1414,14 @@ const HANDLERS = {
     );
     // Refresh cursor after picture insertion.
     cursor.charOffset = doc.getParagraphLength(cursor.sec, cursor.para);
+    // Image paragraph spacing: spacing_before / spacing_after (HWPUNIT) tune the
+    // gap above/below the picture; default to the body trailing gap. align lets a
+    // caller centre the image. These are paragraph margins (collapse like text).
+    applyParaProps(doc, { sec: cursor.sec, para: cursor.para, charOffset: 0 }, {
+      align: op.align ?? "center",
+      spacingBefore: op.spacing_before ?? 0,
+      spacingAfter: op.spacing_after ?? BODY_SPACING_AFTER,
+    });
     // Record the position so the hwpx post-export patcher can inject a
     // matching <hp:pic> node here. binaryItemIDRef follows rhwp's BinData/
     // numbering which is 1-based by insertion order.
@@ -2687,22 +2713,28 @@ async function patchHwpxTableOutMargin(filePath) {
   let nextPprId = header
     ? Math.max(0, ...[...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map((m) => Number(m[1])))
     : 0;
-  let total = 0;
+  let total = 0;       // also indexes tableSpacingSpecs in document order
   let headerChanged = false;
-  for (const name of Object.keys(zip.files)) {
+  for (const name of Object.keys(zip.files).sort()) {
     if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
     let xml = await zip.file(name).async("string");
     let changed = false;
 
-    // 1. outMargin top = bottom = TABLE_OUTMARGIN on each top-level table. The
-    //    below-table gap = outMargin.bottom (paragraph margins are eaten below a
-    //    table); set it to a heading's section gap so 표→heading == body→heading.
+    // 1. outMargin top/bottom on each top-level table. The below-table gap =
+    //    outMargin.bottom (paragraph margins are eaten below a table); default to
+    //    a heading's section gap so 표→heading == body→heading. A per-table
+    //    spacing_before/after (tableSpacingSpecs, in append_table order) overrides
+    //    it. (Hancom clamps an asymmetric pair to symmetric on web; desktop keeps
+    //    both — we still write the caller's intent.)
     const xml2 = xml.replace(/<hp:tbl\b[\s\S]*?<hp:tr\b/g, (seg) =>
       seg.replace(/<hp:outMargin\b[^>]*\/>/, (m) => {
         const left = (m.match(/left="(\d+)"/) || [])[1] ?? "283";
         const right = (m.match(/right="(\d+)"/) || [])[1] ?? "283";
+        const spec = tableSpacingSpecs[total] || {};
+        const top = spec.before ?? TABLE_OUTMARGIN;
+        const bottom = spec.after ?? TABLE_OUTMARGIN;
         total++;
-        return `<hp:outMargin left="${left}" right="${right}" top="${TABLE_OUTMARGIN}" bottom="${TABLE_OUTMARGIN}"/>`;
+        return `<hp:outMargin left="${left}" right="${right}" top="${top}" bottom="${bottom}"/>`;
       }),
     );
     if (xml2 !== xml) { xml = xml2; changed = true; }

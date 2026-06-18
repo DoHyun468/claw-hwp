@@ -131,15 +131,17 @@ All five themes use only render-confirmed fonts (see the **`font_family`** note 
 | Op | Required | Optional |
 |----|----------|----------|
 | `setup_document` | `page_size` (`a4`/`b5`/...), `orientation` (`portrait`/`landscape`) | `margin_mm`, `base_font` |
-| `append_heading` | `level` (1–6), `text` | `align`, `runs` |
+| `append_heading` | `level` (1–6), `text` | `align`, `runs`, `spacing_before`, `spacing_after`, `line_spacing` |
 | `append_paragraph` | `text` | `align`, `line_spacing`, `spacing_before`, `spacing_after`, `runs` |
-| `append_table` ⚠️ | `headers`, `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props` |
-| `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt` |
+| `append_table` ⚠️ | `headers`, `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props`, `spacing_before`, `spacing_after`, `align` |
+| `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt`, `spacing_before`, `spacing_after`, `align` |
 | `append_bullet_list`, `append_numbered_list` | `items[]` | — |
 | `append_page_break` | — | — |
 | `apply_text_style` ⚠️ | `target` (string to find) | `color`, `bold`, `italic`, `underline`, `strikethrough`, `size` (pt), `highlight` (`true` / `"#RRGGBB"` / `false`), `font_family`, `superscript`, `subscript`, `underline_color`, `letter_spacing`, `char_ratio` |
 | `apply_paragraph_style` ⚠️ | `index` (paragraph index, 0-based) | `align`, `indent`, `line_spacing` (% e.g. 130), `margin_left`, `margin_right`, `spacing_before`, `spacing_after`, `background_color`, `page_break_before`, `keep_with_next` |
 
+> **간격 커스터마이즈 (`spacing_before` / `spacing_after`)** — 단위는 HWPUNIT(약 283/mm; 예: 6mm ≈ 1700). 생략하면 각 요소의 기본값 사용(제목은 단계별, 본문/글머리/표/그림은 표준 리듬). 제목·본문·그림은 일반 문단 여백이라 위/아래가 서로 **겹쳐 큰 값으로 합쳐짐(collapse)**. 표는 한컴 web에서 위·아래가 **대칭으로 렌더**되므로(웹은 top 값을 위·아래 공통 적용; 한컴 앱은 위/아래 별도 적용), 표 아래만 크게 두려면 `spacing_before`에도 같은 값을 주는 게 안전.
+>
 > ⚠️ **`append_table` on existing `.hwp` (raw-patch path) — what it honors and what it doesn't:**
 >
 > - **Shape (rows × cols) is honored**: when the caller supplies `headers` (array) and/or `rows` (array of row arrays) and/or `cols` (number), the dispatcher generates a fresh table cluster of the requested shape via rhwp's `createTable`, then splices it into the target's Section0 surgically (no CFB.write, no Sh33tJ5). The cells reference rhwp's default `borderFillId`; the dispatcher remaps every cell's `borderFillId` to a uniform-visible BorderFill in the target's DocInfo (verified concretely: h22 → BF id 2 with 1/1/1/1 thickness; ktx → BF id 4 with 1/1/1/1 thickness). Result: a visible table of the user's requested shape, surgical raw-patch (Hancom-Docs compatible — verified on h22 in-place add).
