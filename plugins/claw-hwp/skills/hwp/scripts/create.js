@@ -207,6 +207,11 @@ const log = [];
 // reference-shaped picture run after export.
 const imagePatches = [];
 
+// Resolved page margins (HWPUNIT) from setup_document, or null when the caller
+// didn't request any. rhwp's exportHwpx ignores PageDef margins for .hwpx, so
+// patchHwpxPageMargin stamps these into the section pagePr post-export.
+let hwpxPageMargin = null;
+
 // Per-table outMargin overrides, in document (append_table) order. Each entry is
 // { before, after } in HWPUNIT (or null to use the default). patchHwpxTableOutMargin
 // consumes these in order so a caller can set spacing_before / spacing_after on an
@@ -897,6 +902,19 @@ const HANDLERS = {
     if (op.margin_right_mm !== undefined) pd.marginRight = Math.round(op.margin_right_mm * 283.46);
 
     unwrap(doc.setPageDef(cursor.sec, JSON.stringify(pd)), "setPageDef");
+    // rhwp's exportHwpx ignores the PageDef margins and writes the blank2010
+    // template's <hp:margin> (left/right 30mm, top 20mm, bottom 15mm) — so a
+    // requested margin_mm silently has no effect in the .hwpx. Record the
+    // resolved margins so the .hwpx post-export pass can stamp them into the
+    // section's pagePr (see patchHwpxPageMargin). Only when the caller actually
+    // asked for a margin, otherwise we leave the template default untouched.
+    if (op.margin_mm !== undefined || op.margin_top_mm !== undefined || op.margin_bottom_mm !== undefined
+        || op.margin_left_mm !== undefined || op.margin_right_mm !== undefined) {
+      hwpxPageMargin = {
+        left: pd.marginLeft, right: pd.marginRight, top: pd.marginTop, bottom: pd.marginBottom,
+        header: pd.marginHeader, footer: pd.marginFooter, gutter: pd.marginGutter,
+      };
+    }
     log.push(`setup_document: ${op.page_size || "default"} ${op.orientation || pd.landscape ? "landscape" : "portrait"}, margin=${op.margin_mm ?? "?"}mm, base_font=${op.base_font || "default"}`);
   },
 
@@ -2199,6 +2217,37 @@ async function patchHwpxPictures(filePath, patches) {
   fs.writeFileSync(filePath, newBuf);
 }
 
+// rhwp's exportHwpx writes the blank2010 template's <hp:margin> into every
+// section's pagePr regardless of the PageDef margins set via setPageDef — so a
+// requested margin_mm has no effect on the .hwpx. Stamp the resolved margins
+// (HWPUNIT) into each section's <hp:margin>. Only sides present in `m` are set.
+async function patchHwpxPageMargin(filePath, m) {
+  const buf = fs.readFileSync(filePath);
+  const zip = await JSZip.loadAsync(buf);
+  let changed = 0;
+  for (const name of Object.keys(zip.files)) {
+    if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
+    let xml = await zip.file(name).async("string");
+    const before = xml;
+    xml = xml.replace(/<hp:margin\b[^>]*\/>/g, (tag) => {
+      let t = tag;
+      for (const [attr, val] of [["left", m.left], ["right", m.right], ["top", m.top],
+        ["bottom", m.bottom], ["header", m.header], ["footer", m.footer], ["gutter", m.gutter]]) {
+        if (val == null) continue;
+        const re = new RegExp(`\\b${attr}="[^"]*"`);
+        t = re.test(t) ? t.replace(re, `${attr}="${val}"`) : t.replace(/\s*\/>$/, ` ${attr}="${val}"/>`);
+      }
+      return t;
+    });
+    if (xml !== before) { zip.file(name, xml); changed++; }
+  }
+  if (changed) {
+    const out = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } });
+    fs.writeFileSync(filePath, out);
+  }
+  return changed;
+}
+
 // ── Heading charPrIDRef fix ───────────────────────────────────────────────
 //
 // rhwp's HWPX serializer emits <hh:charPr id="N" height="..." ><hh:bold/></hh:charPr>
@@ -3477,6 +3526,17 @@ async function readStdin() {
       log.push(`hwpx_patch: injected ${imagePatches.length} <hp:pic> node(s)`);
     } catch (err) {
       log.push(`hwpx_patch failed: ${err.message}`);
+    }
+  }
+
+  // Page margins: rhwp ignores PageDef margins for .hwpx, so stamp the
+  // requested ones into the section pagePr.
+  if (ext === ".hwpx" && hwpxPageMargin) {
+    try {
+      const n = await patchHwpxPageMargin(outPath, hwpxPageMargin);
+      if (n) log.push(`hwpx_patch: page margin L${hwpxPageMargin.left}/R${hwpxPageMargin.right}/T${hwpxPageMargin.top}/B${hwpxPageMargin.bottom} HWPUNIT (${n} section)`);
+    } catch (err) {
+      log.push(`hwpx_page_margin failed: ${err.message}`);
     }
   }
 
