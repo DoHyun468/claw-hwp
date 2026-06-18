@@ -7255,6 +7255,10 @@ export async function applyTablePropertyInPlace(filePath, ops) {
 //            margins?:[l,r,t,b] | margin_mm? }.
 const GSO_CTRL_ID = ' osg'; // "gso " stored reversed (little-endian ctrl_id)
 const GSO_OUTMARGIN_OFF = 28;
+// Object position (floating objects). GT-confirmed (object-prop --pos "80,120"):
+// gso CTRL off8 = vertical offset (y), off12 = horizontal offset (x), u32 HWPUNIT.
+const GSO_POS_Y_OFF = 8;
+const GSO_POS_X_OFF = 12;
 const COMP_BORDER_COLOR_OFF = 196;
 const COMP_BORDER_WIDTH_OFF = 200;
 const COMP_FILL_OFF = 213;
@@ -7313,7 +7317,8 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
     const has = op.fill != null || op.border_color != null || op.border_width_mm != null
       || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null
       || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null
-      || op.arrow_start != null || op.arrow_end != null;
+      || op.arrow_start != null || op.arrow_end != null
+      || op.pos_x_mm != null || op.pos_y_mm != null;
     if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / border_type / fill_pattern / arrow_start / arrow_end / margins / margin_mm / wrap / fill_transparency is required');
     for (const k of ['arrow_start', 'arrow_end']) {
       if (op[k] != null && ARROW_STYLE[String(op[k]).toLowerCase()] == null) {
@@ -7382,6 +7387,8 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
       for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, ctrl.dataOff + GSO_OUTMARGIN_OFF + i * 2);
       rec.margins_mm = margins;
     }
+    if (op.pos_x_mm != null) { secRaw.writeUInt32LE(mm(op.pos_x_mm) >>> 0, ctrl.dataOff + GSO_POS_X_OFF); rec.pos_x_mm = op.pos_x_mm; }
+    if (op.pos_y_mm != null) { secRaw.writeUInt32LE(mm(op.pos_y_mm) >>> 0, ctrl.dataOff + GSO_POS_Y_OFF); rec.pos_y_mm = op.pos_y_mm; }
     if (op.wrap != null) {
       // Object text-wrap = the gso CTRL_HEADER attribute, GT-confirmed to use the
       // SAME bit field as the table (mask 0x600001: bit0 like-char + bits 21-22).
