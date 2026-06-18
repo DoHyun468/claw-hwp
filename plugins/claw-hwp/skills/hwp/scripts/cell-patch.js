@@ -7090,6 +7090,14 @@ const TABLE_OUTMARGIN_OFF = 28; // in-record offset of the 4 outer-margin u16s
 // (claw-hancomdocs table-cell-prop --page-split, .hwp download): none→0,
 // cell→1, table→2 (table == the default). 한컴 spec: 0 나누지않음 / 1 셀단위로나눔 / 2 나눔.
 const TABLE_PAGE_SPLIT = { none: 0, cell: 1, table: 2 };
+// Text-wrap / placement = bits in the table CTRL_HEADER attribute (offset 4).
+// GT-confirmed across all 5 modes (claw-hancomdocs table-cell-prop --table-wrap,
+// .hwp download): mask 0x600001 = bit0 (글자처럼 취급 / like-char) + bits 21-22
+// (wrap mode). Only the attribute changes (record size unchanged, no position
+// record added). inline keeps the like-char bit; the rest float with a 2-bit
+// wrap mode (square 00 / topbottom 01 / behind 10 / front 11).
+const TABLE_WRAP_MASK = 0x600001;
+const TABLE_WRAP = { inline: 0x200001, square: 0x0, topbottom: 0x200000, behind: 0x400000, front: 0x600000 };
 
 // Each table = its CTRL_HEADER (" lbt", outer margin) + the TABLE record (0x4d,
 // rows/cols/attr) that follows it. Return both so one op can patch either.
@@ -7118,14 +7126,17 @@ export async function applyTablePropertyInPlace(filePath, ops) {
   }
   for (const op of ops) {
     if ((op.section ?? 0) !== 0) throw new Error(`set_table_property: only section 0 is supported (got ${op.section})`);
-    if (!Array.isArray(op.margins) && op.margin_mm == null && op.page_split == null) {
-      throw new Error('set_table_property: margins:[l,r,t,b] / margin_mm / page_split is required');
+    if (!Array.isArray(op.margins) && op.margin_mm == null && op.page_split == null && op.table_wrap == null) {
+      throw new Error('set_table_property: margins:[l,r,t,b] / margin_mm / page_split / table_wrap is required');
     }
     if (Array.isArray(op.margins) && op.margins.length !== 4) {
       throw new Error('set_table_property: margins must be [left,right,top,bottom] (4 values, mm)');
     }
     if (op.page_split != null && TABLE_PAGE_SPLIT[String(op.page_split).toLowerCase()] == null) {
       throw new Error('set_table_property: page_split must be none / cell / table');
+    }
+    if (op.table_wrap != null && TABLE_WRAP[String(op.table_wrap).toLowerCase()] == null) {
+      throw new Error('set_table_property: table_wrap must be inline / square / topbottom / behind / front');
     }
   }
 
@@ -7181,6 +7192,12 @@ export async function applyTablePropertyInPlace(filePath, ops) {
       const attr = secRaw.readUInt32LE(table.dataOff);
       secRaw.writeUInt32LE(((attr & ~0x3) | v) >>> 0, table.dataOff);
       rec.page_split = String(op.page_split).toLowerCase();
+    }
+    if (op.table_wrap != null) {
+      const bits = TABLE_WRAP[String(op.table_wrap).toLowerCase()];
+      const attr = secRaw.readUInt32LE(ctrl.dataOff + 4);
+      secRaw.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | bits) >>> 0, ctrl.dataOff + 4);
+      rec.table_wrap = String(op.table_wrap).toLowerCase();
     }
     summary.push(rec);
   }
