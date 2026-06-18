@@ -6974,8 +6974,8 @@ export async function applyCellPropertyInPlace(filePath, ops) {
     if ((op.section ?? 0) !== 0) {
       throw new Error(`set_cell_property: only section 0 is supported (got section ${op.section})`);
     }
-    const has = op.valign != null || op.height_mm != null || op.width_mm != null || op.margin_mm != null || Array.isArray(op.margins);
-    if (!has) throw new Error('set_cell_property: at least one of valign / height_mm / width_mm / margin_mm is required');
+    const has = op.valign != null || op.height_mm != null || op.width_mm != null || op.margin_mm != null || Array.isArray(op.margins) || op.header != null;
+    if (!has) throw new Error('set_cell_property: at least one of valign / height_mm / width_mm / margin_mm / header is required');
     if (op.valign != null && CELL_VALIGN[String(op.valign).toLowerCase()] == null) {
       throw new Error(`set_cell_property: valign must be top / middle / bottom (got "${op.valign}")`);
     }
@@ -7030,8 +7030,12 @@ export async function applyCellPropertyInPlace(filePath, ops) {
     const margins = Array.isArray(e.margins) ? e.margins
       : (e.margin_mm != null ? [e.margin_mm, e.margin_mm, e.margin_mm, e.margin_mm] : null);
     if (margins) for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + 24 + i * 2);
+    // Header / title cell (제목 셀): LIST_HEADER offset 6 (u16). GT-confirmed
+    // (gt_title: claw-hancomdocs table-cell-prop --title-cell, .hwp download) —
+    // base 0 → 4 (bit 2). On the top row this is HWP's repeat-header-row behavior.
+    if (e.header != null) secRaw.writeUInt16LE(e.header ? 4 : 0, o + 6);
     summary.push({ op: e.type, para, control: ctrl, cellIndex: e.cellIndex, row: e.row, col: e.col,
-      valign: e.valign ?? null, height_mm: e.height_mm ?? null, width_mm: e.width_mm ?? null });
+      valign: e.valign ?? null, height_mm: e.height_mm ?? null, width_mm: e.width_mm ?? null, header: e.header ?? null });
   }
 
   // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
