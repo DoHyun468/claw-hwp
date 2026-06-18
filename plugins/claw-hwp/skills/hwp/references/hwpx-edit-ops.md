@@ -87,6 +87,19 @@ when the same edit is performed through its UI.
 | `distribute_table` | `table`, `mode?` (`width` / `height` / `both`, default `both`) | Evenly distributes column widths and/or row heights across the whole table (셀 너비를/높이를 같게): sums the current sizes, divides by the count, rewrites every `<hp:cellSz>`. Best on rectangular tables; merged cells aren't sized proportionally. |
 | `split_cell` | `table`, `row`, `col`, `rows?` (default 1), `cols?` (default 1) | Splits one cell into `rows` × `cols` sub-cells (셀 나누기). Inserts `cols-1` grid columns and/or `rows-1` grid rows at the cell; the cells above/below/beside it grow their span to keep covering the area, and cells past the split shift their address — the same grid bookkeeping Hancom does natively (verified against Hancom-native ground truth + web render for row, column, and 2×2 splits). The top-left sub-cell keeps the original text; the rest are empty. Target must be a normal (un-merged) cell — unmerge first if it spans. Addressed by grid `row`/`col` (the `<hp:cellAddr>` coordinates), so it's correct even when the table has other merges. |
 
+### Table / cell properties (표·셀 속성 다이얼로그)
+
+Mirrors the 4-tab 표/셀 속성 dialog. Margin/size inputs are **mm** → HWPUNIT (≈283.46/mm). Structures cross-checked against claw-hancomdocs's Hancom-web ground truth (`handoff/shared/SHARED_op-inventory-for-GT.md` §1) and round-trip-verified (Hancom preserves them 1:1).
+
+| Op | Required | Optional | Notes |
+|----|----------|----------|-------|
+| `set_cell_margin` | `table`, `row`, `col` | `to_row`, `to_col`, `left`, `right`, `top`, `bottom` (mm) | Sets the cell's `<hp:cellMargin>` (셀 안 여백). `to_row`/`to_col` apply to the `[row,col]..[to_row,to_col]` rectangle. Only the given sides change; others keep their value. |
+| `set_table_margin` | `table` | `left`, `right`, `top`, `bottom` (mm) | Table's `<hp:outMargin>` (표 바깥 여백 = 표↔본문 간격). |
+| `set_table_inner_margin` | `table` | `left`, `right`, `top`, `bottom` (mm) | Table-level `<hp:inMargin>` (표 탭 '모든 셀에 적용되는 안 여백' 기본값). Doesn't override cells that already carry an explicit `cellMargin`. |
+| `set_table_size` | `table` | `width_mm`, `height_mm` | Resizes the whole table. **Scales every `<hp:cellSz>` proportionally** to hit the target (then updates `<hp:sz>`) — Hancom recomputes a table's `<hp:sz>` from its column-width sum, so setting `<hp:sz>` alone is ignored. Rectangular tables hit the target exactly; merged cells are approximate. |
+| `set_table_props` | `table` | `wrap` (`inline`/`square`/`topbottom`/`front`/`behind`), `page_split` (`none`/`cell`/`table`), `repeat_header` (bool) | `<hp:tbl textWrap=…/pageBreak=…/repeatHeader=…>`. `wrap:"inline"` = 글자처럼 취급 (`<hp:pos treatAsChar="1">`, no textWrap); others set textWrap + `treatAsChar="0"`. `page_split` maps `cell→TABLE`, `table→CELL`, `none→NONE` (Hancom's inverted naming, per GT). `repeat_header` repeats the header row across page breaks. |
+| `set_title_cell` | `table`, `row`, `col` | `on?` (default true) | Marks the cell as a header cell (`<hp:tc header="1">`). Hancom's UI only enables this on the top row, but the op accepts any cell. |
+
 ### Styling (clone-mutate-retarget in `header.xml`)
 
 | `type` | Args | Notes |
