@@ -7068,6 +7068,124 @@ export async function applyCellPropertyInPlace(filePath, ops) {
   return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
 }
 
+// ── 표 바깥 여백 (table outer margin) raw-patch ──────────────────────────────
+//
+// GT-first (gt_margin: claw-hancomdocs `table-cell-prop --table-margin "5,5,3,3"`
+// applied in 한컴 web, downloaded as .hwp — NOT converted from .hwpx). The table's
+// outer margin lives in the table CTRL_HEADER (tag 0x47, ctrl_id " lbt" = "tbl "
+// reversed in-stream, body size 46). In-record offset 28/30/32/34 = u16
+// left/right/top/bottom in HWPUNIT (mm × 283.46). Default 283 (=1mm) all sides;
+// GT 5,5,3,3mm → 1417,1417,850,850 (exact byte match vs Hancom). Length-preserving
+// fixed-width edit, Section 0 only. (Verify long+short docs Tier-1 both — CFB path
+// differs.)
+//
+// Each op: { table_index?, margins?:[l,r,t,b] | margin_mm? }.
+const TABLE_CTRL_ID = ' lbt'; // "tbl " stored reversed (little-endian ctrl_id)
+const TABLE_OUTMARGIN_OFF = 28; // in-record offset of the 4 outer-margin u16s
+
+function findTableCtrlHeaders(records, secRaw) {
+  const out = [];
+  for (const r of records) {
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1 && r.size >= TABLE_OUTMARGIN_OFF + 8
+        && secRaw.slice(r.dataOff, r.dataOff + 4).toString('latin1') === TABLE_CTRL_ID) {
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+export async function applyTablePropertyInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`set_table_property: only section 0 is supported (got ${op.section})`);
+    if (!Array.isArray(op.margins) && op.margin_mm == null) {
+      throw new Error('set_table_property: margins:[l,r,t,b] or margin_mm is required');
+    }
+    if (Array.isArray(op.margins) && op.margins.length !== 4) {
+      throw new Error('set_table_property: margins must be [left,right,top,bottom] (4 values, mm)');
+    }
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const mm = (v) => Math.round(v * HWPUNIT_PER_MM);
+  const summary = [];
+  for (const op of ops) {
+    const records = parseRecords(secRaw);
+    const tables = findTableCtrlHeaders(records, secRaw);
+    const idx = op.table_index ?? 0;
+    if (idx < 0 || idx >= tables.length) {
+      throw new Error(`set_table_property: table_index ${idx} out of range (found ${tables.length} table(s))`);
+    }
+    const o = tables[idx].dataOff;
+    const margins = Array.isArray(op.margins)
+      ? op.margins
+      : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
+    for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + TABLE_OUTMARGIN_OFF + i * 2);
+    summary.push({ op: 'set_table_property', table_index: idx, margins_mm: margins });
+  }
+
+  // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
+}
+
 // ── 셀 너비/높이 같게 (equalize table columns / rows) raw-patch ────────────
 //
 // GT-first (eqw_1row.hwp, table-op equal-width on a single-row table): making
