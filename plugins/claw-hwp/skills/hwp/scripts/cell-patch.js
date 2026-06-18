@@ -4039,6 +4039,13 @@ export async function insertImageInPlace(filePath, ops) {
     return Object.assign([], { mode: 'in-place', inserted_count: 0 });
   }
 
+  // Images dropped into a table cell are centered by default (user pref): ensure
+  // a centered ParaShape exists (DocInfo write) before the per-image Section0 step.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
+
   const summary = [];
   for (const op of ops) {
     if (!op.path) throw new Error('insert_image: op.path (image file) is required');
@@ -4111,7 +4118,9 @@ export async function insertImageInPlace(filePath, ops) {
         const target = tableCellRecords(records, raw, para, control)
           .find((c) => c.row === op.cell.row && c.col === op.cell.col);
         if (!target) throw new Error(`insert_image: cell (row=${op.cell.row}, col=${op.cell.col}) not found in table at para ${para} control ${control}`);
-        raw = Buffer.concat([raw.slice(0, target.endByte), relevelCluster(cluster, 2), raw.slice(target.endByte)]);
+        const cellCluster = relevelCluster(cluster, 2);
+        cellCluster.writeUInt16LE(centerPsId & 0xFFFF, 12); // PARA_HEADER body off8 = para_shape_id (centered)
+        raw = Buffer.concat([raw.slice(0, target.endByte), cellCluster, raw.slice(target.endByte)]);
         const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
           .find((c) => c.row === op.cell.row && c.col === op.cell.col);
         const lhDataOff = t2.startByte + 4; // LIST_HEADER header = 4 bytes (body < 0xFFF)
@@ -4455,6 +4464,13 @@ export async function insertShapeInPlace(filePath, ops) {
     return Object.assign([], { mode: 'in-place', inserted_count: 0 });
   }
 
+  // Objects dropped into a table cell are centered by default (user pref): make
+  // sure a centered ParaShape exists (DocInfo write) before we touch Section0.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
+
   let buf = readFileSync(filePath);
   let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
   let fat = readFat(buf, fatAddrs, ssz);
@@ -4488,6 +4504,47 @@ export async function insertShapeInPlace(filePath, ops) {
     const shapeName = SHAPE_KINDS[op.shape] ? op.shape : 'rect';
     const kind = SHAPE_KINDS[shapeName];
     const records = parseRecords(raw);
+
+    if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+      // ── Insert the shape INSIDE a table cell as a new treat-as-char paragraph.
+      // Build a self-contained shape paragraph (like the image path), force the gso
+      // to like-char (글자처럼 취급, attr bit 0) so it sits in the cell flow, drop it
+      // two levels deeper, and splice it at the cell's end (count++ + last-para flag).
+      const para = op.cell.para ?? 0, control = op.cell.control ?? 0;
+      const target = tableCellRecords(records, raw, para, control)
+        .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+      if (!target) throw new Error(`insert_shape: cell (row=${op.cell.row}, col=${op.cell.col}) not found in table at para ${para} control ${control}`);
+      const inst = pickFreshInstanceId(records, raw);
+      const ph = Buffer.alloc(24);
+      ph.writeUInt32LE(9, 0); ph.writeUInt32LE(0x800, 4);
+      ph.writeUInt16LE(centerPsId & 0xFFFF, 8); // centered paragraph (object centered in cell)
+      ph.writeUInt16LE(1, 12); ph.writeUInt32LE(inst >>> 0, 18);
+      const pt = Buffer.from('0b00206f736700000000000000000b000d00', 'hex'); // gso char + EOP
+      const cs = Buffer.alloc(8);
+      const ch = Buffer.from(kind.gsoCtrl, 'hex');
+      ch.writeUInt32LE((inst + 0x10) >>> 0, 36);
+      ch.writeUInt32LE((ch.readUInt32LE(4) | 1) >>> 0, 4); // 글자처럼 취급
+      const sc = Buffer.from(kind.comp, 'hex');
+      if (kind.idPrefix) Buffer.from(kind.idPrefix, 'hex').copy(sc, 0);
+      sc.writeUInt32LE((inst + 0x11) >>> 0, sc.length - 6);
+      const rec = Buffer.from(kind.recHex, 'hex');
+      const shapePara = Buffer.concat([
+        buildRecordHeader(TAG_PARA_HEADER, 0, ph.length), ph,
+        buildRecordHeader(TAG_PARA_TEXT, 1, pt.length), pt,
+        buildRecordHeader(TAG_PARA_CHAR_SHAPE, 1, cs.length), cs,
+        buildRecordHeader(TAG_CTRL_HEADER, 1, ch.length), ch,
+        buildRecordHeader(TAG_SHAPE_COMPONENT, 2, sc.length), sc,
+        buildRecordHeader(kind.recTag, 3, rec.length), rec,
+      ]);
+      raw = Buffer.concat([raw.slice(0, target.endByte), relevelCluster(shapePara, 2), raw.slice(target.endByte)]);
+      const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
+        .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+      const lhDataOff = t2.startByte + 4;
+      raw.writeUInt16LE((raw.readUInt16LE(lhDataOff) + 1) & 0xFFFF, lhDataOff); // nParagraphs++
+      normalizeCellLastParaFlag(raw, t2.startByte, t2.endByte, 2);
+      summary.push({ section: 0, shape: shapeName, cell: { row: op.cell.row, col: op.cell.col } });
+      continue;
+    }
 
     // Anchor paragraph + its level-1 PARA_TEXT.
     const clusters = findClusterBoundaries(records);
