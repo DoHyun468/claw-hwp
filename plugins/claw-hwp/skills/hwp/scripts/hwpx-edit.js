@@ -38,6 +38,7 @@
 //   set_table_size        { table, width_mm?, height_mm? }                  // 표 전체 크기 — 열/행 비례 스케일(한컴이 sz를 셀합으로 재계산하므로)
 //   set_table_props       { table, wrap?, page_split?, repeat_header? }     // wrap=inline|square|topbottom|front|behind; page_split=none|cell|table; repeat_header=bool(머리행 반복)
 //   set_title_cell        { table, row, col, on? }                          // <hp:tc header="1"> (머리 행 셀)
+//   set_table_split_border{ table, line_type?, width_mm?, color? }          // 여러 쪽 자동분할 표 경계선(borderFill breakCellSeparateLine + diagonal, pageBreak=CELL)
 //   set_object_size       { target, index, width_mm?, height_mm? }          // 그림/도형/차트 크기 (target=image|shape|chart)
 //   set_object_position   { target, index, x_mm?, y_mm?, wrap? }            // 위치(종이기준)+배치(wrap=inline|square|topbottom|front|behind)
 //   set_object_margin     { target, index, left?, right?, top?, bottom? }   // 객체↔글 간격(mm)
@@ -1969,6 +1970,42 @@ function opSetTitleCell(doc, tableIndex, row, col, on) {
   return { table: tableIndex, row, col, header: want === '1' };
 }
 
+// 표가 여러 쪽에 자동분할될 때 잘린 가장자리에 그려지는 경계선(여백/캡션 탭의 '자동으로
+// 나뉜 표의 경계선 설정'). GT(handoff §1): 표 borderFill 에 breakCellSeparateLine="1" 을
+// 켜고 그 **<hh:diagonal> 슬롯**(top/bottomBorder 아님!)에 type/width/color 를 저장. 표는
+// '나눔'(pageBreak="CELL") 모드여야 활성. 표의 기존 borderFill 을 복제(테두리 모양은 유지)
+// 해 위 두 가지를 적용하고, 표를 새 borderFill 로 repoint. line_type 은 표준 HWPX style 직접
+// emit(파선=DASH; 한컴 UI swap 은 클릭 보정용이라 코드 emit 엔 불필요). width 는 "N mm" 문자열.
+function opSetTableSplitBorder(doc, tableIndex, opts) {
+  const { section, el } = getTable(doc, tableIndex);
+  const ref = getAttr(el.attrs, 'borderFillIDRef') || '1';
+  const headerName = doc.headerName();
+  if (!headerName) throw new Error('set_table_split_border: Contents/header.xml missing');
+  const header = doc.read(headerName);
+  const list = scanTopLevel(header, 'hh:borderFills')[0];
+  if (!list) throw new Error('set_table_split_border: <hh:borderFills> missing');
+  const bfs = scanTopLevel(list.inner, 'hh:borderFill');
+  const src = bfs.find((b) => getAttr(b.attrs, 'id') === ref) || bfs[0];
+  if (!src) throw new Error('set_table_split_border: table borderFill not found');
+  const style = opts.line_type != null ? (OBJ_LINE_STYLE[String(opts.line_type).toLowerCase()] || 'SOLID') : 'SOLID';
+  const w = opts.width_mm != null ? `${Number(opts.width_mm)} mm` : '0.5 mm';
+  const color = opts.color != null ? normHex(opts.color) : '#000000';
+  const diag = `<hh:diagonal type="${style}" width="${w}" color="${color}"/>`;
+  let inner = /<hh:diagonal\b[^>]*\/>/.test(src.inner) ? src.inner.replace(/<hh:diagonal\b[^>]*\/>/, diag) : src.inner + diag;
+  const newId = String(Math.max(0, ...bfs.map((b) => Number(getAttr(b.attrs, 'id') || 0))) + 1);
+  let newAttrs = src.attrs.replace(/\s*id="\d+"/, ` id="${newId}"`);
+  newAttrs = setOrAddAttr(newAttrs, 'breakCellSeparateLine', '1');
+  const newBf = `<hh:borderFill${newAttrs}>${inner}</hh:borderFill>`;
+  let newHeader = spliceEl(header, list, `<hh:borderFills${list.attrs}>${list.inner + newBf}</hh:borderFills>`);
+  newHeader = bumpListCount(newHeader, 'hh:borderFills', +1);
+  doc.write(headerName, newHeader);
+  // 표를 '나눔' 모드 + 새 borderFill 로 repoint
+  let tblAttrs = setOrAddAttr(el.attrs, 'pageBreak', 'CELL');
+  tblAttrs = setOrAddAttr(tblAttrs, 'borderFillIDRef', newId);
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${tblAttrs}>${el.inner}</hp:tbl>`));
+  return { table: tableIndex, borderFillId: newId, line_type: opts.line_type || 'solid', width: w, color, pageBreak: 'CELL' };
+}
+
 // Distribute row heights / column widths evenly (셀 높이를/너비를 같게). Sums the
 // current row heights and column widths, divides by the count, and rewrites every
 // cell's <hp:cellSz>. mode: "width" / "height" / "both" (default). Best on
@@ -3413,6 +3450,7 @@ function applyOp(doc, op) {
     case 'set_table_size': return opSetTableSize(doc, op.table, op.width_mm, op.height_mm);
     case 'set_table_props': return opSetTableProps(doc, op.table, op);
     case 'set_title_cell': return opSetTitleCell(doc, op.table, op.row, op.col, op.on);
+    case 'set_table_split_border': return opSetTableSplitBorder(doc, op.table, op);
     case 'set_page_break': return opSetPageBreak(doc, op.index, op.on);
     case 'set_bullet_list': return opSetParagraphList(doc, op.index, 'BULLET', op.level, { char: op.char });
     case 'set_number_list': return opSetParagraphList(doc, op.index, 'NUMBER', op.level, { style: op.style });
