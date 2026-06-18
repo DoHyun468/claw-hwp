@@ -38,6 +38,8 @@
 //   set_table_size        { table, width_mm?, height_mm? }                  // 표 전체 크기 — 열/행 비례 스케일(한컴이 sz를 셀합으로 재계산하므로)
 //   set_table_props       { table, wrap?, page_split?, repeat_header? }     // wrap=inline|square|topbottom|front|behind; page_split=none|cell|table; repeat_header=bool(머리행 반복)
 //   set_title_cell        { table, row, col, on? }                          // <hp:tc header="1"> (머리 행 셀)
+//   set_cell_image        { table, row, col, source, ext?, width_mm?, height_mm? }   // 이미지를 셀 안에(inline) — 셀폭 자동맞춤+가운데+사방 여백
+//   set_cell_shape        { table, row, col, shape, width_mm?, height_mm?, fill_color?, line_color?, line_width_mm? }  // 도형(rect/ellipse/line)을 셀 안에(inline)
 //   set_table_split_border{ table, line_type?, width_mm?, color? }          // 여러 쪽 자동분할 표 경계선(borderFill breakCellSeparateLine + diagonal, pageBreak=CELL)
 //   set_object_size       { target, index, width_mm?, height_mm? }          // 그림/도형/차트 크기 (target=image|shape|chart)
 //   set_object_position   { target, index, x_mm?, y_mm?, wrap? }            // 위치(종이기준)+배치(wrap=inline|square|topbottom|front|behind)
@@ -2675,6 +2677,164 @@ function opInsertImage(doc, sourcePath, ext, width, height) {
   return { entry, itemId, inserted: true };
 }
 
+// Embed an image binary + manifest entry, return its itemId (shared by
+// insert_image-into-cell). Mirrors opInsertImage's embed half.
+function embedImageBinary(doc, sourcePath, ext) {
+  ext = (ext || path.extname(sourcePath).slice(1) || 'png').toLowerCase();
+  if (!MIME[ext]) throw new Error(`image: unsupported ext .${ext} (png/jpg/bmp/gif)`);
+  const existing = Object.keys(doc.files).filter((n) => /^BinData\//i.test(n));
+  const usedIds = new Set();
+  const hpf = doc.hpfName();
+  if (hpf) for (const m of doc.read(hpf).matchAll(/<opf:item [^>]*id="([^"]+)"/g)) usedIds.add(m[1]);
+  let n = 1;
+  while (existing.some((p) => p.endsWith(`/image${n}.${ext}`) || p.endsWith(`/img${n}.${ext}`)) || usedIds.has(`image${n}`)) n++;
+  const entry = `BinData/image${n}.${ext}`, itemId = `image${n}`;
+  doc.files[entry] = new Uint8Array(fs.readFileSync(sourcePath));
+  if (hpf) {
+    let s = doc.read(hpf);
+    if (!s.includes(`href="${entry}"`)) {
+      s = s.replace(/<\/opf:manifest>/, `<opf:item id="${itemId}" href="${entry}" media-type="${MIME[ext]}" isEmbeded="1"/></opf:manifest>`);
+      doc.write(hpf, s);
+    }
+  }
+  return { entry, itemId };
+}
+
+// Place ANY inline object XML (pic / shape / chart …) into a table cell. The
+// object must be treated-as-char (treatAsChar="1") so it flows inside the cell
+// like a glyph instead of floating out (user insight: "글자처럼 취급하면 글처럼
+// 들어간다"). insert_image/insert_shape only append to the body — this is the
+// shared path for getting objects INTO a cell. Appended as a run on the cell's
+// first paragraph (after any existing text).
+function placeObjectInCell(doc, tableIndex, row, col, objXml, opName) {
+  const { section, el } = getTable(doc, tableIndex);
+  const rows = scanTopLevel(el.inner, 'hp:tr');
+  if (row < 0 || row >= rows.length) throw new Error(`${opName}: row ${row} out of range`);
+  const tcs = scanTopLevel(rows[row].inner, 'hp:tc');
+  if (col < 0 || col >= tcs.length) throw new Error(`${opName}: col ${col} out of range`);
+  const tc = tcs[col];
+  const subs = scanTopLevel(tc.inner, 'hp:subList');
+  if (!subs.length) throw new Error(`${opName}: cell has no <hp:subList>`);
+  const ps = scanTopLevel(subs[0].inner, 'hp:p');
+  if (!ps.length) throw new Error(`${opName}: cell has no <hp:p>`);
+  const p = ps[0];
+  const charPrId = (p.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+  const newPInner = p.inner + `<hp:run charPrIDRef="${charPrId}">${objXml}</hp:run>`;
+  const newSub = `<hp:subList${subs[0].attrs}>${spliceEl(subs[0].inner, p, `<hp:p${p.attrs}>${newPInner}</hp:p>`)}</hp:subList>`;
+  const newTc = `<hp:tc${tc.attrs}>${spliceEl(tc.inner, subs[0], newSub)}</hp:tc>`;
+  const newRow = `<hp:tr${rows[row].attrs}>${spliceEl(rows[row].inner, tc, newTc)}</hp:tr>`;
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${spliceEl(el.inner, rows[row], newRow)}</hp:tbl>`));
+}
+
+// Default breathing margin (여백) around an in-cell object, per side.
+const CELL_OBJ_MARGIN = Math.round(1.4 * 283.46); // HWPUNIT (~1.4mm)
+const CELL_OBJ_MARGIN_MM = 1.4;
+
+// Read a table cell's usable inner content width (HWPUNIT) — what an inline
+// object must fit inside. Hancom renders cells at their <hp:cellSz> width (it
+// recomputes the table <hp:sz> from the column-width sum, so cellSz, not table
+// sz, is authoritative) and clips an object wider than the cell. The content
+// area is cellSz minus the cell's left/right 안여백: the cell's own cellMargin
+// when it carries one (hasMargin="1"), otherwise the inherited table inMargin
+// (GT 2026-06-18: a hasMargin="0" cell inherits table inMargin left/right 510
+// ≈ 1.8mm — ignoring it made the object overflow the content area and hug the
+// right border). Returns null when cellSz looks like rhwp garbage (width ≤ 100).
+function cellContentWidth(doc, tableIndex, row, col) {
+  try {
+    const { el } = getTable(doc, tableIndex);
+    const rows = scanTopLevel(el.inner, 'hp:tr');
+    if (row < 0 || row >= rows.length) return null;
+    const tcs = scanTopLevel(rows[row].inner, 'hp:tc');
+    if (col < 0 || col >= tcs.length) return null;
+    const tc = tcs[col];
+    const szM = tc.inner.match(/<hp:cellSz\b[^>]*\bwidth="(\d+)"/);
+    if (!szM) return null;
+    const w = Number(szM[1]);
+    if (!(w > 100)) return null; // rhwp garbage width="1" → caller default
+    const sumLR = (s) => s ? Number((s.match(/\bleft="(\d+)"/) || [, 0])[1]) + Number((s.match(/\bright="(\d+)"/) || [, 0])[1]) : 0;
+    const lr = /hasMargin="1"/.test(tc.attrs)
+      ? sumLR((tc.inner.match(/<hp:cellMargin\b[^>]*\/?>/) || [])[0])        // cell's own
+      : sumLR((el.inner.match(/<hp:inMargin\b[^>]*\/?>/) || [])[0]);        // inherited table inMargin
+    return Math.max(0, w - lr);
+  } catch { return null; }
+}
+
+// Clamp an inline object's [w,h] so it fits the cell's content width (cellSz −
+// 안여백), preserving aspect ratio. No-op when the cell width is unknown
+// (garbage cellSz) or it already fits. This is the "적당한 크기 자동조절" rule
+// (table size fixed → shrink the object); ⚠️ keep it aligned with the HWP track
+// (cell-patch.js) — memory hwpx-cell-object-sizing-align-hwp.
+function fitToCell(doc, tableIndex, row, col, w, h) {
+  const cw = cellContentWidth(doc, tableIndex, row, col);
+  if (cw == null) return [w, h];
+  if (w <= cw) return [w, h];
+  return [cw, Math.max(1, Math.round(h * (cw / w)))];
+}
+
+// Ensure an object cell carries explicit left/right 안여백 so the inline object
+// renders inset symmetrically from the side borders. Skips a cell the caller
+// already padded (hasMargin="1"), to respect an explicit set_cell_margin. Uses
+// the verified set_cell_margin mechanism (hasMargin="1" + <hp:cellMargin>);
+// horizontal margin = this cellMargin (object clamped to fill the content
+// width), vertical margin = the object's outMargin top/bottom + centre align.
+function ensureCellObjPadding(doc, tableIndex, row, col) {
+  const { el } = getTable(doc, tableIndex);
+  const rows = scanTopLevel(el.inner, 'hp:tr');
+  const tc = rows[row] && scanTopLevel(rows[row].inner, 'hp:tc')[col];
+  if (tc && /hasMargin="1"/.test(tc.attrs)) return;
+  opSetCellMargin(doc, tableIndex, row, col, { left: CELL_OBJ_MARGIN_MM, right: CELL_OBJ_MARGIN_MM });
+}
+
+// Give an in-cell object vertical breathing room via <hp:outMargin> top/bottom
+// only. Horizontal margin comes from the cell's cellMargin (ensureCellObjPadding)
+// + the width clamp, not from left/right outMargin — an inline object's
+// left/right outMargin renders one-sided (the object is a glyph on the line, so
+// it can't centre that way; GT-measured L≈2mm / R≈0.5mm). top/bottom instead
+// grows the line/row height so vertical-centre alignment yields an even gap.
+function withCellMargin(xml, m) {
+  const om = `<hp:outMargin left="0" right="0" top="${m}" bottom="${m}"/>`;
+  return /<hp:outMargin\b[^>]*\/>/.test(xml) ? xml.replace(/<hp:outMargin\b[^>]*\/>/, om) : xml;
+}
+
+// 이미지를 표 셀 안에 (inline). width/height HWPUNIT.
+function opSetCellImage(doc, tableIndex, row, col, sourcePath, ext, width, height) {
+  const { entry, itemId } = embedImageBinary(doc, sourcePath, ext);
+  ensureCellObjPadding(doc, tableIndex, row, col); // 좌우 셀 안여백(대칭)
+  // 기본 크기는 작게(30×20mm; 본문 insert_image 100mm 와 달리), 그리고 fitToCell 로 셀
+  // content 너비(cellSz − 안여백)에 클램프해 셀을 넘지 않게 한다(넘으면 한컴이 잘라버림).
+  // 호출자가 width_mm 로 지정해도 content 보다 크면 비율 유지하며 줄인다.
+  // ⚠️ 이 기본/맞춤 규칙은 HWP 트랙과 정합 필요 — 메모리 hwpx-cell-object-sizing-align-hwp.
+  width = width || Math.round(30 * 283.46);
+  height = height || Math.round(20 * 283.46);
+  [width, height] = fitToCell(doc, tableIndex, row, col, width, height);
+  let pic = buildPic(doc, itemId, width, height).replace(/treatAsChar="[^"]*"/, 'treatAsChar="1"');
+  pic = withCellMargin(pic, CELL_OBJ_MARGIN); // 상하 여백
+  placeObjectInCell(doc, tableIndex, row, col, pic, 'set_cell_image');
+  opSetCellAlign(doc, tableIndex, row, col, 'CENTER', 'CENTER'); // 셀 안에서 가운데
+  return { table: tableIndex, row, col, entry, itemId, inCell: true, width, height };
+}
+
+// 도형(사각형/타원/선)을 표 셀 안에 (inline, 글자처럼 취급).
+function opSetCellShape(doc, op) {
+  const shape = ({ rect: 'rect', rectangle: 'rect', box: 'rect', ellipse: 'ellipse', oval: 'ellipse', circle: 'ellipse', line: 'line' })[String(op.shape || 'rect').toLowerCase()];
+  if (!shape) throw new Error('set_cell_shape: shape must be rect / ellipse / line');
+  const toHu = (mm) => Math.round(Number(mm) * 283.46);
+  ensureCellObjPadding(doc, op.table, op.row, op.col); // 좌우 셀 안여백(대칭)
+  // 셀에 무난히 들어가는 작은 기본(20×12mm); 정확한 크기는 호출자가 지정. 그 뒤 fitToCell
+  // 로 content 너비에 클램프(넘으면 비율 유지하며 줄여 잘림 방지). HWP 정합 필요.
+  let w = op.width_mm != null ? toHu(op.width_mm) : toHu(20);
+  let h = op.height_mm != null ? toHu(op.height_mm) : toHu(12);
+  [w, h] = fitToCell(doc, op.table, op.row, op.col, w, h);
+  const fill = op.fill_color ? normHex(op.fill_color) : '#FFFFFF';
+  const line = op.line_color ? normHex(op.line_color) : '#000000';
+  const lw = op.line_width_mm != null ? toHu(op.line_width_mm) : 33;
+  let shapeXml = buildShape(shape, w, h, fill, line, lw, 'IN_FRONT_OF_TEXT', 0, 0, 0).replace(/treatAsChar="[^"]*"/, 'treatAsChar="1"');
+  shapeXml = withCellMargin(shapeXml, CELL_OBJ_MARGIN); // 상하 여백
+  placeObjectInCell(doc, op.table, op.row, op.col, shapeXml, 'set_cell_shape');
+  opSetCellAlign(doc, op.table, op.row, op.col, 'CENTER', 'CENTER'); // 셀 안에서 가운데
+  return { table: op.table, row: op.row, col: op.col, shape, inCell: true };
+}
+
 // Build an inline <hp:pic> for a freshly-added image. Hancom Docs validates the
 // shape schema strictly (requires hp:renderingInfo, hp:shapeComment; rejects a
 // stray hp:caption), so we CLONE an existing pic from the document when one is
@@ -3481,6 +3641,10 @@ function applyOp(doc, op) {
     case 'set_object_margin': return opSetObjectMargin(doc, op.target, op.index, op);
     case 'set_object_border': return opSetObjectBorder(doc, op.target, op.index, op);
     case 'set_object_fill': return opSetObjectFill(doc, op.target, op.index, op);
+    case 'set_cell_image': return opSetCellImage(doc, op.table, op.row, op.col, op.source, op.ext,
+      op.width_mm != null ? Math.round(Number(op.width_mm) * 283.46) : op.width,
+      op.height_mm != null ? Math.round(Number(op.height_mm) * 283.46) : op.height);
+    case 'set_cell_shape': return opSetCellShape(doc, op);
     case 'set_column_break': return opSetColumnBreak(doc, op.index, op.on);
     case 'insert_table_row': return opInsertTableRow(doc, op.table, op.row, op.where, op.cells);
     case 'insert_table_column': return opInsertTableColumn(doc, op.table, op.col, op.where, op.cells);
