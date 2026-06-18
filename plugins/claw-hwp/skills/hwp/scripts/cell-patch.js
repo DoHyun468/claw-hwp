@@ -2485,6 +2485,39 @@ function setGsoOutMarginTopBottom(cluster, hu) {
 }
 const CELL_OBJ_VMARGIN_HU = 283; // ~1 mm default top/bottom margin for in-cell objects
 
+// Set the first PARA_HEADER's para_shape_id (body @8) in a built object cluster —
+// used to center an object paragraph dropped into a cell.
+function setClusterParaShape(cluster, psId) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p);
+    const tag = h & 0x3ff; let size = (h >>> 20) & 0xfff; let hd = 4;
+    if (size === 0xfff) { size = cluster.readUInt32LE(p + 4); hd = 8; }
+    if (tag === TAG_PARA_HEADER) { cluster.writeUInt16LE(psId & 0xFFFF, p + hd + 8); return; }
+    p += hd + size;
+  }
+}
+
+// Drop a body-built self-contained gso cluster (image / shape / chart) into a table
+// cell: re-level +2, center it, add the default vertical margin, splice at the cell
+// end, bump the cell's paragraph count, fix the cell's last-para flag. Returns the
+// new `raw`. (locateCell-by-row/col via tableCellRecords.)
+function spliceGsoIntoCell(raw, cluster, para, control, row, col, centerPsId) {
+  const target = tableCellRecords(parseRecords(raw), raw, para, control)
+    .find((c) => c.row === row && c.col === col);
+  if (!target) throw new Error(`cell (row=${row}, col=${col}) not found in table at para ${para} control ${control}`);
+  const cellCluster = relevelCluster(cluster, 2);
+  setClusterParaShape(cellCluster, centerPsId);
+  setGsoOutMarginTopBottom(cellCluster, CELL_OBJ_VMARGIN_HU);
+  raw = Buffer.concat([raw.slice(0, target.endByte), cellCluster, raw.slice(target.endByte)]);
+  const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
+    .find((c) => c.row === row && c.col === col);
+  const lhDataOff = t2.startByte + 4;
+  raw.writeUInt16LE((raw.readUInt16LE(lhDataOff) + 1) & 0xFFFF, lhDataOff); // nParagraphs++
+  normalizeCellLastParaFlag(raw, t2.startByte, t2.endByte, 2);
+  return raw;
+}
+
 // Inside a cell whose first paragraph is at `cellParaLevel` (2 for table cells):
 // set the last-paragraph flag (MSB of char_count) on the LAST PARA_HEADER of that
 // level within [startByte, endByte) and clear it on the earlier ones. Mirrors
@@ -4328,6 +4361,12 @@ export async function insertChartInPlace(filePath, ops) {
   if (!Array.isArray(ops) || ops.length === 0) {
     return Object.assign([], { mode: 'in-place', inserted_count: 0 });
   }
+  // Charts dropped into a table cell are centered by default (user pref): ensure a
+  // centered ParaShape exists (DocInfo write) before the per-chart Section0 step.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
   const summary = [];
   for (const op of ops) {
     const type = Number.isInteger(op.chart_type) && op.chart_type >= 0 && op.chart_type <= 19 ? op.chart_type : 0;
@@ -4421,15 +4460,21 @@ export async function insertChartInPlace(filePath, ops) {
       const cluster = Buffer.from(tpl.clusterHex, 'hex');
       // Default to like-char so the chart reserves its height and surrounding
       // text flows above/below it (set op.float:true for the floating original).
-      setGsoLikeChar(cluster, op.float === true ? false : (op.like_char !== false));
-      let insertAt = raw.length;
-      const clusters = findClusterBoundaries(records);
-      if (op.anchor && typeof op.anchor === 'string') {
-        const ab = Buffer.from(op.anchor, 'utf16le');
-        for (const c of clusters) { let hit = false; for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } } if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; } }
-      } else { const t = findLastSimpleBodyParagraph(records); insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length; }
-      raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
-      normalizeLastParaFlag(raw);
+      if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+        // ── Drop the chart INSIDE a table cell (centered, like-char). ──
+        setGsoLikeChar(cluster, true);
+        raw = spliceGsoIntoCell(raw, cluster, op.cell.para ?? 0, op.cell.control ?? 0, op.cell.row, op.cell.col, centerPsId);
+      } else {
+        setGsoLikeChar(cluster, op.float === true ? false : (op.like_char !== false));
+        let insertAt = raw.length;
+        const clusters = findClusterBoundaries(records);
+        if (op.anchor && typeof op.anchor === 'string') {
+          const ab = Buffer.from(op.anchor, 'utf16le');
+          for (const c of clusters) { let hit = false; for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } } if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; } }
+        } else { const t = findLastSimpleBodyParagraph(records); insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length; }
+        raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+        normalizeLastParaFlag(raw);
+      }
 
       let newComp;
       if (secInMini) {
