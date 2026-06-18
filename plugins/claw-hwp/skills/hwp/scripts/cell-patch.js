@@ -7267,6 +7267,13 @@ const BORDER_TYPE = {
   solid: 0x41, dotted: 0x42, dashed: 0x43, 'dash-dot': 0x44,
   'dash-dot-dot': 0x45, 'long-dash': 0x46, 'circle-dot': 0x47, double: 0x48,
 };
+const COMP_HATCH_COLOR_OFF = 217; // fill pattern (hatch) color, u32 BGR
+const COMP_HATCH_STYLE_OFF = 221; // fill pattern (hatch) style, u32 (0xFFFFFFFF = none)
+// GT-confirmed (object-prop --fill-pattern, .hwp download). 0xFFFFFFFF = solid (no
+// hatch); 0-5 = hatch style.
+const FILL_PATTERN = {
+  horizontal: 0, vertical: 1, 'down-diagonal': 2, 'up-diagonal': 3, grid: 4, cross: 5,
+};
 
 // Each drawing object = its gso CTRL_HEADER + the SHAPE_COMPONENT (0x4c) that
 // immediately follows it (holds the inline fill/line).
@@ -7297,13 +7304,16 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
     if ((op.section ?? 0) !== 0) throw new Error(`set_object_property: only section 0 is supported (got ${op.section})`);
     const has = op.fill != null || op.border_color != null || op.border_width_mm != null
       || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null
-      || op.fill_transparency != null || op.border_type != null;
-    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / border_type / margins / margin_mm / wrap / fill_transparency is required');
+      || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null;
+    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / border_type / fill_pattern / margins / margin_mm / wrap / fill_transparency is required');
     if (op.fill_transparency != null && (op.fill_transparency < 0 || op.fill_transparency > 100)) {
       throw new Error('set_object_property: fill_transparency must be 0-100');
     }
     if (op.border_type != null && BORDER_TYPE[String(op.border_type).toLowerCase()] == null) {
       throw new Error(`set_object_property: border_type must be one of ${Object.keys(BORDER_TYPE).join(' / ')}`);
+    }
+    if (op.fill_pattern != null && op.fill_pattern !== 'none' && FILL_PATTERN[String(op.fill_pattern).toLowerCase()] == null) {
+      throw new Error(`set_object_property: fill_pattern must be 'none' or one of ${Object.keys(FILL_PATTERN).join(' / ')}`);
     }
     if (Array.isArray(op.margins) && op.margins.length !== 4) {
       throw new Error('set_object_property: margins must be [left,right,top,bottom] (4 values, mm)');
@@ -7367,11 +7377,19 @@ export async function applyObjectPropertyInPlace(filePath, ops) {
       rec.wrap = String(op.wrap).toLowerCase();
     }
     if (op.fill != null || op.border_color != null || op.border_width_mm != null
-        || op.fill_transparency != null || op.border_type != null) {
+        || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null) {
       if (!comp) throw new Error(`set_object_property: no SHAPE_COMPONENT for object ${idx} (fill/border need a shape)`);
       if (op.border_type != null) {
         secRaw.writeUInt8(BORDER_TYPE[String(op.border_type).toLowerCase()], comp.dataOff + COMP_BORDER_TYPE_OFF);
         rec.border_type = String(op.border_type).toLowerCase();
+      }
+      if (op.fill_pattern != null) {
+        const style = op.fill_pattern === 'none' ? 0xFFFFFFFF : FILL_PATTERN[String(op.fill_pattern).toLowerCase()];
+        secRaw.writeUInt32LE(style >>> 0, comp.dataOff + COMP_HATCH_STYLE_OFF);
+        if (op.fill_pattern_color != null) {
+          secRaw.writeUInt32LE(parseColorBGR(op.fill_pattern_color) >>> 0, comp.dataOff + COMP_HATCH_COLOR_OFF);
+        }
+        rec.fill_pattern = String(op.fill_pattern).toLowerCase();
       }
       if (op.fill != null && op.fill !== 'none') {
         secRaw.writeUInt32LE(parseColorBGR(op.fill) >>> 0, comp.dataOff + COMP_FILL_OFF);
