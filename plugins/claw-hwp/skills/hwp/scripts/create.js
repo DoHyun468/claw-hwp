@@ -993,6 +993,9 @@ const HANDLERS = {
       heightHU,
       bold: true,
       color: inkColor,
+      // Top gap (HWPUNIT) so a table directly before this heading can carry it on
+      // its outMargin.bottom (Hancom eats a heading's own prev below a table).
+      topGap: op.spacing_before ?? def.spacingBefore,
     });
     // Headings: left-aligned (justify makes 16pt headings look weird with
     // the inter-word stretch), tight line spacing, generous before/after.
@@ -2814,25 +2817,34 @@ async function patchHwpxTableOutMargin(filePath) {
     let xml = await zip.file(name).async("string");
     let changed = false;
 
-    // 1. outMargin top/bottom on each top-level table. The below-table gap =
-    //    outMargin.bottom (paragraph margins are eaten below a table); default to
-    //    a heading's section gap so 표→heading == body→heading. A per-table
-    //    spacing_before/after (tableSpacingSpecs, in append_table order) overrides
-    //    it. (Hancom clamps an asymmetric pair to symmetric on web; desktop keeps
-    //    both — we still write the caller's intent.)
+    // Per-table bottom margin: if a HEADING follows the table, use that heading's
+    // top gap so 표→제목 == 제목 위 여백 (Hancom eats a heading's own prev below a
+    // table, so the below-gap must live on the table's outMargin.bottom). Else the
+    // small default before body. headingPatches.paraIdx aligns with
+    // topLevelParaRegions on section0 (same indexing patchHwpxHeadings relies on).
+    const isSec0 = name === "Contents/section0.xml";
+    const headTopGap = new Map(headingPatches.map((h) => [h.paraIdx, h.topGap]));
+    const regionsPre = topLevelParaRegions(xml);
+    const tableBottoms = [];
+    for (let i = 0; i < regionsPre.length; i++) {
+      if (!/<hp:tbl\b/.test(xml.slice(regionsPre[i].start, regionsPre[i].end))) continue;
+      tableBottoms.push((isSec0 && headTopGap.has(i + 1)) ? headTopGap.get(i + 1) : null);
+    }
+    let tIdx = 0;
+
+    // 1. outMargin top/bottom on each top-level table. above-gap (top) = small
+    //    dedicated table margin (wrapper para prev=0 → above-gap = preceding.after
+    //    collapsed + this small top ≈ 제목→글). below-gap (bottom) = the following
+    //    heading's top gap (표→제목 == 글→제목) or the small default before body.
+    //    A per-table spacing_before/after (tableSpacingSpecs) still overrides.
     const xml2 = xml.replace(/<hp:tbl\b[\s\S]*?<hp:tr\b/g, (seg) =>
       seg.replace(/<hp:outMargin\b[^>]*\/>/, (m) => {
         const left = TABLE_TOP_MARGIN;   // 양옆도 500(≈1.8mm)로 통일 — 사방 대칭
         const right = TABLE_TOP_MARGIN;
         const spec = tableSpacingSpecs[total] || {};
-        // top: small dedicated table margin (~1/4 of the section gap). The wrapper
-        // para's prev is 0, so the above-gap = preceding.after (collapsed) + this
-        // small top — close to 제목→글 with a touch of table breathing room, not the
-        // old double-stack. bottom keeps the section gap (para margins are eaten
-        // below a table). A caller's spacing_before/after still overrides.
         const top = spec.before ?? TABLE_TOP_MARGIN;
-        const bottom = spec.after ?? TABLE_TOP_MARGIN; // 위·아래 대칭 500(≈1.8mm)
-        total++;
+        const bottom = spec.after ?? tableBottoms[tIdx] ?? TABLE_TOP_MARGIN;
+        total++; tIdx++;
         return `<hp:outMargin left="${left}" right="${right}" top="${top}" bottom="${bottom}"/>`;
       }),
     );
