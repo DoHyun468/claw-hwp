@@ -1070,8 +1070,8 @@ const HANDLERS = {
     // single-key calls didn't. This is the same recipe.
     const DEFAULT_BORDER = { type: 1, width: 1, color: "#000000" };
     const HEADER_BG = "#EAEAEA";   // soft Office-style header gray
-    const HEADER_PAD = 600;        // ~2.1mm vertical — taller header row
-    const BODY_PAD = 400;          // ~1.4mm — generous breathing room (vs default 141)
+    const HEADER_PAD = 400;        // ~1.4mm vertical (docx 80 twip ×5) — uniform w/ body
+    const BODY_PAD = 400;          // ~1.4mm vertical (docx 80 twip ×5)
     // createTableEx ignores per-column colWidths in the rhwp build we use:
     // header row 0 ends up with width=1 (≈0cm) and body rows get total/cols
     // evenly distributed regardless of the colWidths argument. Reapplying
@@ -1095,8 +1095,8 @@ const HANDLERS = {
         const cellProps = {
           paddingTop: isHeader ? HEADER_PAD : BODY_PAD,
           paddingBottom: isHeader ? HEADER_PAD : BODY_PAD,
-          paddingLeft: 510,
-          paddingRight: 510,
+          paddingLeft: 600,   // ~2.1mm horizontal (docx 120 twip ×5)
+          paddingRight: 600,
         };
         if (colWidthsHwp) cellProps.width = colWidthsHwp[c];
         if (isHeader) {
