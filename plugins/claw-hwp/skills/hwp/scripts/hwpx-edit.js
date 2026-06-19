@@ -2827,7 +2827,7 @@ function opDeleteImage(doc, target) {
   return { entry, itemId, picsRemoved, deleted: true };
 }
 
-function opInsertImage(doc, sourcePath, ext, width, height) {
+function opInsertImage(doc, sourcePath, ext, width, height, index) {
   ext = (ext || path.extname(sourcePath).slice(1) || 'png').toLowerCase();
   if (!MIME[ext]) throw new Error(`insert_image: unsupported ext .${ext} (png/jpg/bmp/gif)`);
   const existing = Object.keys(doc.files).filter((n) => /^BinData\//i.test(n));
@@ -2849,17 +2849,30 @@ function opInsertImage(doc, sourcePath, ext, width, height) {
       doc.write(hpf, s);
     }
   }
+  const pic = buildPic(doc, itemId, width, height);
+  const plainAttrs = ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"`;
+  // `index` optional: place the image's paragraph AFTER top-level paragraph
+  // `index` (so an image lands next to its reference text, like insert_chart)
+  // instead of always appending to the doc end. Omit → append.
+  const allParas = doc.paragraphs();
+  const idx = Number.isInteger(index) ? index : null;
+  if (idx != null && idx >= 0 && idx < allParas.length) {
+    const { section, el } = allParas[idx];
+    const cpr = (el.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+    const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${cpr}">${pic}</hp:run></hp:p>`;
+    const sxml = doc.read(section);
+    doc.write(section, sxml.slice(0, el.end) + para + sxml.slice(el.end));
+    return { entry, itemId, inserted: true, afterIndex: idx };
+  }
   const names = doc.sectionNames();
   const last = names[names.length - 1];
   let xml = doc.read(last);
-  const paras = scanTopLevel(xml, 'hp:p');
-  const charPrId = paras.length ? (paras[paras.length - 1].inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1] : '0';
-  const attrs = paras.length ? paras[paras.length - 1].attrs.replace(/\s*id="\d+"/, ` id="${freshId()}"`) : ` id="${freshId()}" paraPrIDRef="0" styleIDRef="0"`;
-  const pic = buildPic(doc, itemId, width, height);
-  const para = `<hp:p${attrs}><hp:run charPrIDRef="${charPrId}">${pic}</hp:run></hp:p>`;
+  const lastParas = scanTopLevel(xml, 'hp:p');
+  const charPrId = lastParas.length ? (lastParas[lastParas.length - 1].inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1] : '0';
+  const para = `<hp:p${plainAttrs}><hp:run charPrIDRef="${charPrId}">${pic}</hp:run></hp:p>`;
   xml = /<\/hs:sec>\s*$/.test(xml) ? xml.replace(/<\/hs:sec>\s*$/, para + '</hs:sec>') : xml + para;
   doc.write(last, xml);
-  return { entry, itemId, inserted: true };
+  return { entry, itemId, inserted: true, appended: true };
 }
 
 // Embed an image binary + manifest entry, return its itemId (shared by
@@ -3828,8 +3841,12 @@ function buildShape(shape, w, h, fillColor, lineColor, lineWidth, wrap, x, y, ma
     + `<hp:lineShape color="${lineColor}" width="${lw}" style="SOLID" endCap="FLAT" headStyle="NORMAL" tailStyle="NORMAL" headfill="1" tailfill="1" headSz="SMALL_SMALL" tailSz="SMALL_SMALL" outlineStyle="NORMAL" alpha="0"/>`;
   const fill = `<hc:fillBrush><hc:winBrush faceColor="${fillColor}" hatchColor="#000000" alpha="0"/></hc:fillBrush>`;
   const shadow = `<hp:shadow type="NONE" color="#B2B2B2" offsetX="0" offsetY="0" alpha="0"/>`;
+  // INLINE wrap → treat the shape as a character (sits in the text line / its own
+  // paragraph) instead of floating. Otherwise text overlaps it (the bug where an
+  // inline-requested shape still floated left and the next text wrapped over it).
+  const tac = tw === 'INLINE' ? '1' : '0';
   const tail = `<hp:sz width="${w}" widthRelTo="ABSOLUTE" height="${h}" heightRelTo="ABSOLUTE" protect="0"/>`
-    + `<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="0" allowOverlap="1" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="${vy}" horzOffset="${hx}"/>`
+    + `<hp:pos treatAsChar="${tac}" affectLSpacing="0" flowWithText="${tac === '1' ? '1' : '0'}" allowOverlap="${tac === '1' ? '0' : '1'}" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="${tac === '1' ? 'PARA' : 'COLUMN'}" vertAlign="TOP" horzAlign="LEFT" vertOffset="${vy}" horzOffset="${hx}"/>`
     + `<hp:outMargin left="${om}" right="${om}" top="${om}" bottom="${om}"/>`;
   const open = (extra) => `<hp:${shape} id="${id}" zOrder="0" numberingType="PICTURE" textWrap="${tw}" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="${inst}"${extra}>`;
   if (shape === 'line') {
@@ -3948,7 +3965,8 @@ function applyOp(doc, op) {
     case 'apply_paragraph_style': return opApplyParagraphStyle(doc, op.index, op);
     case 'insert_image': return opInsertImage(doc, op.source, op.ext,
       op.width_mm != null ? Math.round(Number(op.width_mm) * 283.46) : op.width,
-      op.height_mm != null ? Math.round(Number(op.height_mm) * 283.46) : op.height);
+      op.height_mm != null ? Math.round(Number(op.height_mm) * 283.46) : op.height,
+      op.index);
     case 'replace_image': return opReplaceImage(doc, op.target, op.source);
     case 'delete_image': return opDeleteImage(doc, op.target);
     case 'set_field_value': return opSetFieldValue(doc, op.name, op.value);
