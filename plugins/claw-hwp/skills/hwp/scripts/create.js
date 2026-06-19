@@ -1271,10 +1271,16 @@ const HANDLERS = {
     // two read identically (user: 표 뒤 제목과 본문 뒤 제목 간격이 같아야 한다).
     // The earlier outMargin approach ADDED on top of the collapsed gap (sum),
     // which over-spaced 표→heading.
+    // The table must space EXACTLY like a body paragraph: its top gap should
+    // come ONLY from the preceding element's spacingAfter, so 제목→표 == 제목→글
+    // and 글→표 == 글→글. So wrapper spacingBefore = 0 (a body paragraph's prev is
+    // 0) AND the table's own outMargin.top = 0 (set in patchHwpxTableOutMargin) —
+    // otherwise the two stack and over-space above the table. Keep spacingAfter
+    // for the below-table rhythm.
     applyParaProps(doc, { sec: cursor.sec, para: tableParaIdx, charOffset: 0 }, {
       align: "left",
       lineSpacing: BODY_LINE_SPACING,
-      spacingBefore: BODY_SPACING_AFTER,
+      spacingBefore: 0,
       spacingAfter: BODY_SPACING_AFTER,
     });
     // Record this table's spacing override (HWPUNIT) for patchHwpxTableOutMargin,
@@ -2774,7 +2780,9 @@ async function patchHwpxParaSpacing(filePath) {
 // (+ outMargin.top). So om=0 makes 표→heading touch. To make 표→heading match
 // body→heading (≈6mm, the heading's collapsed section gap), set outMargin to that
 // gap so the below-table gap (=outMargin.bottom) equals it.
-const TABLE_OUTMARGIN = 1700; // HWPUNIT ≈ 6mm — matches a heading's section gap
+const TABLE_OUTMARGIN = 1700; // HWPUNIT ≈ 6mm — below-table section gap
+const TABLE_TOP_MARGIN = 500; // HWPUNIT ≈ 1.8mm — small above-table margin (~¼ of section gap);
+                              // wrapper para prev=0, so above-gap ≈ preceding.after + this (no double-stack)
 async function patchHwpxTableOutMargin(filePath) {
   const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
   const headerEntry = zip.file("Contents/header.xml");
@@ -2800,7 +2808,12 @@ async function patchHwpxTableOutMargin(filePath) {
         const left = (m.match(/left="(\d+)"/) || [])[1] ?? "283";
         const right = (m.match(/right="(\d+)"/) || [])[1] ?? "283";
         const spec = tableSpacingSpecs[total] || {};
-        const top = spec.before ?? TABLE_OUTMARGIN;
+        // top: small dedicated table margin (~1/4 of the section gap). The wrapper
+        // para's prev is 0, so the above-gap = preceding.after (collapsed) + this
+        // small top — close to 제목→글 with a touch of table breathing room, not the
+        // old double-stack. bottom keeps the section gap (para margins are eaten
+        // below a table). A caller's spacing_before/after still overrides.
+        const top = spec.before ?? TABLE_TOP_MARGIN;
         const bottom = spec.after ?? TABLE_OUTMARGIN;
         total++;
         return `<hp:outMargin left="${left}" right="${right}" top="${top}" bottom="${bottom}"/>`;
