@@ -4,6 +4,12 @@
 directly to its OWPML XML (via the vendored `fflate` zip), then repackaging. It
 never touches HWP 5.0 binary (`.hwp`) — that path is `cell-patch.js` / Path B.
 
+> **Placing objects (charts/images/shapes) so they look natural?** See
+> **`hwpx-object-placement.md`** — a decision table + verified recipe for every
+> `wrap` mode (inline default / topbottom / square / behind / front) with size,
+> margin, and position guidance. Picking the wrong mode for the content (e.g. a
+> full-width chart with `square`) mangles the page; the manual says which to use.
+
 ## Invocation
 
 ```bash
