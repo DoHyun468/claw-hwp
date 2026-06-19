@@ -4173,6 +4173,10 @@ export async function insertImageInPlace(filePath, ops) {
       const records = parseRecords(raw);
       const paraInst = pickFreshInstanceId(records, raw);
       const cluster = buildImagePicCluster(storageId, paraInst, (paraInst + 0x100) >>> 0);
+      // size — aspect preserved from the image's NATIVE pixel ratio (give one
+      // axis → the other follows; give both → explicit squeeze).
+      const px = readImagePixelSize(imgBuf);
+      applyGsoSize(cluster, resolveAspectSize(op, px && px.w > 0 && px.h > 0 ? px.w / px.h : gsoCtrlRatio(cluster)));
       if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
         // ── Insert into a table CELL — the image becomes a new (treat-as-char)
         // paragraph inside the cell. The body-built gso cluster is dropped two
@@ -4334,6 +4338,168 @@ function setGsoLikeChar(cluster, likeChar) {
   return cluster;
 }
 
+// ── 개체 배치 (object placement / wrap) — unified across insert_* ops ─────────
+// One placement vocabulary shared with the HWPX track + set_object_property:
+//   wrap = inline (글자처럼, DEFAULT) | topbottom (자리차지) | square (어울림)
+//        | behind (글 뒤) | front (글 앞)
+// inline keeps the object on its own line/flow (object reserves height → text
+// flows above/below cleanly, never drifts to a later page); the floating modes
+// use the GT-verified TABLE_WRAP bit field (same as set_object_property.wrap).
+function resolveWrapMode(op) {
+  if (op.wrap != null) {
+    const w = String(op.wrap).toLowerCase();
+    if (!(w in TABLE_WRAP)) {
+      throw new Error('wrap must be inline / topbottom / square / behind / front');
+    }
+    return w;
+  }
+  // Back-compat: the old `float:true` / `like_char:false` meant "the floating
+  // original" (text wraps beside it) = square.
+  if (op.float === true || op.like_char === false) return 'square';
+  return 'inline';
+}
+
+// Apply wrap + optional floating position (x/y, mm from page) + outer margins
+// to the gso CTRL_HEADER inside an assembled cluster. Reuses the exact byte
+// offsets and TABLE_WRAP encoding that set_object_property (GT-verified across
+// all 5 modes) writes, so insert+wrap is byte-equivalent to insert then
+// set_object_property — no separate Tier-2 proof needed per mode.
+function applyGsoPlacement(cluster, op, mode) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      const d = p; // CTRL_HEADER data start (' osg' id at d, attribute at d+4)
+      const attr = cluster.readUInt32LE(d + 4);
+      cluster.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | TABLE_WRAP[mode]) >>> 0, d + 4);
+      // Floating position (paper-relative). Meaningful for square/behind/front;
+      // inline ignores it. Only written when the caller supplies it.
+      if (op.pos_x_mm != null && d + GSO_POS_X_OFF + 4 <= cluster.length) {
+        cluster.writeUInt32LE(Math.round(op.pos_x_mm * HWPUNIT_PER_MM) >>> 0, d + GSO_POS_X_OFF);
+      }
+      if (op.pos_y_mm != null && d + GSO_POS_Y_OFF + 4 <= cluster.length) {
+        cluster.writeUInt32LE(Math.round(op.pos_y_mm * HWPUNIT_PER_MM) >>> 0, d + GSO_POS_Y_OFF);
+      }
+      if ((op.margin_mm != null || Array.isArray(op.margins)) && d + GSO_OUTMARGIN_OFF + 8 <= cluster.length) {
+        const m = Array.isArray(op.margins)
+          ? op.margins
+          : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
+        for (let i = 0; i < 4; i++) {
+          cluster.writeUInt16LE(Math.round(m[i] * HWPUNIT_PER_MM) & 0xFFFF, d + GSO_OUTMARGIN_OFF + i * 2);
+        }
+      }
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Per-shape-record byte offsets of the W / H coordinates, keyed by the shape
+// record tag. Hancom draws each shape from its record geometry (literal local
+// coords), so resizing means rewriting these too — not just the CTRL/COMP
+// bounding box. GT-decoded from the templates (15000×6750 = 53×24 mm markers):
+//   rect (0x4f): 4 corners — W at the two right-edge x's, H at the two bottom y's
+//   ellipse (0x50): bounding box right/bottom
+//   line (0x4e): the endpoint vector (dx, dy)
+//   arc (0x51): bounding box
+// Each entry [byteOffset, factor]: write round(axisLen × factor). Most are ×1
+// (a literal corner/endpoint coordinate); the ellipse stores center + axis
+// endpoints, so its center/axis-x's are half the width, etc.
+const SHAPE_REC_SIZE = {
+  0x4f: { w: [[9, 1], [17, 1]], h: [[21, 1], [29, 1]] },          // RECTANGLE — 4 corners (verified)
+  0x4e: { w: [[8, 1]], h: [[12, 1]] },                            // LINE — endpoint vector (verified)
+  0x50: { w: [[4, 0.5], [12, 1], [20, 0.5]], h: [[8, 0.5], [16, 0.5]] }, // ELLIPSE — center(W/2,H/2)+axis(W,H/2) endpoints
+  // arc (0x51) is center+axis+sweep-angle (W@17 H@13, irregular) — resizing W/H
+  // alone won't preserve the curve; kept guarded (see resize guard below).
+};
+
+// Set the gso object's size (width/height, mm → HWPUNIT). Writes every place the
+// size lives so they stay consistent: CTRL_HEADER bounding (W@16 H@20),
+// SHAPE_COMPONENT curWidth/curHeight pairs (@20/24 + @28/32), and the shape
+// RECORD's local geometry (per SHAPE_REC_SIZE — Hancom draws from these). Only
+// the axes the caller supplies are touched. Unknown record tags get CTRL+COMP
+// only (bounding resizes; geometry may not — caller should verify).
+function applyGsoSize(cluster, op) {
+  if (op.width_mm == null && op.height_mm == null) return cluster;
+  const W = op.width_mm != null ? Math.round(op.width_mm * HWPUNIT_PER_MM) : null;
+  const H = op.height_mm != null ? Math.round(op.height_mm * HWPUNIT_PER_MM) : null;
+  const put = (off, v) => { if (v != null && off + 4 <= cluster.length) cluster.writeUInt32LE(v >>> 0, off); };
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    const d = p;
+    if (tag === 0x47 && cluster.slice(d, d + 4).toString('latin1') === ' osg') {
+      put(d + 16, W); put(d + 20, H);
+    } else if (tag === 0x4C) { // SHAPE_COMPONENT: curWidth/curHeight pairs
+      put(d + 20, W); put(d + 28, W); put(d + 24, H); put(d + 32, H);
+    } else if (SHAPE_REC_SIZE[tag]) {
+      const m = SHAPE_REC_SIZE[tag];
+      if (W != null) for (const [o, f] of m.w) put(d + o, Math.round(W * f));
+      if (H != null) for (const [o, f] of m.h) put(d + o, Math.round(H * f));
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Aspect-ratio resolution for object size. The default is to PRESERVE aspect:
+// when the caller gives only one axis, the other is derived from `refRatio`
+// (= refWidth / refHeight — native pixels for an image, the template's default
+// extent for shapes/charts) so the object never distorts. Giving BOTH axes is
+// the explicit override — the agent deliberately squeezing an object to fit a
+// fixed slot without breaking the form. Returns a {width_mm, height_mm} object
+// to hand straight to applyGsoSize (either field may stay null = use default).
+function resolveAspectSize(op, refRatio) {
+  const w = op.width_mm, h = op.height_mm;
+  if (w != null && h != null) return { width_mm: w, height_mm: h };          // explicit override
+  if (w != null && h == null && refRatio) return { width_mm: w, height_mm: w / refRatio };
+  if (h != null && w == null && refRatio) return { width_mm: h * refRatio, height_mm: h };
+  return { width_mm: w, height_mm: h };
+}
+
+// refRatio (W/H) from a cluster's gso CTRL_HEADER default extent (W@16, H@20).
+function gsoCtrlRatio(cluster) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      const w = cluster.readUInt32LE(p + 16), hh = cluster.readUInt32LE(p + 20);
+      if (w > 0 && hh > 0) return w / hh;
+    }
+    p += sz;
+  }
+  return null;
+}
+
+// Native pixel WxH of a PNG or JPEG buffer (for image aspect preservation).
+function readImagePixelSize(buf) {
+  if (buf.length >= 24 && buf.readUInt32BE(0) === 0x89504e47) { // PNG: IHDR W@16 H@20 (BE)
+    return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+  }
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8) { // JPEG: scan SOF markers
+    let p = 2;
+    while (p + 9 < buf.length) {
+      if (buf[p] !== 0xff) { p++; continue; }
+      const m = buf[p + 1];
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        return { h: buf.readUInt16BE(p + 5), w: buf.readUInt16BE(p + 7) };
+      }
+      if (p + 4 > buf.length) break;
+      p += 2 + buf.readUInt16BE(p + 2);
+    }
+  }
+  return null;
+}
+
+// Build a {categories, series:[{name,values}]} model from op params, or null if
+// the op carries no data overrides (then the template's default chart is used).
+
 // Build a {categories, series:[{name,values}]} model from op params, or null if
 // the op carries no data overrides (then the template's default chart is used).
 function buildChartDataModel(op) {
@@ -4474,7 +4640,8 @@ export async function insertChartInPlace(filePath, ops) {
         setGsoLikeChar(cluster, true);
         raw = spliceGsoIntoCell(raw, cluster, op.cell.para ?? 0, op.cell.control ?? 0, op.cell.row, op.cell.col, centerPsId);
       } else {
-        setGsoLikeChar(cluster, op.float === true ? false : (op.like_char !== false));
+        applyGsoPlacement(cluster, op, resolveWrapMode(op));
+        applyGsoSize(cluster, resolveAspectSize(op, gsoCtrlRatio(cluster))); // size, aspect-preserved (chart scales to frame)
         let insertAt = raw.length;
         const clusters = findClusterBoundaries(records);
         if (op.anchor && typeof op.anchor === 'string') {
@@ -4580,6 +4747,11 @@ export async function insertShapeInPlace(filePath, ops) {
   for (const op of ops) {
     const shapeName = SHAPE_KINDS[op.shape] ? op.shape : 'rect';
     const kind = SHAPE_KINDS[shapeName];
+    if ((op.width_mm != null || op.height_mm != null) && shapeName === 'arc') {
+      // arc geometry is center+axis+sweep-angle; resizing W/H alone won't keep the
+      // curve, and the layout isn't GT-mapped — reject cleanly rather than distort.
+      throw new Error('insert_shape: width_mm/height_mm not yet supported for arc (rect/ellipse/line only — resize the arc in Hancom desktop)');
+    }
     const records = parseRecords(raw);
 
     if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
@@ -4671,6 +4843,9 @@ export async function insertShapeInPlace(filePath, ops) {
       buildRecordHeader(TAG_SHAPE_COMPONENT, 2, sc.length), sc,
       buildRecordHeader(kind.recTag, 3, rec.length), rec,
     ]);
+    // Placement: inline (글자처럼) by default, or wrap=topbottom/square/behind/front.
+    applyGsoPlacement(cluster2, op, resolveWrapMode(op));
+    applyGsoSize(cluster2, resolveAspectSize(op, gsoCtrlRatio(cluster2))); // size, aspect-preserved
     const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
 
     // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x800 (char 0x0b).
@@ -4994,6 +5169,9 @@ export async function insertTextboxInPlace(filePath, ops) {
 
     // 2) text box gso cluster.
     const cluster2 = buildTextboxCluster(text);
+    // Placement: inline (글자처럼) by default, or wrap=topbottom/square/behind/front.
+    applyGsoPlacement(cluster2, op, resolveWrapMode(op));
+    applyGsoSize(cluster2, resolveAspectSize(op, gsoCtrlRatio(cluster2))); // size, aspect-preserved
     const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
 
     // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x800.
