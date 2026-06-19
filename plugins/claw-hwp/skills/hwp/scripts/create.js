@@ -1070,8 +1070,11 @@ const HANDLERS = {
     // single-key calls didn't. This is the same recipe.
     const DEFAULT_BORDER = { type: 1, width: 1, color: "#000000" };
     const HEADER_BG = "#EAEAEA";   // soft Office-style header gray
-    const HEADER_PAD = 400;        // ~1.4mm vertical (docx 80 twip ×5) — uniform w/ body
-    const BODY_PAD = 400;          // ~1.4mm vertical (docx 80 twip ×5)
+    // Uniform 1.4mm cell padding on all four sides. NOTE: this only renders once
+    // the cell's hasMargin="1" is set (patchHwpxCellHasMargin post-export) — rhwp
+    // leaves it 0, which makes Hancom ignore the per-cell margin entirely.
+    const HEADER_PAD = 400;        // ~1.4mm vertical (docx 80 twip ×5)
+    const BODY_PAD = 400;          // ~1.4mm vertical
     // createTableEx ignores per-column colWidths in the rhwp build we use:
     // header row 0 ends up with width=1 (≈0cm) and body rows get total/cols
     // evenly distributed regardless of the colWidths argument. Reapplying
@@ -1095,8 +1098,8 @@ const HANDLERS = {
         const cellProps = {
           paddingTop: isHeader ? HEADER_PAD : BODY_PAD,
           paddingBottom: isHeader ? HEADER_PAD : BODY_PAD,
-          paddingLeft: 600,   // ~2.1mm horizontal (docx 120 twip ×5)
-          paddingRight: 600,
+          paddingLeft: 400,   // ~1.4mm — uniform all four sides
+          paddingRight: 400,
         };
         if (colWidthsHwp) cellProps.width = colWidthsHwp[c];
         if (isHeader) {
@@ -2864,6 +2867,82 @@ async function patchHwpxTableOutMargin(filePath) {
   return total;
 }
 
+// rhwp's setCellProperties writes our per-cell <hp:cellMargin> but leaves the
+// cell's hasMargin="0" — which tells Hancom to IGNORE the per-cell margin and
+// inherit the table/document default. So every cellMargin we set (esp. the
+// vertical top/bottom) silently rendered at Hancom's tight default (GT pixel-
+// measured 2026-06-19: a 737 top margin rendered ~3px until hasMargin flipped).
+// set_cell_margin (hwpx-edit) sets hasMargin="1" — that's the verified mechanism.
+// Flip hasMargin 0→1 on every cell that actually carries a <hp:cellMargin>, so
+// our padding becomes authoritative. Tempered match stays inside each <hp:tc>.
+async function patchHwpxCellHasMargin(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  let total = 0;
+  for (const name of Object.keys(zip.files)) {
+    if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
+    let xml = await zip.file(name).async("string");
+    const before = xml;
+    xml = xml.replace(
+      /(<hp:tc\b[^>]*?)hasMargin="0"((?:(?!<\/hp:tc>)[^>])*>(?:(?!<\/hp:tc>)[\s\S])*?<hp:cellMargin\b)/g,
+      (_m, pre, post) => { total++; return `${pre}hasMargin="1"${post}`; },
+    );
+    if (xml !== before) zip.file(name, xml);
+  }
+  if (total > 0) {
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return total;
+}
+
+// Inject the header-row gray shade that rhwp's setCellProperties silently drops.
+// rhwp builds the header cell's BorderFill (4 solid borders) from our JSON but
+// serializes an EMPTY <hc:fillBrush> — the fill color (#EAEAEA) never reaches the
+// file, so the header renders unshaded on Hancom (GT 2026-06-19). We can't fix it
+// in rhwp (HWP-team vendor), so we stamp the winBrush post-export. A BorderFill is
+// a header target IFF it is referenced EXCLUSIVELY by row-0 cells (rowAddr==0)
+// across the whole doc: append_table gives the header row its own BorderFill
+// (distinct props), while a header-less table's row 0 shares the body BorderFill
+// (its rowAddr set includes 1,2,… → not exclusive → left untouched). Only an
+// already-EMPTY fillBrush is filled (never clobber a real fill).
+const HEADER_SHADE_COLOR = "#EAEAEA";   // soft Office-style header gray (== HEADER_BG)
+async function patchHwpxTableHeaderFill(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const headerEntry = zip.file("Contents/header.xml");
+  if (!headerEntry) return 0;
+  let header = await headerEntry.async("string");
+  // borderFillIDRef -> Set of rowAddr values on cells that reference it.
+  const rowsByBf = new Map();
+  for (const name of Object.keys(zip.files)) {
+    if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
+    const xml = await zip.file(name).async("string");
+    const re = /<hp:tc\b[^>]*\bborderFillIDRef="(\d+)"[^>]*>[\s\S]*?<hp:cellAddr\b[^>]*\browAddr="(\d+)"/g;
+    let m;
+    while ((m = re.exec(xml)) !== null) {
+      const bf = m[1], row = Number(m[2]);
+      if (!rowsByBf.has(bf)) rowsByBf.set(bf, new Set());
+      rowsByBf.get(bf).add(row);
+    }
+  }
+  const headerBfs = [...rowsByBf.entries()]
+    .filter(([, rows]) => rows.size === 1 && rows.has(0))
+    .map(([bf]) => bf);
+  if (!headerBfs.length) return 0;
+  const SHADE = `<hc:fillBrush><hc:winBrush faceColor="${HEADER_SHADE_COLOR}" hatchColor="${HEADER_SHADE_COLOR}" alpha="0"/></hc:fillBrush>`;
+  let n = 0;
+  for (const bf of headerBfs) {
+    // Tempered match keeps us inside THIS BorderFill block; only an empty fillBrush.
+    const re = new RegExp(`(<hh:borderFill id="${bf}"(?:(?!</hh:borderFill>)[\\s\\S])*?)(<hc:fillBrush\\s*/>|<hc:fillBrush>\\s*</hc:fillBrush>)`);
+    const before = header;
+    header = header.replace(re, (_full, pre) => `${pre}${SHADE}`);
+    if (header !== before) n++;
+  }
+  if (n > 0) {
+    zip.file("Contents/header.xml", header);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return n;
+}
+
 // Remap the default char shape (charPr id=0) to the theme body font. rhwp
 // resets a fair number of run charPrIDRefs to "0" on .hwpx export — notably
 // in-table-cell runs (applyCharFormatInCell creates a styled charPr in
@@ -3619,6 +3698,29 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: ${n} table outMargin → 0 (collapse via wrapper para)`);
     } catch (err) {
       log.push(`hwpx_tableoutmargin_patch failed: ${err.message}`);
+    }
+  }
+
+  // Cell padding: flip hasMargin 0→1 so Hancom honors our per-cell <hp:cellMargin>
+  // (rhwp leaves it 0 → margins silently ignored). See patchHwpxCellHasMargin.
+  if (ext === ".hwpx") {
+    try {
+      const n = await patchHwpxCellHasMargin(outPath);
+      if (n > 0) log.push(`hwpx_patch: ${n} cell hasMargin 0→1 (honor cellMargin)`);
+    } catch (err) {
+      log.push(`hwpx_cellhasmargin_patch failed: ${err.message}`);
+    }
+  }
+
+  // Header-row shade: stamp the gray winBrush rhwp dropped (setCellProperties
+  // builds the borderFill but emits an empty <hc:fillBrush>). See
+  // patchHwpxTableHeaderFill — only borderFills used exclusively by row-0 cells.
+  if (ext === ".hwpx") {
+    try {
+      const n = await patchHwpxTableHeaderFill(outPath);
+      if (n > 0) log.push(`hwpx_patch: ${n} header-row borderFill → gray shade`);
+    } catch (err) {
+      log.push(`hwpx_tableheaderfill_patch failed: ${err.message}`);
     }
   }
 

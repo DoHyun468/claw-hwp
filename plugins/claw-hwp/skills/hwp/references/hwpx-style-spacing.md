@@ -53,7 +53,7 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 | 제목 L5/L6 | 10.5/10pt | 120% | 900 / 800 | 520 / 450 |
 | 리스트 item | 본문크기 | **140%** (`LIST_LINE_SPACING`) | 0 | **700 ≈2.5mm** (`LIST_SPACING_AFTER`) |
 | 표 | 셀 22pt 등 | — | **outMargin 사방 500≈1.8mm** (`TABLE_TOP_MARGIN`, 위·아래·양옆 대칭) | |
-| 표 (셀 안 여백) | — | — | **cellMargin 양옆 600≈2.1mm / 상하 400≈1.4mm** (docx 120·80 twip ×5, 머리·본문행 균일). 글자–셀선 간격 디폴트. `HEADER_PAD`·`BODY_PAD`·`paddingLeft/Right`. | |
+| 표 (셀 안 여백) | — | — | **cellMargin 사방 400≈1.4mm** (글자–셀선 간격, 위·아래·양옆 균일). `paddingLeft/Right`·`HEADER_PAD`·`BODY_PAD`. ⚠️ 셀의 **`hasMargin="1"`이 켜져야** 한컴이 이 값을 씀 — create.js가 후처리(`patchHwpxCellHasMargin`)로 켠다(rhwp는 0으로 둬서, 안 켜면 값이 박혀도 한컴이 무시 → 특히 상하가 ~3px로 증발했던 버그). | |
 | 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 사방 대칭이라 본문 사이에 끼어도 균형. 이중 너비·연한 테두리·머리행 강조 | | | |
 | **객체(이미지·차트·도형·수식)** | inline(treatAsChar=1, 자기 줄) | 세로 간격은 자기 문단 줄간격이 처리 | outMargin: 차트 2.5mm, 이미지·도형 0, 수식 양옆 0.2mm (제각각이나 inline이라 무방) | |
 | 용지/여백 | A4, 상하좌우 ~20mm (`setup_document`) | | | |
