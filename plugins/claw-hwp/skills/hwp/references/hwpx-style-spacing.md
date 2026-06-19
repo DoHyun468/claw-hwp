@@ -58,8 +58,8 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 | 리스트 item | 본문크기 | **140%** (`LIST_LINE_SPACING`) | 0 | **700 ≈2.5mm** (`LIST_SPACING_AFTER`) |
 | 표 | 셀 22pt 등 | — | **outMargin 사방 500≈1.8mm** (`TABLE_TOP_MARGIN`, 위·아래·양옆 대칭) | |
 | 표 (셀 안 여백) | — | — | **cellMargin 사방 400≈1.4mm** (글자–셀선 간격, 위·아래·양옆 균일). `paddingLeft/Right`·`HEADER_PAD`·`BODY_PAD`. ⚠️ 셀의 **`hasMargin="1"`이 켜져야** 한컴이 이 값을 씀 — create.js가 후처리(`patchHwpxCellHasMargin`)로 켠다(rhwp는 0으로 둬서, 안 켜면 값이 박혀도 한컴이 무시 → 특히 상하가 ~3px로 증발했던 버그). | |
-| 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 사방 대칭이라 본문 사이에 끼어도 균형. 이중 너비·연한 테두리·**머리행 옅은 회색 음영(#EAEAEA)** | | | |
-| 표 (머리행 음영) | — | — | `headers` 준 표의 첫 행 = #EAEAEA 음영. ⚠️ rhwp가 fill을 빈 `<hc:fillBrush>`로 떨궈 안 보이던 걸 후처리(`patchHwpxTableHeaderFill`, row-0 전용 borderFill에 winBrush 재주입)로 살림. | |
+| 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 표 아래→다음 제목 = 그 제목 위 여백(`outMargin.bottom` 적응). 사방 대칭이라 본문 사이에 끼어도 균형. 이중 너비·연한 테두리·**머리행 테마색 틴트** | | | |
+| 표 (머리행 색) | — | — | **연한 틴트 + 검은 글자**(한컴에 잘 맞음 — docx식 진한 배경+흰 글자 아님). 기본 = **테마색 연한 틴트**(정부 #EAEAEA 회색, 그 외 헤딩색에서 `tintColor` 파생). **LLM이 자유 지정**: 표별 `append_table {header_fill:"#hex"}` / 문서 전체 `theme_overrides.headerFill`. ⚠️ rhwp가 셀 fill을 빈 `<hc:fillBrush>`로 떨궈 후처리(`patchHwpxTableHeaderFill`, row-0 전용 borderFill에 winBrush 재주입, 표별 색 문서순 매핑)로 살림. | |
 | **객체(이미지·차트·도형·수식)** | inline(treatAsChar=1, 자기 줄) | 세로 간격은 자기 문단 줄간격이 처리 | outMargin: 차트 2.5mm, 이미지·도형 0, 수식 양옆 0.2mm (제각각이나 inline이라 무방) | |
 | 용지/여백 | A4, 상하좌우 ~20mm (`setup_document`) | | | |
 
@@ -81,6 +81,7 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 - 표 바깥 여백: `set_table_margin {table, left/right/top/bottom(mm)}` / create 시 `append_table {spacing_before, spacing_after}`
 - 표 셀 안 여백: `set_cell_margin {table, left/right/top/bottom(mm)}` (글자–셀선 간격; 디폴트 사방 1.4mm)
 - 헤딩 색: `append_heading {color}`(1개) / `theme`(전체) / `theme_overrides.headingColors`(일부)
+- 표 머리행 색: `append_table {header_fill:"#hex"}`(표별, LLM 자유) / `theme_overrides.headerFill`(전체). **연한 톤 권장**(검은 글자 가독·한글다움)
 - 객체 여백: `set_object_margin {target, index, margin_mm}` / `insert_chart`·`insert_shape {margin_mm}`
 - 객체 위치·배치: `set_object_position {x_mm, y_mm, wrap}`
 - 문단 간격·정렬: `apply_paragraph_style` (위 참고)

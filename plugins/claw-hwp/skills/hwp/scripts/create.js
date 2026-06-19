@@ -219,6 +219,13 @@ let hwpxPageMargin = null;
 // (Hancom renders table top/bottom ~symmetrically — it clamps an asymmetric pair).
 const tableSpacingSpecs = [];
 
+// Per-table header-row fill colour (pale tint, dark text — suits Hancom). The
+// caller (LLM) may pick `header_fill` per append_table for full freedom; null →
+// fall back to the theme's headerFill (derived pale tint of the heading colour).
+// patchHwpxTableHeaderFill consumes the header-table entries in document order
+// (rhwp drops the cell fill, so the colour has to be re-injected post-export).
+const tableHeaderFills = [];
+
 // Tracks headings emitted by append_heading. rhwp's HWPX serializer correctly
 // creates the <hh:charPr> definition (large height + bold) in header.xml but
 // then writes the heading run with charPrIDRef="0" (default body), so the
@@ -1109,7 +1116,8 @@ const HANDLERS = {
     // together with fill, which is why their UI works and our earlier
     // single-key calls didn't. This is the same recipe.
     const DEFAULT_BORDER = { type: 1, width: 1, color: "#000000" };
-    const HEADER_BG = activeTheme.headerFill || "#EAEAEA";   // 테마별 머리행 틴트(없으면 회색)
+    // 머리행 채움색: 호출자(LLM)가 op.header_fill 로 자유 지정 > 테마 파생 틴트 > 회색.
+    const HEADER_BG = op.header_fill ? normalizeHexColor(op.header_fill) : (activeTheme.headerFill || "#EAEAEA");
     // Uniform 1.4mm cell padding on all four sides. NOTE: this only renders once
     // the cell's hasMargin="1" is set (patchHwpxCellHasMargin post-export) — rhwp
     // leaves it 0, which makes Hancom ignore the per-cell margin entirely.
@@ -1333,6 +1341,12 @@ const HANDLERS = {
     tableSpacingSpecs.push({
       before: op.spacing_before ?? null,
       after: op.spacing_after ?? null,
+    });
+    // Header fill per table (only header tables get a shaded row → only these are
+    // re-injected). Document order matches patchHwpxTableHeaderFill's header scan.
+    tableHeaderFills.push({
+      hasHeader: headers.length > 0,
+      fill: op.header_fill ? normalizeHexColor(op.header_fill) : null,
     });
 
     const newParaCount = doc.getParagraphCount(cursor.sec);
@@ -2984,10 +2998,17 @@ async function patchHwpxTableHeaderFill(filePath) {
     .filter(([, rows]) => rows.size === 1 && rows.has(0))
     .map(([bf]) => bf);
   if (!headerBfs.length) return 0;
-  const shade = activeTheme.headerFill || HEADER_SHADE_COLOR;   // 테마별 머리행 틴트
-  const SHADE = `<hc:fillBrush><hc:winBrush faceColor="${shade}" hatchColor="${shade}" alpha="0"/></hc:fillBrush>`;
+  const themeShade = activeTheme.headerFill || HEADER_SHADE_COLOR;
+  // Per-table caller fills (op.header_fill), in document order of header tables.
+  // headerBfs is also in document order, so index n ↔ nth header table — unless
+  // counts disagree (nested/odd tables), in which case fall back to the theme tint.
+  const perTable = tableHeaderFills.filter((t) => t.hasHeader).map((t) => t.fill);
+  const aligned = perTable.length === headerBfs.length;
   let n = 0;
-  for (const bf of headerBfs) {
+  for (let idx = 0; idx < headerBfs.length; idx++) {
+    const bf = headerBfs[idx];
+    const shade = (aligned && perTable[idx]) || themeShade;
+    const SHADE = `<hc:fillBrush><hc:winBrush faceColor="${shade}" hatchColor="${shade}" alpha="0"/></hc:fillBrush>`;
     // Tempered match keeps us inside THIS BorderFill block; only an empty fillBrush.
     const re = new RegExp(`(<hh:borderFill id="${bf}"(?:(?!</hh:borderFill>)[\\s\\S])*?)(<hc:fillBrush\\s*/>|<hc:fillBrush>\\s*</hc:fillBrush>)`);
     const before = header;

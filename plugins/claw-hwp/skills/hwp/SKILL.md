@@ -156,7 +156,7 @@ Omitting `theme` = `government` (unchanged default). A theme sets only heading c
 
 **Extra themes from `themes/*.md`** — beyond the 5 built-ins, 10 more (converted from Anthropic's theme-factory, re-fonted to the Hancom A-set) load by name from the `themes/` folder: `ocean-depths`, `sunset-boulevard`, `forest-canopy`, `modern-minimalist`, `golden-hour`, `arctic-frost`, `desert-rose`, `tech-innovation`, `botanical-garden`, `midnight-galaxy`. Pass any of these as `theme`. To add your own, drop a `themes/<name>.md` with frontmatter `name / label / bodyFont / headingFont / headingColor / accent` (fonts must be from the A-set to render on Hancom web).
 
-Fine-tune without defining a whole theme via the top-level `theme_overrides` object — `{ "bodyFont": "...", "headingFont": "...", "accent": "#RRGGBB", "headingColors": { "1": "#RRGGBB", "2": "#RRGGBB", ... } }`. Use it when the user gives specific colour/font feedback (e.g. "제목을 진한 파랑으로", "본문은 굴림으로"); set just the fields you want to change.
+Fine-tune without defining a whole theme via the top-level `theme_overrides` object — `{ "bodyFont": "...", "headingFont": "...", "accent": "#RRGGBB", "headingColors": { "1": "#RRGGBB", "2": "#RRGGBB", ... }, "headerFill": "#RRGGBB" }`. Use it when the user gives specific colour/font feedback (e.g. "제목을 진한 파랑으로", "본문은 굴림으로"); set just the fields you want to change. `headerFill` = 표 머리행 배경색(전체).
 
 All five themes use only render-confirmed fonts (see the **`font_family`** note below for which fonts render where). Theme colours/fonts take effect when **building a new document** (payload starts with `setup_document`); for in-place edits of an existing form, append ops stay plain text (same as the heading-styling limitation noted below).
 
@@ -169,7 +169,7 @@ All five themes use only render-confirmed fonts (see the **`font_family`** note 
 | `setup_document` | `page_size` (`a4`/`b5`/...), `orientation` (`portrait`/`landscape`) | `margin_mm`, `base_font` |
 | `append_heading` | `level` (1–6), `text` | `align`, `runs`, `spacing_before`, `spacing_after`, `line_spacing` |
 | `append_paragraph` | `text` | `align`, `line_spacing`, `spacing_before`, `spacing_after`, `runs` |
-| `append_table` ⚠️ | `headers`, `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props`, `spacing_before`, `spacing_after`, `align` |
+| `append_table` ⚠️ | `headers`, `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props`, `spacing_before`, `spacing_after`, `align`, `header_fill` (머리행 배경색 #hex — 연한 톤 권장, 검은 글자 가독; 생략 시 테마 틴트) |
 | `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt`, `spacing_before`, `spacing_after`, `align` |
 | `append_bullet_list`, `append_numbered_list` | `items[]` | — |
 | `append_page_break` | — | — |
