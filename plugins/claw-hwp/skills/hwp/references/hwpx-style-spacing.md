@@ -28,6 +28,10 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
   복제하게 될지 인덱스 확인**.
 - ⚠️ `apply_paragraph_style`로 부분 속성(예: spacing만) 바꿀 때 **나머지(정렬·들여쓰기)는 현재 값
   자동 보존**됨(2026-06-19 수정). 정렬을 안 바꾸려면 그냥 안 넘기면 된다.
+- ⚠️ **템플릿 편집 시 `theme`·디폴트 스펙(§B) 강요 금지.** 헤딩 색·셀 안 여백·줄간격·문단간격을
+  우리 디폴트로 덮어쓰지 마라 — 템플릿이 이미 가진 값을 op들이 상속한다(`theme`은 §B 새 문서 전용).
+  사용자가 명시적으로 "색/간격 바꿔줘" 할 때만 `apply_paragraph_style`/`apply_text_style`/`set_cell_margin`
+  으로 **그 부분만** 손댄다.
 
 ---
 
@@ -54,13 +58,19 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 | 리스트 item | 본문크기 | **140%** (`LIST_LINE_SPACING`) | 0 | **700 ≈2.5mm** (`LIST_SPACING_AFTER`) |
 | 표 | 셀 22pt 등 | — | **outMargin 사방 500≈1.8mm** (`TABLE_TOP_MARGIN`, 위·아래·양옆 대칭) | |
 | 표 (셀 안 여백) | — | — | **cellMargin 사방 400≈1.4mm** (글자–셀선 간격, 위·아래·양옆 균일). `paddingLeft/Right`·`HEADER_PAD`·`BODY_PAD`. ⚠️ 셀의 **`hasMargin="1"`이 켜져야** 한컴이 이 값을 씀 — create.js가 후처리(`patchHwpxCellHasMargin`)로 켠다(rhwp는 0으로 둬서, 안 켜면 값이 박혀도 한컴이 무시 → 특히 상하가 ~3px로 증발했던 버그). | |
-| 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 사방 대칭이라 본문 사이에 끼어도 균형. 이중 너비·연한 테두리·머리행 강조 | | | |
+| 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 사방 대칭이라 본문 사이에 끼어도 균형. 이중 너비·연한 테두리·**머리행 옅은 회색 음영(#EAEAEA)** | | | |
+| 표 (머리행 음영) | — | — | `headers` 준 표의 첫 행 = #EAEAEA 음영. ⚠️ rhwp가 fill을 빈 `<hc:fillBrush>`로 떨궈 안 보이던 걸 후처리(`patchHwpxTableHeaderFill`, row-0 전용 borderFill에 winBrush 재주입)로 살림. | |
 | **객체(이미지·차트·도형·수식)** | inline(treatAsChar=1, 자기 줄) | 세로 간격은 자기 문단 줄간격이 처리 | outMargin: 차트 2.5mm, 이미지·도형 0, 수식 양옆 0.2mm (제각각이나 inline이라 무방) | |
 | 용지/여백 | A4, 상하좌우 ~20mm (`setup_document`) | | | |
 
 → 정리: **본문 150% 줄간격 + 문단 뒤 3.5mm**, **제목은 120% 줄간격 + 레벨별 앞 큰 간격(L1 7.8 / L2 6mm)
-+ 뒤 간격**, **리스트 140% + 뒤 2.5mm**. 색/폰트는 theme이 결정(크기·간격은 theme 무관, 위 고정).
-제목 색: L1 #1A1A1A … 점점 옅게(테마 override 가능).
++ 뒤 간격**, **리스트 140% + 뒤 2.5mm**. **크기·간격은 theme 무관(위 표 고정), 색·폰트만 theme이 결정.**
+
+**제목(헤딩) 색 — theme별 (2026-06-19 채도 낮춤, 한글다운 muted):**
+- `government`(기본): 회색 그라데이션 L1 #1A1A1A → L6 #595959 (사용자 선호, 유지).
+- 빌트인 5종은 **레벨별 그라데이션**(corporate 네이비 #304D68…, modern 슬레이트, clean 틸다크, warm 브라운), `themes/*.md` 10종은 **단일 헤딩색**(보타닉 그린 #4A7C59, 미드나잇 퍼플 #2C2438, 오션 딥블루 #1E2839 등). 전부 **docx보다 채도 낮춤**(S>0.34→×0.62), 너무 검은 건 살짝 들어올려 틴트가 보이게.
+- ⚠️ **헤딩 색은 charPr가 (크기·굵기·색) 까지 매칭돼야 렌더된다**(`patchHwpxHeadings`, 2026-06-19 수정). 같은 크기여도 색 다르면 각자 렌더. 한 문서에 여러 색도 OK.
+- 덮어쓰기: 헤딩 1개만 → `append_heading {color}`; 문서 전체 톤 → `theme` 선택; 일부만 → `theme_overrides.headingColors{level:hex}`. 본문 색은 회색(#323232)이 기본, 헤딩만 색.
 
 조정이 필요할 때만 `apply_paragraph_style`(`lineSpacing` %, `spacing_before`/`spacing_after` HWP단위,
 `align`, `indent` — 모두 Hancom web-safe, 부분 적용 시 나머지 자동 보존 §A) 로 **명시적으로** 바꾼다.
@@ -69,7 +79,8 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 
 **이 값들은 전부 디폴트일 뿐 — 문서마다 자유롭게 덮어쓸 수 있다:**
 - 표 바깥 여백: `set_table_margin {table, left/right/top/bottom(mm)}` / create 시 `append_table {spacing_before, spacing_after}`
-- 표 셀 안 여백: `set_cell_margin {table, left/right/top/bottom(mm)}` (글자–셀선 간격; 디폴트 양옆2.1/상하1.4mm)
+- 표 셀 안 여백: `set_cell_margin {table, left/right/top/bottom(mm)}` (글자–셀선 간격; 디폴트 사방 1.4mm)
+- 헤딩 색: `append_heading {color}`(1개) / `theme`(전체) / `theme_overrides.headingColors`(일부)
 - 객체 여백: `set_object_margin {target, index, margin_mm}` / `insert_chart`·`insert_shape {margin_mm}`
 - 객체 위치·배치: `set_object_position {x_mm, y_mm, wrap}`
 - 문단 간격·정렬: `apply_paragraph_style` (위 참고)
@@ -83,8 +94,8 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 | **HWPX**(우리 create.js) | **본문 150% / 제목 120%** | 본문 뒤 3.5mm, 제목 앞 6~7.8mm·뒤 3mm | 줄 적당, 섹션은 제목의 큰 앞 간격으로 또렷 |
 | **DOCX**(서구/docx-js) | 단일(1.0) | 본문 0, 문단 뒤 8pt·제목 앞뒤 12/9pt | 줄 좁고 문단/제목 간격으로 구분 |
 
-같은 본문도 HWPX는 세로로 퍼지고 DOCX는 문단 단위로 끊겨 보인다. 비교 렌더(같은 본문 풀페이지):
-HWPX(160%) ↔ DOCX(soffice). **한국 문서(.hwpx)는 160% 줄간격 유지** — docx 문단간격 흉내 금지.
+같은 본문도 HWPX는 세로로 퍼지고 DOCX는 문단 단위로 끊겨 보인다. **한국 문서(.hwpx)는 본문 150%
+줄간격 유지**(`BODY_LINE_SPACING`) — docx식 단일 줄간격+문단간격 흉내 금지.
 
 > docx 스킬엔 "템플릿 스타일 감지→재사용" 분기가 없다(새 문서 vs XML 직접편집뿐). 우리 §A 상속
 > 전략이 더 구체적이다. docx에서 벤치마크한 건 **"디폴트 스펙을 표로 못박는다"는 방식**뿐 —
