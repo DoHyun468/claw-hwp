@@ -3,7 +3,7 @@ name: midnight-galaxy
 label: 미드나잇 — 드라마틱 퍼플
 bodyFont: Pretendard
 headingFont: Pretendard Black
-headingColor: "#2B1E3E"
+headingColor: "#2C2438"
 accent: "#4A4E8F"
 source: anthropic theme-factory (Midnight Galaxy)
 ---

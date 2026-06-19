@@ -3,7 +3,7 @@ name: sunset-boulevard
 label: 선셋 — 크리에이티브 오렌지
 bodyFont: Apple SD 산돌고딕 Neo
 headingFont: HY헤드라인M
-headingColor: "#264653"
+headingColor: "#2F424A"
 accent: "#E76F51"
 source: anthropic theme-factory (Sunset Boulevard)
 ---

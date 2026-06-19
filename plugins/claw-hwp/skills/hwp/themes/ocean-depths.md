@@ -3,7 +3,7 @@ name: ocean-depths
 label: 오션 — 코퍼레이트 딥블루
 bodyFont: 맑은 고딕
 headingFont: 맑은 고딕
-headingColor: "#1A2332"
+headingColor: "#1E2839"
 accent: "#2D8B8B"
 source: anthropic theme-factory (Ocean Depths)
 ---

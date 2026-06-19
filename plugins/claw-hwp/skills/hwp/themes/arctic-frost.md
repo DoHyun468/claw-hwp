@@ -3,7 +3,7 @@ name: arctic-frost
 label: 아틱 — 클린 블루
 bodyFont: 해피니스 산스 레귤러
 headingFont: 해피니스 산스 볼드
-headingColor: "#4A6FA5"
+headingColor: "#5B7294"
 accent: "#4A6FA5"
 source: anthropic theme-factory (Arctic Frost)
 ---

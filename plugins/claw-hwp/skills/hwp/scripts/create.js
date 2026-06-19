@@ -660,7 +660,7 @@ const THEMES = {
     bodyFont: "맑은 고딕",
     headingFont: "맑은 고딕",
     headingColors: {
-      1: "#1F4E79", 2: "#2E5E8C", 3: "#36679B",
+      1: "#304D68", 2: "#405E7A", 3: "#496888",
       4: "#5A7A9E", 5: "#5A7A9E", 6: "#5A7A9E",
     },
     accent: "#1F4E79",
@@ -670,7 +670,7 @@ const THEMES = {
     bodyFont: "Pretendard",
     headingFont: "Pretendard SemiBold",
     headingColors: {
-      1: "#111827", 2: "#1F2937", 3: "#374151",
+      1: "#212836", 2: "#1F2937", 3: "#374151",
       4: "#4B5563", 5: "#4B5563", 6: "#4B5563",
     },
     accent: "#2563EB",
@@ -680,7 +680,7 @@ const THEMES = {
     bodyFont: "해피니스 산스 레귤러",
     headingFont: "해피니스 산스 볼드",
     headingColors: {
-      1: "#0F172A", 2: "#1E293B", 3: "#334155",
+      1: "#1F2638", 2: "#1E293B", 3: "#334155",
       4: "#475569", 5: "#475569", 6: "#475569",
     },
     accent: "#0F766E",
@@ -690,7 +690,7 @@ const THEMES = {
     bodyFont: "Apple SD 산돌고딕 Neo",
     headingFont: "HY헤드라인M",
     headingColors: {
-      1: "#3F2A1A", 2: "#5A3A22", 3: "#6B4226",
+      1: "#382B21", 2: "#4F3C2D", 3: "#5E4433",
       4: "#7C5A3E", 5: "#7C5A3E", 6: "#7C5A3E",
     },
     accent: "#C2410C",
