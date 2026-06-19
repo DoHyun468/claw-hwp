@@ -2814,7 +2814,7 @@ async function patchHwpxTableOutMargin(filePath) {
         // old double-stack. bottom keeps the section gap (para margins are eaten
         // below a table). A caller's spacing_before/after still overrides.
         const top = spec.before ?? TABLE_TOP_MARGIN;
-        const bottom = spec.after ?? TABLE_OUTMARGIN;
+        const bottom = spec.after ?? TABLE_TOP_MARGIN; // 위·아래 대칭 500(≈1.8mm)
         total++;
         return `<hp:outMargin left="${left}" right="${right}" top="${top}" bottom="${bottom}"/>`;
       }),
