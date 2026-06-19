@@ -199,6 +199,27 @@ class Hwpx {
     }
     return list;
   }
+  // EVERY <hp:tbl> across sections — nested included — in document (pre-order)
+  // order, each with absolute section offsets so spliceEl edits work on nested
+  // tables too. Index matches `--inspect` table count. Many Korean 서식 wrap the
+  // fillable grid in an outer table, so cell ops must reach nested tables.
+  tablesDeep() {
+    const list = [];
+    for (const name of this.sectionNames()) {
+      const xml = this.read(name);
+      const walk = (s, base) => {
+        for (const el of scanTopLevel(s, 'hp:tbl')) {
+          list.push({ section: name, el: {
+            start: base + el.start, end: base + el.end,
+            openEnd: base + el.openEnd, attrs: el.attrs, inner: el.inner,
+          } });
+          walk(el.inner, base + el.openEnd);
+        }
+      };
+      walk(xml, 0);
+    }
+    return list;
+  }
 }
 
 function secIdx(name) {
@@ -409,7 +430,8 @@ function opDeleteParagraph(doc, index) {
 // ── table helpers ──────────────────────────────────────────────────────────
 
 function getTable(doc, tableIndex) {
-  const tables = doc.tables();
+  // Deep enumeration (nested tables included), document order == `--inspect`.
+  const tables = doc.tablesDeep();
   if (tableIndex < 0 || tableIndex >= tables.length) throw new Error(`table index ${tableIndex} out of range (found ${tables.length})`);
   return tables[tableIndex];
 }

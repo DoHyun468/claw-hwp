@@ -23,7 +23,7 @@ Returns JSON: `{ "ok": true, "output": "...", "results": [ { "type": ..., ...sta
 ## Indexing model
 
 - **Paragraph index** — 0-based, document order, counting **top-level `<hp:p>`** across all `Contents/section*.xml` (a table-bearing paragraph counts as one). Paragraphs inside table cells are not in this index.
-- **Table index** — 0-based, document order, **top-level `<hp:tbl>`** only (a table nested inside a cell is not separately indexed). This differs from a naive "all `<hp:tbl>`" count.
+- **Table index** — 0-based, **document (pre-)order over EVERY `<hp:tbl>` including tables nested inside cells** — matches `--inspect`'s table count exactly. (Korean 서식 routinely wrap the fillable grid inside an outer table; cell/table ops reach those nested grids.) A parent table comes before its nested children, then the next sibling. **2026-06-19 change** — superseded the old "top-level only" rule; index now == `--inspect` order, so inspect → use that number directly.
 - **row / col** — 0-based within a table. `set_cell_text` targets by `<hp:cellAddr>` (merge-aware) and falls back to positional.
 
 Discover indices with `node scripts/extract_text.js --inspect file.hwpx` (counts) and
