@@ -4124,6 +4124,8 @@ export async function insertImageInPlace(filePath, ops) {
 
     let binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
     if (binDataIdx < 0) {
+      ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+      dir = readDirectory(buf, fat, ssz, dirStart);
       const folderSlot = findUnusedDirSlot(dir.entries);
       if (folderSlot < 0) throw new Error('insert_image: no free directory slot for the BinData folder');
       writeDirEntry(buf, dir.entries[folderSlot], 'BinData', 1, 0, 0); // storage: start 0, size 0
@@ -4135,6 +4137,9 @@ export async function insertImageInPlace(filePath, ops) {
     rootChain = walkChain(fat, dir.entries[0].start);
     binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
     const newName = pickFreeBinDataName(dir.entries, ext);
+    ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
     const streamSlot = findUnusedDirSlot(dir.entries);
     if (streamSlot < 0) throw new Error('insert_image: no free directory slot for the image stream');
     const alloc = allocMiniChain({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain, rootEntry: dir.entries[0] }, stored.length);
@@ -5067,6 +5072,39 @@ function findUnusedDirSlot(entries) {
     if (entries[i].type === 0) return i;
   }
   return -1;
+}
+
+// Ensure the directory has at least one unused (type 0) entry slot. CFB stores
+// directory entries in a chain of sectors (ssz/128 entries each); when every slot
+// is taken, append a fresh zeroed sector to the chain so the next stream has a
+// home. Without this, a doc whose directory sector is exactly full (common after
+// a few streams) rejects a SECOND image/chart ("no free directory slot"). Returns
+// the (possibly reallocated) { buf, fat }. Caller must re-read the directory.
+function ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart) {
+  const slotsPerSector = ssz >>> 7;
+  const dirChain = walkChain(fat, dirStart);
+  for (const s of dirChain) {
+    const base = (s + 1) * ssz;
+    for (let i = 0; i < slotsPerSector; i++) {
+      if (buf.readUInt8(base + i * 128 + 0x42) === 0) return { buf, fat }; // a free slot exists
+    }
+  }
+  // No free slot — append a new directory sector and link it to the chain's tail.
+  const exp = expandFatCapacity(buf, ssz, fat, fatAddrs, (buf.length / ssz) + 1);
+  buf = exp.buf; fat = exp.fat;
+  const a = appendBlankSector(buf, ssz); buf = a.buf;
+  const newSec = a.newSecIdx;
+  writeFatEntry(buf, ssz, fatAddrs, newSec, ENDOFCHAIN); fat[newSec] = ENDOFCHAIN;
+  const last = dirChain[dirChain.length - 1];
+  writeFatEntry(buf, ssz, fatAddrs, last, newSec); fat[last] = newSec;
+  const base = (newSec + 1) * ssz; // init 4 unused entries (type 0, siblings/child = NOSTREAM)
+  for (let i = 0; i < slotsPerSector; i++) {
+    const o = base + i * 128;
+    buf.writeInt32LE(FREESECT, o + 0x44);
+    buf.writeInt32LE(FREESECT, o + 0x48);
+    buf.writeInt32LE(FREESECT, o + 0x4C);
+  }
+  return { buf, fat };
 }
 
 function cfbNameCompare(a, b) {
