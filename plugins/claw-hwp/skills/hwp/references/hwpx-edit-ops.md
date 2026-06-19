@@ -9,6 +9,14 @@ never touches HWP 5.0 binary (`.hwp`) — that path is `cell-patch.js` / Path B.
 > `wrap` mode (inline default / topbottom / square / behind / front) with size,
 > margin, and position guidance. Picking the wrong mode for the content (e.g. a
 > full-width chart with `square`) mangles the page; the manual says which to use.
+>
+> **Line spacing / paragraph gaps / heading sizes — what's the default, and how to
+> match a template?** See **`hwpx-style-spacing.md`**. It has the EXACT spacing
+> create.js auto-applies (body 150% line + 3.5mm after; headings 120% + per-level
+> before/after; lists 140% + 2.5mm — from the `HEADING_DEFAULTS`/`BODY_*`/`LIST_*`
+> source constants), and the rule: **filling a given template → inherit its styles
+> (don't impose defaults); no template → those defaults are already applied (don't
+> re-add — `apply_paragraph_style spacing_before` OVERWRITES, shrinking the gap).**
 
 ## Invocation
 
