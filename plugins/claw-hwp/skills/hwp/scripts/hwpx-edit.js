@@ -2469,6 +2469,32 @@ function ensureCleanAlignParaPr(doc, align) {
 // hp:case = mm×100, hp:default = mm×200; lineSpacing(%) is copied verbatim into
 // both branches. Always injects from the stub when any margin/lineSpacing is set
 // (an existing paraPr won't match those exact values); reuses for align-only.
+// Read a paraPr's current align / indent / margins / lineSpacing by id, so a
+// partial apply_paragraph_style can preserve what the caller didn't specify.
+// Handles both a regular paraPr (<hh:margin> children in HWPUNIT) and the
+// web-safe switch form (<hp:default><hh:margin><hc:*> in mm×200).
+function readParaPrVals(doc, pprId) {
+  const hn = doc.headerName();
+  if (!hn) return {};
+  const blk = (doc.read(hn).match(new RegExp(`<hh:paraPr\\b[^>]*\\bid="${pprId}"[\\s\\S]*?</hh:paraPr>`)) || [''])[0];
+  if (!blk) return {};
+  const reg = (t) => { const x = blk.match(new RegExp(`<hh:${t}\\b[^>]*value="([-\\d]+)"`)); return x ? Number(x[1]) : null; };
+  const lsm = blk.match(/<hh:lineSpacing\b[^>]*value="([-\d]+)"/);
+  const v = {
+    align: (blk.match(/<hh:align\b[^>]*horizontal="([^"]+)"/) || [])[1] || null,
+    indent: reg('intent'), marginLeft: reg('left'), marginRight: reg('right'),
+    spacingBefore: reg('prev'), spacingAfter: reg('next'),
+    lineSpacing: lsm ? Number(lsm[1]) : null,
+  };
+  if (v.spacingBefore == null && /<hp:default>/.test(blk)) {
+    const def = (blk.match(/<hp:default>[\s\S]*?<\/hp:default>/) || [''])[0];
+    const hc = (t) => { const x = def.match(new RegExp(`<hc:${t}\\b[^>]*value="([-\\d]+)"`)); return x ? Math.round((Number(x[1]) / 200) * 283.46) : null; };
+    v.indent ??= hc('intent'); v.marginLeft ??= hc('left'); v.marginRight ??= hc('right');
+    v.spacingBefore ??= hc('prev'); v.spacingAfter ??= hc('next');
+  }
+  return v;
+}
+
 function ensureCleanParaPr(doc, opts) {
   const al = opts.align ? String(opts.align).toUpperCase() : null;
   if (al && !ALIGN_VALUES.has(al)) throw new Error(`apply_paragraph_style: align must be one of ${[...ALIGN_VALUES].join('/')}`);
@@ -2533,6 +2559,20 @@ function opApplyParagraphStyle(doc, index, style) {
   const wantsNative = Object.values(nativeOpts).some((v) => v != null);
   const noExtras = style.background_color == null && style.page_break_before == null && style.keep_with_next == null;
   if (wantsNative && noExtras) {
+    // PRESERVE unspecified props: the clean paraPr is built from a stub (which
+    // defaults to CENTER align + 0 margins), so applying e.g. only spacing_before
+    // would otherwise reset the paragraph's align/indent/lineSpacing. Seed
+    // nativeOpts from the target paragraph's CURRENT paraPr for anything the
+    // caller didn't set, so only the requested property actually changes.
+    const parasCur = doc.paragraphs();
+    if (index >= 0 && index < parasCur.length) {
+      const curId = (parasCur[index].el.attrs.match(/paraPrIDRef="(\d+)"/) || [])[1];
+      const cur = curId != null ? readParaPrVals(doc, curId) : {};
+      if (nativeOpts.align == null && cur.align) nativeOpts.align = cur.align;
+      for (const k of ['indent', 'marginLeft', 'marginRight', 'spacingBefore', 'spacingAfter', 'lineSpacing']) {
+        if (nativeOpts[k] == null && cur[k] != null) nativeOpts[k] = cur[k];
+      }
+    }
     const pprId = ensureCleanParaPr(doc, nativeOpts);
     if (pprId != null) {
       const paras0 = doc.paragraphs();
