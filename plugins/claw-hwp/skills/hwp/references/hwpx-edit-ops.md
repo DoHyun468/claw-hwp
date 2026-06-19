@@ -63,7 +63,7 @@ each table) or rely on `--inspect`'s `cellCount` and open the doc to confirm.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `set_cell_text` | `table`, `row`, `col`, `text` | Sets one cell's text. |
+| `set_cell_text` | `table`, `row`, `col`, `text` | Sets one cell's text (**replaces the whole cell**, so `text` must be the complete final string). `table` index is document order incl. nested (== `--inspect`). **빈칸/괄호/밑줄 placeholder 셀 채우기** (`전화번호 (    )`, `(  )-(  )-(  )`, `___-__-_____`, `성명:____ 직위:____`): naive append/replace는 어느 괄호에 넣을지 못 정함 → **① 먼저 셀 내용을 읽고**(`--format markdown` 또는 `--inspect`) **② 어디에 무엇을 넣을지 에이전트가 판단해 ③ 완성된 셀 전체 문자열을 `set_cell_text`로 통째로 쓴다.** 예: `전화번호 (    )` 읽음 → `text:"전화번호 ( 02-100-2000 )"`, `(  )-(  )-(  )` → `text:"( 02 ) - ( 100 ) - ( 2000 )"`. 괄호 수·지역번호 분리 등 폼마다 의미가 달라 코드가 추측하지 말고 에이전트가 정함. (HWP 트랙 `set_cell_text_by_label`의 placeholder 규칙을 HWPX(index 기반)로 이식 — 한컴 렌더 검증 2026-06-19.) |
 | `append_table_row` | `table`, `cells` (string[]) | Clones the last row; fills cells left-to-right; updates `rowCnt`. Inherits the last row's column count. |
 | `insert_table_row` | `table`, `row`, `where?` (`before` default / `after`), `cells?` (string[]) | Inserts a row relative to row `row` (clones it for shape, fills `cells`), updates `rowCnt`, and renumbers every cell's `rowAddr` to its row index. Best on rectangular tables — a table with `rowSpan` merges may need manual `cellAddr` fixup. |
 | `insert_table_column` | `table`, `col`, `where?` (`before`/`after`), `cells?` (string[], top→bottom) | Inserts a column relative to col `col` in every row, updates `colCnt`, renumbers `colAddr`. Same merge caveat as `insert_table_row`. |
