@@ -51,8 +51,9 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 | 제목 L4 | 11pt | 120% | 1100 ≈3.9mm | 600 ≈2.1mm |
 | 제목 L5/L6 | 10.5/10pt | 120% | 900 / 800 | 520 / 450 |
 | 리스트 item | 본문크기 | **140%** (`LIST_LINE_SPACING`) | 0 | **700 ≈2.5mm** (`LIST_SPACING_AFTER`) |
-| 표 | 셀 22pt 등 | — | **위 outMargin 500≈1.8mm** | **아래도 500≈1.8mm** (`TABLE_TOP_MARGIN`, 위·아래 대칭) |
-| 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 위·아래 대칭이라 본문 문단 사이에 끼어도 균형. 이중 너비·연한 테두리·머리행 옅은 음영 | | | |
+| 표 | 셀 22pt 등 | — | **outMargin 사방 500≈1.8mm** (`TABLE_TOP_MARGIN`, 위·아래·양옆 대칭) | |
+| 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 사방 대칭이라 본문 사이에 끼어도 균형. 이중 너비·연한 테두리·머리행 옅은 음영 | | | |
+| **객체(이미지·차트·도형·수식)** | inline(treatAsChar=1, 자기 줄) | 세로 간격은 자기 문단 줄간격이 처리 | outMargin: 차트 2.5mm, 이미지·도형 0, 수식 양옆 0.2mm (제각각이나 inline이라 무방) | |
 | 용지/여백 | A4, 상하좌우 ~20mm (`setup_document`) | | | |
 
 → 정리: **본문 150% 줄간격 + 문단 뒤 3.5mm**, **제목은 120% 줄간격 + 레벨별 앞 큰 간격(L1 7.8 / L2 6mm)
@@ -63,6 +64,12 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 `align`, `indent` — 모두 Hancom web-safe, 부분 적용 시 나머지 자동 보존 §A) 로 **명시적으로** 바꾼다.
 리스트는 유니코드 "•" 텍스트 금지, `set_bullet_list`/`set_number_list` 사용(한컴 web BULLET strip 주의
 [[hwpx-hancom-web-list-strip]]).
+
+**이 값들은 전부 디폴트일 뿐 — 문서마다 자유롭게 덮어쓸 수 있다:**
+- 표 바깥 여백: `set_table_margin {table, left/right/top/bottom(mm)}` / create 시 `append_table {spacing_before, spacing_after}`
+- 객체 여백: `set_object_margin {target, index, margin_mm}` / `insert_chart`·`insert_shape {margin_mm}`
+- 객체 위치·배치: `set_object_position {x_mm, y_mm, wrap}`
+- 문단 간격·정렬: `apply_paragraph_style` (위 참고)
 
 ---
 

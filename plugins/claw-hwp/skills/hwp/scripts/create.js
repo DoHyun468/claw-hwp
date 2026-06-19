@@ -2805,8 +2805,8 @@ async function patchHwpxTableOutMargin(filePath) {
     //    both — we still write the caller's intent.)
     const xml2 = xml.replace(/<hp:tbl\b[\s\S]*?<hp:tr\b/g, (seg) =>
       seg.replace(/<hp:outMargin\b[^>]*\/>/, (m) => {
-        const left = (m.match(/left="(\d+)"/) || [])[1] ?? "283";
-        const right = (m.match(/right="(\d+)"/) || [])[1] ?? "283";
+        const left = TABLE_TOP_MARGIN;   // 양옆도 500(≈1.8mm)로 통일 — 사방 대칭
+        const right = TABLE_TOP_MARGIN;
         const spec = tableSpacingSpecs[total] || {};
         // top: small dedicated table margin (~1/4 of the section gap). The wrapper
         // para's prev is 0, so the above-gap = preceding.after (collapsed) + this
