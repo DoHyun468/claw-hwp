@@ -196,7 +196,7 @@ itself is invisible in body rendering.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `insert_hyperlink` | `index`, `url`, `text` | Appends a clickable hyperlink to paragraph `index`. Built as a paired Hancom field (`<hp:fieldBegin type="HYPERLINK">` … `<hp:t>text</hp:t>` … `<hp:fieldEnd>`) inside a new run, mirroring the verified structure from a real government doc. `text` is what the reader sees; `url` is the target. **Link-only paragraph pattern:** the op appends the link to whatever's in paragraph `index`, so to produce a paragraph that's just the link, first `append_paragraph` with empty `text: ""`, then `insert_hyperlink` targeting that new paragraph's index. |
+| `insert_hyperlink` | `index?`, `url`, `text` | Appends a clickable hyperlink to paragraph `index` (**`index` optional — defaults to the last top-level paragraph**, so a quick "link at the end of the doc" needs only `url`+`text`). Built as a paired Hancom field (`<hp:fieldBegin type="HYPERLINK">` … `<hp:t>text</hp:t>` … `<hp:fieldEnd>`) inside a new run, mirroring the verified structure from a real government doc. `text` is what the reader sees; `url` is the target. **Link-only paragraph pattern:** the op appends the link to whatever's in paragraph `index`, so to produce a paragraph that's just the link, first `append_paragraph` with empty `text: ""`, then `insert_hyperlink` targeting that new paragraph's index. |
 
 ### Images
 

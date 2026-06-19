@@ -3374,6 +3374,9 @@ function opInsertHyperlink(doc, paragraphIndex, url, text) {
   if (!url) throw new Error('insert_hyperlink: "url" is required');
   if (!text) throw new Error('insert_hyperlink: "text" (display label) is required');
   const paras = doc.paragraphs();
+  // `index` optional → default to the last top-level paragraph (append at doc end)
+  // instead of crashing on an undefined index.
+  if (paragraphIndex == null) paragraphIndex = paras.length - 1;
   if (paragraphIndex < 0 || paragraphIndex >= paras.length) {
     throw new Error(`insert_hyperlink: paragraph index ${paragraphIndex} out of range (0..${paras.length - 1})`);
   }
