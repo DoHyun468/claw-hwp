@@ -1645,12 +1645,24 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
       if (hits.length === 0) throw new Error(`set_cell_text_by_label: no cell containing "${op.label}" found`);
       if (occurrence >= hits.length) throw new Error(`set_cell_text_by_label: occurrence ${occurrence} out of range (${hits.length} hits)`);
       const hit = hits[occurrence];
-      out.push({
-        section: hit.sec, para: hit.para, control: hit.ctrl,
-        row: hit.cell.row + (autoTarget ? 0 : rowOff),
-        col: hit.cell.col + (autoTarget ? (hit.cell.colSpan ?? 1) : colOff),
-        text,
-      });
+      if (op.append) {
+        // The label cell ITSELF is the write area — "건 명 : ___" / underline /
+        // colon-style fields where the value is typed after the label in the same
+        // cell, not in an adjacent cell. Keep the label text and append the value.
+        const labelText = (hit.cell.text || '').replace(/[\r\n]+/g, ' ').replace(/\s+$/, '');
+        out.push({
+          section: hit.sec, para: hit.para, control: hit.ctrl,
+          row: hit.cell.row, col: hit.cell.col,
+          text: labelText ? `${labelText} ${text}` : text,
+        });
+      } else {
+        out.push({
+          section: hit.sec, para: hit.para, control: hit.ctrl,
+          row: hit.cell.row + (autoTarget ? 0 : rowOff),
+          col: hit.cell.col + (autoTarget ? (hit.cell.colSpan ?? 1) : colOff),
+          text,
+        });
+      }
     }
     return out;
   } finally {
