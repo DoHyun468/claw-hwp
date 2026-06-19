@@ -3727,7 +3727,12 @@ function opInsertChart(doc, op) {
   const toHu = (mm) => Math.round(Number(mm) * 283.46);
   const cw = op.width_mm != null ? toHu(op.width_mm) : 32250;
   const ch = op.height_mm != null ? toHu(op.height_mm) : 18750;
-  const wrap = wrapVal(op.wrap, 'SQUARE');
+  // Default INLINE (글자처럼): chart sits on its own line where inserted — text
+  // flows above/below, never squeezed into a narrow column beside a floating
+  // chart (the SQUARE/어울림 default mangled report sections), and the chart
+  // can't drift onto a later page. Override via `wrap` (square/topbottom/front/
+  // behind) when a floating layout is wanted.
+  const wrap = wrapVal(op.wrap, 'INLINE');
   // Outer margin (바깥 여백) so surrounding text isn't crowded/covered by the
   // chart. Default ~2.5mm all round; override with margin_mm. + optional x/y.
   const cmargin = op.margin_mm != null ? toHu(op.margin_mm) : 709;
