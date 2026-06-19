@@ -20,7 +20,8 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 | `insert_table` | 문서 첫 `<hp:tbl>` 복제(borderFill/cellSz/cellMargin) → 표 스타일 일치 |
 
 **적재적소 원칙**
-- 본문 → 본문 문단 **뒤에** `append_paragraph`. 표 → `insert_table`(또는 기존 표에 `set_cell_text`).
+- 본문 → 본문 문단 **뒤에** `append_paragraph`(끝 문단 스타일을 복제하니, 본문 스타일과 다르면 그 문단을 본문 뒤에 두거나 이후 `apply_paragraph_style`로 맞춤). 표 → `insert_table`(또는 기존 표에 `set_cell_text`).
+  - ⚠️ `insert_table {index}` 에서 **`index:-1`은 문서 맨 앞 prepend** — 템플릿 안 특정 위치에 넣으려면 **실제 문단 index**를 줘라(안 그러면 표가 1페이지 맨 위로 올라가고 본문이 밀린다). 검증됨: 새 표도 기존 표의 borderFill 스타일은 그대로 상속.
 - 제목/소제목처럼 **다른 스타일**이 필요하면: 템플릿에서 그 스타일 문단을 `--inspect`/`--format markdown`
   으로 찾아 **줄간격·정렬·크기를 읽고**(추측 금지) `apply_paragraph_style`/`apply_text_style`로 맞춘다.
 - ⚠️ 엉뚱한 위치에 붙이면 엉뚱한 스타일 상속(목차 뒤에 본문→목차 스타일). 넣기 전 **어느 문단을
