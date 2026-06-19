@@ -974,19 +974,25 @@ const HANDLERS = {
       : parseInlineRuns(op.text || "");
     const heightHU = Math.round(def.fontSize * 100);
     // Theme controls colour + font; HEADING_DEFAULTS still owns size/spacing.
-    // A per-run color / font_family overrides the theme (handled downstream).
+    // A per-op `color` or per-run color overrides the theme (handled downstream).
+    const headingColor = op.color ? normalizeHexColor(op.color) : (activeTheme.headingColors[level] ?? def.color);
     const headingDefaults = {
       fontSize: heightHU,
       bold: true,
-      color: activeTheme.headingColors[level] ?? def.color,
+      color: headingColor,
     };
     const hFontIds = themeFontIds(doc, "heading");
     if (hFontIds) headingDefaults.fontIds = hFontIds;
     writeRunsAt(doc, cursor, runs, headingDefaults);
+    // Record the intended ink colour: patchHwpxHeadings re-links the run to a
+    // charPr matching (size, bold, COLOUR) — without colour in the key it would
+    // collapse every same-size heading onto the first charPr (all one colour).
+    const inkColor = (runs[0] && runs[0].color) ? normalizeHexColor(runs[0].color) : headingColor;
     headingPatches.push({
       paraIdx: cursor.para,
       heightHU,
       bold: true,
+      color: inkColor,
     });
     // Headings: left-aligned (justify makes 16pt headings look weird with
     // the inter-word stretch), tight line spacing, generous before/after.
@@ -2452,7 +2458,8 @@ async function patchHwpxHeadings(filePath, patches) {
   // Parse <hh:charPr> blocks (self-closing or paired). Build a (height, bold) → id map.
   // Multiple charPrs may share the same (height, bold) — pick the first; rhwp dedupes.
   const charPrRe = /<hh:charPr\b[^>]*?(?:\/>|>(?:[^<]|<(?!\/hh:charPr>))*?<\/hh:charPr>)/g;
-  const lookup = new Map();
+  const lookup = new Map();    // height:bold → first id (colour-agnostic fallback)
+  const lookupC = new Map();   // height:bold:TEXTCOLOR → id (so per-heading colour survives)
   for (const m of headerXml.matchAll(charPrRe)) {
     const s = m[0];
     const idM = /\bid="(\d+)"/.exec(s);
@@ -2461,8 +2468,12 @@ async function patchHwpxHeadings(filePath, patches) {
     const id = idM[1];
     const height = heightM[1];
     const bold = /<hh:bold\b/.test(s);
+    const colorM = /\btextColor="(#[0-9A-Fa-f]{6})"/.exec(s);
+    const color = (colorM ? colorM[1] : "#000000").toUpperCase();
     const key = `${height}:${bold ? 1 : 0}`;
     if (!lookup.has(key)) lookup.set(key, id);
+    const keyC = `${key}:${color}`;
+    if (!lookupC.has(keyC)) lookupC.set(keyC, id);
   }
 
   // Find every <hp:p>...</hp:p> region and rewrite the text-bearing run's
@@ -2475,7 +2486,10 @@ async function patchHwpxHeadings(filePath, patches) {
     const p = patches[i];
     if (p.paraIdx < 0 || p.paraIdx >= regions.length) continue;
     const key = `${p.heightHU}:${p.bold ? 1 : 0}`;
-    const targetId = lookup.get(key);
+    const keyC = p.color ? `${key}:${String(p.color).toUpperCase()}` : null;
+    // Prefer the charPr that also matches the heading's intended colour; fall
+    // back to the colour-agnostic match (old behaviour) if none exists.
+    const targetId = (keyC && lookupC.get(keyC)) || lookup.get(key);
     if (!targetId) continue;
     const region = regions[p.paraIdx];
     const before = xml.slice(0, region.start);
