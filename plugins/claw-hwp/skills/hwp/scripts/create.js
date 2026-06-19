@@ -654,6 +654,7 @@ const THEMES = {
       5: HEADING_DEFAULTS[5].color, 6: HEADING_DEFAULTS[6].color,
     },
     accent: "#1F3864",
+    headerFill: "#EAEAEA",   // 표 머리행 회색(사용자 선호, 유지). 타 테마는 헤딩색 틴트 자동.
   },
   corporate: {
     label: "기업·비즈니스 (네이비)",
@@ -729,6 +730,32 @@ function loadThemeFile(name) {
   };
 }
 
+// Derive a pale table-header fill from a heading colour: keep the hue, cap chroma
+// (한글다운 muted), force a light L so a colored-but-subtle band reads under dark
+// header text. Neutral source (government #1A1A1A) → light gray. So each theme's
+// 표 머리행 takes its own tint (docx-style) instead of a fixed gray.
+function tintColor(hex, light = 0.86, satCap = 0.34) {
+  const h = String(hex || "#1A1A1A").replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16) / 255, g = parseInt(h.slice(2, 4), 16) / 255, b = parseInt(h.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l0 = (max + min) / 2;
+  let hue = 0, s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l0 > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) hue = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) hue = (b - r) / d + 2;
+    else hue = (r - g) / d + 4;
+    hue /= 6;
+  }
+  const S = Math.min(s, satCap), L = light;
+  const hue2rgb = (p, q, t) => { if (t < 0) t += 1; if (t > 1) t -= 1; if (t < 1 / 6) return p + (q - p) * 6 * t; if (t < 1 / 2) return q; if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6; return p; };
+  let R, G, B;
+  if (S === 0) { R = G = B = L; }
+  else { const q = L < 0.5 ? L * (1 + S) : L + S - L * S; const p = 2 * L - q; R = hue2rgb(p, q, hue + 1 / 3); G = hue2rgb(p, q, hue); B = hue2rgb(p, q, hue - 1 / 3); }
+  const to2 = (x) => Math.round(x * 255).toString(16).padStart(2, "0").toUpperCase();
+  return `#${to2(R)}${to2(G)}${to2(B)}`;
+}
+
 // Resolve the active theme from the payload. Unknown `theme` names fall back to
 // government with a logged note (a typo must never abort a document). The
 // optional `theme_overrides` object deep-patches the chosen theme — bodyFont /
@@ -757,6 +784,10 @@ function resolveTheme(payload, log) {
     }
     if (log) log.push(`theme_overrides applied (${Object.keys(ov).join(", ")})`);
   }
+  // 표 머리행 채움색: 명시값(government 회색) 우선, 없으면 헤딩 L1 색에서 연한 틴트 파생.
+  // theme_overrides.headerFill 로 직접 지정 가능.
+  theme.headerFill = (ov && ov.headerFill) ? normalizeHexColor(ov.headerFill)
+    : (base.headerFill ?? tintColor(theme.headingColors[1] || "#1A1A1A"));
   return theme;
 }
 
@@ -1078,7 +1109,7 @@ const HANDLERS = {
     // together with fill, which is why their UI works and our earlier
     // single-key calls didn't. This is the same recipe.
     const DEFAULT_BORDER = { type: 1, width: 1, color: "#000000" };
-    const HEADER_BG = "#EAEAEA";   // soft Office-style header gray
+    const HEADER_BG = activeTheme.headerFill || "#EAEAEA";   // 테마별 머리행 틴트(없으면 회색)
     // Uniform 1.4mm cell padding on all four sides. NOTE: this only renders once
     // the cell's hasMargin="1" is set (patchHwpxCellHasMargin post-export) — rhwp
     // leaves it 0, which makes Hancom ignore the per-cell margin entirely.
@@ -2953,7 +2984,8 @@ async function patchHwpxTableHeaderFill(filePath) {
     .filter(([, rows]) => rows.size === 1 && rows.has(0))
     .map(([bf]) => bf);
   if (!headerBfs.length) return 0;
-  const SHADE = `<hc:fillBrush><hc:winBrush faceColor="${HEADER_SHADE_COLOR}" hatchColor="${HEADER_SHADE_COLOR}" alpha="0"/></hc:fillBrush>`;
+  const shade = activeTheme.headerFill || HEADER_SHADE_COLOR;   // 테마별 머리행 틴트
+  const SHADE = `<hc:fillBrush><hc:winBrush faceColor="${shade}" hatchColor="${shade}" alpha="0"/></hc:fillBrush>`;
   let n = 0;
   for (const bf of headerBfs) {
     // Tempered match keeps us inside THIS BorderFill block; only an empty fillBrush.
