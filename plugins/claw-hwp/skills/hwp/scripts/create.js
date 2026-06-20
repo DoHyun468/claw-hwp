@@ -1051,8 +1051,20 @@ const HANDLERS = {
   },
 
   append_table(doc, op, cursor) {
-    const headers = op.headers || [];
-    const rows = op.rows || [];
+    // Header-row safety net. Report/grid tables almost always lead with a
+    // header row, but the model sometimes packs that row into `rows` and omits
+    // `headers` — which silently skips the theme header tint + bold, since the
+    // whole header treatment is gated on `headers.length`. When `headers` is
+    // absent we promote `rows[0]` to the header so the top row reliably gets
+    // the theme tint (the user can still override the colour with
+    // `header_fill`). A genuinely header-less table opts out via
+    // `no_header: true`.
+    let headers = op.headers || [];
+    let rows = op.rows || [];
+    if (!headers.length && rows.length && op.no_header !== true) {
+      headers = rows[0];
+      rows = rows.slice(1);
+    }
     const cols = headers.length || (rows[0] ? rows[0].length : 0);
     if (cols === 0) throw new Error("append_table: need headers or non-empty rows");
     const totalRows = (headers.length ? 1 : 0) + rows.length;

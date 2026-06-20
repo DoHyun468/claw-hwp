@@ -169,13 +169,15 @@ All five themes use only render-confirmed fonts (see the **`font_family`** note 
 | `setup_document` | `page_size` (`a4`/`b5`/...), `orientation` (`portrait`/`landscape`) | `margin_mm`, `base_font` |
 | `append_heading` | `level` (1–6), `text` | `align`, `runs`, `spacing_before`, `spacing_after`, `line_spacing` |
 | `append_paragraph` | `text` | `align`, `line_spacing`, `spacing_before`, `spacing_after`, `runs` |
-| `append_table` ⚠️ | `headers`, `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props`, `spacing_before`, `spacing_after`, `align`, `header_fill` (머리행 배경색 #hex — 연한 톤 권장, 검은 글자 가독; 생략 시 테마 틴트) |
+| `append_table` ⚠️ | `headers`(머리글 행), `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props`, `spacing_before`, `spacing_after`, `align`, `header_fill`(머리행 배경색 #hex), `no_header` |
 | `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt`, `spacing_before`, `spacing_after`, `align` |
 | `append_bullet_list`, `append_numbered_list` | `items[]` | — |
 | `append_page_break` | — | — |
 | `apply_text_style` ⚠️ | `target` (string to find) | `color`, `bold`, `italic`, `underline`, `strikethrough`, `size` (pt), `highlight` (`true` / `"#RRGGBB"` / `false`), `font_family`, `superscript`, `subscript`, `underline_color`, `letter_spacing`, `char_ratio` |
 | `apply_paragraph_style` ⚠️ | `index` (paragraph index, 0-based) | `align`, `indent`, `line_spacing` (% e.g. 130), `margin_left`, `margin_right`, `spacing_before`, `spacing_after`, `background_color`, `page_break_before`, `keep_with_next` |
 
+> **표 머리행 색 (새 문서 빌드 전용)** — 표를 만들면 **첫 행이 자동으로 머리행**이 되어 테마색 연한 틴트 + 굵게로 칠해진다(정부=회색, 그 외=헤딩색에서 파생한 연한 톤; 연한 배경 + 검은 글자가 한컴에 잘 맞는다 — docx식 진한 배경+흰 글자가 아님). 머리글은 `headers`로 넘기는 게 정석이고, `rows`에만 넣어도 `rows[0]`이 자동으로 머리행 승격된다. 색을 바꾸려면 `header_fill:"#RRGGBB"`(연한 톤 권장, 검은 글자 가독). 머리글이 없는 순수 데이터/레이아웃 표만 `no_header:true`로 끈다. ⚠️ 이 자동 틴트는 **새 문서 빌드**(payload가 `setup_document`로 시작)에만 적용된다 — 사용자가 준 **기존 양식/템플릿을 편집**할 땐 원본 표 스타일을 그대로 보존하고 머리행 색을 강제하지 않는다.
+>
 > **간격 커스터마이즈 (`spacing_before` / `spacing_after`)** — 단위는 HWPUNIT(약 283/mm; 예: 6mm ≈ 1700). 생략하면 각 요소의 기본값 사용(제목은 단계별, 본문/글머리/표/그림은 표준 리듬). 제목·본문·그림은 일반 문단 여백이라 위/아래가 서로 **겹쳐 큰 값으로 합쳐짐(collapse)**. 표는 한컴 web에서 위·아래가 **대칭으로 렌더**되므로(웹은 top 값을 위·아래 공통 적용; 한컴 앱은 위/아래 별도 적용), 표 아래만 크게 두려면 `spacing_before`에도 같은 값을 주는 게 안전.
 >
 > ⚠️ **`append_table` on existing `.hwp` (raw-patch path) — what it honors and what it doesn't:**
