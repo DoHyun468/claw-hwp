@@ -3665,13 +3665,46 @@ function strCachePts(vals) {
 function numCachePts(vals) {
   return `<c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>` + vals.map((v, i) => `<c:pt idx="${i}"><c:v>${Number(v) || 0}</c:v></c:pt>`).join('');
 }
+// Chart series/point colour. GT (chart-theme-schemeclr.hwpx, 한컴독스 author):
+// Hancom serialises a coloured series as <c:spPr><a:solidFill>…</a:solidFill></c:spPr>.
+// Two colour forms are accepted:
+//   - "accent1".."accent6" → <a:schemeClr> (follows Hancom's built-in chart theme
+//     palette — the .hwpx carries no embedded OOXML theme, so accentN resolves to
+//     Hancom's default accents, NOT the document theme).
+//   - "#RRGGBB" / "RRGGBB" → <a:srgbClr> (literal colour — use this to MATCH the
+//     document theme, e.g. corporate navy #304D68).
+// No colour → empty <c:spPr/> (unchanged: Hancom auto-assigns its default palette).
+function chartColorFill(color) {
+  if (color == null) return null;
+  const c = String(color).trim();
+  if (/^accent[1-6]$/i.test(c)) return `<a:solidFill><a:schemeClr val="${c.toLowerCase()}"/></a:solidFill>`;
+  const hex = c.replace(/^#/, '').toUpperCase();
+  if (/^[0-9A-F]{6}$/.test(hex)) return `<a:solidFill><a:srgbClr val="${hex}"/></a:solidFill>`;
+  return null; // unknown token → ignore, keep default palette
+}
+function serSpPr(color) {
+  const f = chartColorFill(color);
+  return f ? `<c:spPr>${f}</c:spPr>` : '<c:spPr/>';
+}
+// Per-point (per-bar / per-slice) colour overrides via <c:dPt>. Used for pie
+// slices and for single-series bar/column charts that want each bar its own colour.
+function dPtXml(pointColors) {
+  if (!Array.isArray(pointColors) || !pointColors.length) return '';
+  return pointColors.map((col, i) => {
+    const f = chartColorFill(col);
+    return f ? `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${f}</c:spPr></c:dPt>` : '';
+  }).join('');
+}
 // Standard series (cat + val): bar / line / area / radar / pie / doughnut.
-function stdSer(idx, name, cat, values, explode) {
+// `color` = whole-series fill; `pointColors` = per-point overrides (pie slices /
+// per-bar). Both optional — omitted → Hancom default palette (back-compat).
+function stdSer(idx, name, cat, values, explode, color, pointColors) {
   const cl = colLetter(idx);
   return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>`
     + `<c:tx><c:strRef><c:f>Sheet1!$${cl}$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>${xmlEscape(name)}</c:v></c:pt></c:strCache></c:strRef></c:tx>`
-    + `<c:spPr/><c:invertIfNegative val="0"/>`
+    + `${serSpPr(color)}<c:invertIfNegative val="0"/>`
     + (explode ? `<c:explosion val="25"/>` : '')
+    + dPtXml(pointColors)
     + `<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$${cat.length + 1}</c:f><c:strCache>${strCachePts(cat)}</c:strCache></c:strRef></c:cat>`
     + `<c:val><c:numRef><c:f>Sheet1!$${cl}$2:$${cl}$${values.length + 1}</c:f><c:numCache>${numCachePts(values)}</c:numCache></c:numRef></c:val>`
     + `</c:ser>`;
@@ -3712,10 +3745,10 @@ function buildChartSpace(spec, cat, series) {
       + valAxXml(ax1, 'b', ax2) + valAxXml(ax2, 'l', ax1);
   } else if (spec.pie) {
     const s0 = series[0];
-    plot = `<c:${spec.el}><c:varyColors val="1"/>${stdSer(0, s0.name, cat, s0.values, spec.explode)}<c:firstSliceAng val="0"/>`
+    plot = `<c:${spec.el}><c:varyColors val="1"/>${stdSer(0, s0.name, cat, s0.values, spec.explode, s0.color, s0.pointColors)}<c:firstSliceAng val="0"/>`
       + (spec.hole != null ? `<c:holeSize val="${spec.hole}"/>` : '') + `</c:${spec.el}>`;
   } else {
-    const sers = series.map((s, i) => stdSer(i, s.name, cat, s.values)).join('');
+    const sers = series.map((s, i) => stdSer(i, s.name, cat, s.values, false, s.color, s.pointColors)).join('');
     const horiz = spec.dir === 'bar';
     let inner = '';
     if (spec.dir) inner += `<c:barDir val="${spec.dir}"/>`;
@@ -3736,14 +3769,31 @@ function buildChartSpace(spec, cat, series) {
 // Object wrap (배치): how text flows around a floating object.
 const OBJ_WRAP = { inline: 'INLINE', square: 'SQUARE', 어울림: 'SQUARE', topbottom: 'TOP_AND_BOTTOM', 자리차지: 'TOP_AND_BOTTOM', front: 'IN_FRONT_OF_TEXT', behind: 'BEHIND_TEXT' };
 function wrapVal(w, def) { return OBJ_WRAP[String(w == null ? '' : w).toLowerCase()] || def; }
-// Normalize a chart op's {chart_type, cat, series} into {spec, cat, series}.
-// Shared by insert_chart and set_cell_chart.
+// Normalize a chart op's {chart_type, cat, series, colors} into {spec, cat, series}.
+// Shared by insert_chart and set_cell_chart. Colour (optional):
+//   - `colors`: array (or single `color`). For a pie/doughnut → per-slice colours;
+//     for bar/line/area → per-series colours (cycled if fewer than series).
+//   - `point_colors`: array → per-bar colours of the first series (any standard
+//     chart) so a single-series column chart can be a theme gradient.
+// Each colour is "#RRGGBB"/"RRGGBB" (literal, matches the document theme) or
+// "accent1".."accent6" (Hancom's built-in chart accents). See chartColorFill.
 function chartData(op) {
   const spec = chartSpec(op.chart_type);
   const cat = Array.isArray(op.cat) ? op.cat.map(String) : ['항목 1', '항목 2', '항목 3'];
   let series = Array.isArray(op.series) && op.series.length ? op.series : [{ name: '계열 1', values: cat.map(() => 0) }];
   series = series.map((s, i) => ({ name: s.name != null ? String(s.name) : `계열 ${i + 1}`, values: Array.isArray(s.values) ? s.values : [] }));
   if (spec.pie) series = [series[0]];
+  const colors = Array.isArray(op.colors) ? op.colors.map(String)
+    : (op.color != null ? [String(op.color)] : null);
+  const pointColors = Array.isArray(op.point_colors) ? op.point_colors.map(String) : null;
+  if (spec.pie) {
+    // Pie is inherently one colour per slice → colors (or point_colors) map to slices.
+    const slice = colors || pointColors;
+    if (slice) series[0].pointColors = slice;
+  } else {
+    if (colors) series.forEach((s, i) => { s.color = colors[i % colors.length]; });
+    if (pointColors && series[0]) series[0].pointColors = pointColors;
+  }
   return { spec, cat, series };
 }
 

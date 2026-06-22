@@ -289,7 +289,7 @@ part (no OLE binary needed).
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `insert_chart` | `chart_type?`, `cat?`, `series?`, `width_mm?`, `height_mm?`, `wrap?`, `margin_mm?`, `x_mm?`, `y_mm?` | Appends a chart at the end of the last section. `width_mm`/`height_mm` set the chart size (default ≈114 × 66 mm); `wrap` = `inline` (글자처럼, **default** — chart sits on its own line where inserted; text flows above/below, no side-wrap mangling, and it can't drift to a later page) / `topbottom` (자리차지, floats but text only above/below) / `square` (어울림 — text wraps around; only when you want a side-by-side layout) / `front` / `behind`. **Default changed 2026-06-19 from `square`→`inline`** after a side-by-side render test (square mangled report section headings; behind overlapped text; inline & topbottom were clean — inline chosen for predictable in-place anchoring). **`margin_mm` = outer margin so surrounding text isn't crowded/covered (default ≈2.5 mm — keeps a gap above/below).** `x_mm`/`y_mm` nudge the position. `chart_type` accepts a **name** — `column` (default) / `bar` / `line` / `area` / `pie` / `doughnut` / `scatter` / `radar` — **or a numeric 0–19** covering Hancom's full type list (incl. stacked, 3D, exploded pie): 0 col · 1 col-stacked · 2 line · 3 bar · 4 bar-stacked · 5 scatter · 6 pie · 7 pie-exploded · 8 doughnut · 9 area · 10 area-stacked · 11 radar · 12–15 3D bar · 16–17 3D pie · 18–19 3D area. `cat` = category labels `["1월","2월","3월"]` (for `scatter`, numeric X values). `series` = `[{ "name": "매출", "values": [120,135,150] }, …]` (pie/doughnut use the first series only; values map to categories in order). The OOXML chart part is generated from this data; **all 20 types verified rendering on Hancom Docs web** (clustered/stacked bar, line, area, pie/doughnut/exploded, scatter, radar, 3D). |
+| `insert_chart` | `chart_type?`, `cat?`, `series?`, `colors?`, `color?`, `point_colors?`, `width_mm?`, `height_mm?`, `wrap?`, `margin_mm?`, `x_mm?`, `y_mm?` | Appends a chart at the end of the last section. `width_mm`/`height_mm` set the chart size (default ≈114 × 66 mm); `wrap` = `inline` (글자처럼, **default** — chart sits on its own line where inserted; text flows above/below, no side-wrap mangling, and it can't drift to a later page) / `topbottom` (자리차지, floats but text only above/below) / `square` (어울림 — text wraps around; only when you want a side-by-side layout) / `front` / `behind`. **Default changed 2026-06-19 from `square`→`inline`** after a side-by-side render test (square mangled report section headings; behind overlapped text; inline & topbottom were clean — inline chosen for predictable in-place anchoring). **`margin_mm` = outer margin so surrounding text isn't crowded/covered (default ≈2.5 mm — keeps a gap above/below).** `x_mm`/`y_mm` nudge the position. `chart_type` accepts a **name** — `column` (default) / `bar` / `line` / `area` / `pie` / `doughnut` / `scatter` / `radar` — **or a numeric 0–19** covering Hancom's full type list (incl. stacked, 3D, exploded pie): 0 col · 1 col-stacked · 2 line · 3 bar · 4 bar-stacked · 5 scatter · 6 pie · 7 pie-exploded · 8 doughnut · 9 area · 10 area-stacked · 11 radar · 12–15 3D bar · 16–17 3D pie · 18–19 3D area. `cat` = category labels `["1월","2월","3월"]` (for `scatter`, numeric X values). `series` = `[{ "name": "매출", "values": [120,135,150] }, …]` (pie/doughnut use the first series only; values map to categories in order). The OOXML chart part is generated from this data; **all 20 types verified rendering on Hancom Docs web** (clustered/stacked bar, line, area, pie/doughnut/exploded, scatter, radar, 3D). |
 
 ```json
 {"type":"insert_chart","chart_type":"column",
@@ -297,6 +297,17 @@ part (no OLE binary needed).
  "series":[{"name":"매출","values":[120,135,150]},{"name":"비용","values":[80,75,90]}]}
 {"type":"insert_chart","chart_type":"pie","cat":["A","B","C","D"],"series":[{"name":"점유율","values":[40,30,20,10]}]}
 ```
+
+테마색 차트 예 (문서 테마에 맞춘 색):
+```json
+{"type":"insert_chart","chart_type":"column","cat":["1Q","2Q","3Q","4Q"],
+ "series":[{"name":"매출","values":[980,1010,1046,1240]}],
+ "point_colors":["#A9C4DE","#6F93BC","#3E6592","#1F3D5E"]}
+{"type":"insert_chart","chart_type":"column","cat":["1Q","2Q","3Q"],
+ "series":[{"name":"매출","values":[120,135,150]},{"name":"비용","values":[80,75,90]}],
+ "colors":["#304D68","#9CC3E6"]}
+```
+- `point_colors` = 단일 계열 막대를 막대마다 다른 색(테마 연→진 그라데이션). `colors` = 다계열에서 계열마다 색. `color` = 전부 한 색. 색은 `#RRGGBB`(테마색 매칭) 권장.
 
 ### Shape (도형)
 
