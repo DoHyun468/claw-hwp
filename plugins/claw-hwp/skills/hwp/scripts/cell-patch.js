@@ -4272,7 +4272,7 @@ function _chEditXml(xml, model) {
   return xml.slice(0, first) + sers.join('') + xml.slice(lastClose + 8);
 }
 // minimal inner-CFB primitives (simple v3 CFB only)
-const _icHdr = (cfb) => { const ssz = 1 << cfb.readUInt16LE(30); const nFat = cfb.readUInt32LE(44); const dirStart = cfb.readUInt32LE(48); const difat = []; for (let i = 0; i < 109; i++) { const v = cfb.readUInt32LE(76 + i * 4); if (v <= 0xFFFFFFFA) difat.push(v); } return { ssz, nFat, dirStart, difat }; };
+const _icHdr = (cfb) => { const ssz = 1 << cfb.readUInt16LE(30); const mssz = 1 << cfb.readUInt16LE(32); const nFat = cfb.readUInt32LE(44); const dirStart = cfb.readUInt32LE(48); const miniCutoff = cfb.readUInt32LE(56); const minifatStart = cfb.readUInt32LE(60); const difat = []; for (let i = 0; i < 109; i++) { const v = cfb.readUInt32LE(76 + i * 4); if (v <= 0xFFFFFFFA) difat.push(v); } return { ssz, mssz, nFat, dirStart, miniCutoff, minifatStart, difat }; };
 const _icFat = (cfb, difat, ssz) => { const fat = []; for (const fs of difat) { const off = 512 + fs * ssz; for (let i = 0; i < ssz / 4; i++) fat.push(cfb.readUInt32LE(off + i * 4)); } return fat; };
 const _icChain = (fat, start) => { const c = []; let s = start; while (s <= 0xFFFFFFFA && s < fat.length) { c.push(s); s = fat[s]; if (c.length > 100000) break; } return c; };
 const _icSecOff = (idx, ssz) => 512 + idx * ssz;
@@ -4283,8 +4283,34 @@ function _icFindEntry(cfb, hdr, fat, name) {
   }
   return -1;
 }
+// Mini-stream support. Inner CFBs classify any stream < miniCutoff (4096) as a
+// mini-stream: its bytes live in 64-byte mini-sectors packed inside the Root Entry's
+// regular chain, indexed by the mini-FAT (not the regular FAT). Pie/doughnut chart
+// templates store OOXMLChartContents (~3.4 KB) natively here, so reading them needs
+// this path (the regular reader would walk the wrong FAT and return garbage).
+const _icMiniFat = (cfb, hdr, fat) => {
+  const mf = []; if (hdr.minifatStart > 0xFFFFFFFA) return mf;
+  for (const sec of _icChain(fat, hdr.minifatStart)) { const off = _icSecOff(sec, hdr.ssz); for (let i = 0; i < hdr.ssz / 4; i++) mf.push(cfb.readUInt32LE(off + i * 4)); }
+  return mf;
+};
+const _icReadRootStream = (cfb, hdr, fat) => {
+  // Root Entry = first dir entry (dirStart sector, offset 0); its regular chain is the mini-stream container.
+  const rootOff = _icSecOff(hdr.dirStart, hdr.ssz);
+  const chain = _icChain(fat, cfb.readUInt32LE(rootOff + 116)); const rsize = cfb.readUInt32LE(rootOff + 120);
+  const out = Buffer.alloc(chain.length * hdr.ssz); let p = 0;
+  for (const sec of chain) { const off = _icSecOff(sec, hdr.ssz); cfb.copy(out, p, off, off + hdr.ssz); p += hdr.ssz; }
+  return rsize > 0 && rsize < out.length ? out.slice(0, rsize) : out;
+};
+function _icReadMini(cfb, hdr, fat, entryOff) {
+  const size = cfb.readUInt32LE(entryOff + 120); const miniFat = _icMiniFat(cfb, hdr, fat); const root = _icReadRootStream(cfb, hdr, fat);
+  const out = Buffer.alloc(size); let p = 0; let s = cfb.readUInt32LE(entryOff + 116);
+  while (s <= 0xFFFFFFFA && p < size) { const off = s * hdr.mssz; const n = Math.min(hdr.mssz, size - p); root.copy(out, p, off, off + n); p += n; s = miniFat[s]; if (s === undefined) break; }
+  return out;
+}
 function _icReadStream(cfb, hdr, fat, entryOff) {
-  const size = cfb.readUInt32LE(entryOff + 120); const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116));
+  const size = cfb.readUInt32LE(entryOff + 120);
+  if (size > 0 && size < hdr.miniCutoff) return _icReadMini(cfb, hdr, fat, entryOff);
+  const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116));
   const out = Buffer.alloc(size); let p = 0;
   for (const sec of chain) { const off = _icSecOff(sec, hdr.ssz); const n = Math.min(hdr.ssz, size - p); cfb.copy(out, p, off, off + n); p += n; if (p >= size) break; }
   return out;
@@ -4292,21 +4318,43 @@ function _icReadStream(cfb, hdr, fat, entryOff) {
 function _icWriteOoxml(cfb, newXml) {
   const hdr = _icHdr(cfb); const ssz = hdr.ssz; let fat = _icFat(cfb, hdr.difat, ssz);
   const entryOff = _icFindEntry(cfb, hdr, fat, 'OOXMLChartContents'); if (entryOff < 0) throw new Error('chart data edit: OOXMLChartContents not found');
-  const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116)); const capacity = chain.length * ssz;
   const data = Buffer.from(newXml, 'utf8');
-  if (data.length <= capacity) {
-    let p = 0; for (const sec of chain) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(cfb, off, p, p + n); if (n < ssz) cfb.fill(0, off + Math.max(0, n), off + ssz); p += n; }
-    cfb.writeUInt32LE(data.length, entryOff + 120); return cfb;
+  const oldSize = cfb.readUInt32LE(entryOff + 120);
+  const wasMini = oldSize > 0 && oldSize < hdr.miniCutoff;
+  if (!wasMini) {
+    const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116)); const capacity = chain.length * ssz;
+    if (data.length <= capacity) {
+      let p = 0; for (const sec of chain) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(cfb, off, p, p + n); if (n < ssz) cfb.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+      cfb.writeUInt32LE(data.length, entryOff + 120); return cfb;
+    }
+    if (hdr.nFat !== 1 || hdr.difat.length !== 1) throw new Error('chart data edit: multi-FAT OLE not supported');
+    const needSectors = Math.ceil(data.length / ssz); const addSectors = needSectors - chain.length; let buf = cfb; const added = [];
+    for (let i = 0; i < addSectors; i++) { const idx = (buf.length - 512) / ssz; const tmp = Buffer.alloc(buf.length + ssz); buf.copy(tmp); buf = tmp; added.push(idx); }
+    while (fat.length < (buf.length - 512) / ssz) fat.push(0xFFFFFFFF);
+    const full = chain.concat(added); for (let i = 0; i < full.length - 1; i++) fat[full[i]] = full[i + 1]; fat[full[full.length - 1]] = 0xFFFFFFFE;
+    const maxEntries = ssz / 4; if (fat.length > maxEntries) throw new Error('chart data edit: OLE exceeded single-FAT capacity (too many rows/cols)');
+    const fatOff = _icSecOff(hdr.difat[0], ssz); for (let i = 0; i < maxEntries; i++) buf.writeUInt32LE((i < fat.length ? fat[i] : 0xFFFFFFFF) >>> 0, fatOff + i * 4);
+    let p = 0; for (const sec of full) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(buf, off, p, p + n); if (n < ssz) buf.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+    buf.writeUInt32LE(data.length, entryOff + 120); return buf;
   }
+  // The entry was a MINI stream (pie/doughnut templates store OOXMLChartContents
+  // natively at ~3.4 KB, below the 4096 cutoff). The edited+padded XML is regular-sized
+  // (buildChartOleWithData pads to >= MIN_OOXML), so MOVE the entry out of the mini-stream
+  // into a fresh regular chain: allocate sectors at the tail, repoint the dir entry, and
+  // set a regular size. The old mini-sectors are left orphaned in the mini-stream container
+  // (harmless — nothing references them once the entry points elsewhere).
   if (hdr.nFat !== 1 || hdr.difat.length !== 1) throw new Error('chart data edit: multi-FAT OLE not supported');
-  const needSectors = Math.ceil(data.length / ssz); const addSectors = needSectors - chain.length; let buf = cfb; const added = [];
-  for (let i = 0; i < addSectors; i++) { const idx = (buf.length - 512) / ssz; const tmp = Buffer.alloc(buf.length + ssz); buf.copy(tmp); buf = tmp; added.push(idx); }
+  if (data.length < hdr.miniCutoff) throw new Error('chart data edit: mini-stream entry under cutoff (expected padded >= 4096)');
+  const needSectors = Math.ceil(data.length / ssz); let buf = cfb; const newChain = [];
+  for (let i = 0; i < needSectors; i++) { const idx = (buf.length - 512) / ssz; const tmp = Buffer.alloc(buf.length + ssz); buf.copy(tmp); buf = tmp; newChain.push(idx); }
   while (fat.length < (buf.length - 512) / ssz) fat.push(0xFFFFFFFF);
-  const full = chain.concat(added); for (let i = 0; i < full.length - 1; i++) fat[full[i]] = full[i + 1]; fat[full[full.length - 1]] = 0xFFFFFFFE;
+  for (let i = 0; i < newChain.length - 1; i++) fat[newChain[i]] = newChain[i + 1]; fat[newChain[newChain.length - 1]] = 0xFFFFFFFE;
   const maxEntries = ssz / 4; if (fat.length > maxEntries) throw new Error('chart data edit: OLE exceeded single-FAT capacity (too many rows/cols)');
   const fatOff = _icSecOff(hdr.difat[0], ssz); for (let i = 0; i < maxEntries; i++) buf.writeUInt32LE((i < fat.length ? fat[i] : 0xFFFFFFFF) >>> 0, fatOff + i * 4);
-  let p = 0; for (const sec of full) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(buf, off, p, p + n); if (n < ssz) buf.fill(0, off + Math.max(0, n), off + ssz); p += n; }
-  buf.writeUInt32LE(data.length, entryOff + 120); return buf;
+  let p = 0; for (const sec of newChain) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(buf, off, p, p + n); if (n < ssz) buf.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+  buf.writeUInt32LE(newChain[0], entryOff + 116);  // dir entry → fresh regular chain
+  buf.writeUInt32LE(data.length, entryOff + 120);   // regular size (>= cutoff)
+  return buf;
 }
 // ── chart series / point colour (theme matching) ─────────────────────────
 // Inject colour into the OOXMLChartContents, mirroring the HWPX track's
@@ -4345,6 +4393,16 @@ function _chApplyColors(xml, op) {
     return ser.replace(/(<c:order val="\d+"\/>)/, (m) => m + frag);
   };
   const putSpPr = (ser, spPrXml) => SPPR.test(ser) ? ser.replace(SPPR, spPrXml) : insertAfterTx(ser, spPrXml);
+  // Colour a line/radar series' point marker to match its line. The template marker
+  // is <c:marker><c:symbol/><c:size/></c:marker> with no spPr (→ default accent); add
+  // a spPr (fill + outline) right before </c:marker>, only if it has none yet. `fill`
+  // is an <a:solidFill> fragment (same one used for the line).
+  const colorMarker = (s, fill) => {
+    const i = s.indexOf('<c:marker>'); if (i < 0) return s;
+    const j = s.indexOf('</c:marker>', i); if (j < 0) return s;
+    if (s.slice(i, j).includes('<c:spPr>')) return s;
+    return s.slice(0, j) + `<c:spPr>${fill}<a:ln>${fill}</a:ln></c:spPr>` + s.slice(j);
+  };
   let out = '', cur = 0, si = 0;
   for (;;) {
     const a = xml.indexOf('<c:ser>', cur);
@@ -4358,8 +4416,12 @@ function _chApplyColors(xml, op) {
     const insertDpt = (s, dpts) => { const ci = s.indexOf('<c:cat>'); const vi = s.indexOf('<c:val>'); const at = ci >= 0 ? ci : (vi >= 0 ? vi : -1); return at >= 0 ? s.slice(0, at) + dpts + s.slice(at) : (SPPR.test(s) ? s.replace(SPPR, (m) => m + dpts) : insertAfterTx(s, dpts)); };
     if (isPie) {
       // Pie/doughnut: one series, one colour per slice (point_colors > colors).
+      // Pie/doughnut templates already carry one <c:dPt> per slice (accent1-4);
+      // strip those so our colours don't collide with the template's at the same
+      // <c:idx> (duplicate dPt for one index renders ambiguously). Then splice ours
+      // in at the schema position (before <c:cat>).
       const dpts = mkDpts(pointColors || colors || (single ? [single] : []));
-      if (dpts) ser = insertDpt(ser, dpts);
+      if (dpts) { ser = ser.replace(/<c:dPt>[\s\S]*?<\/c:dPt>/g, ''); ser = insertDpt(ser, dpts); }
     } else if (pointColors) {
       // Per-bar / per-point gradient on the FIRST series (single-series bar/area →
       // theme gradient, like the HWPX reference). Each data point gets its own <c:dPt>.
@@ -4372,9 +4434,31 @@ function _chApplyColors(xml, op) {
           ? `<c:spPr><a:ln w="28575" cap="flat" cmpd="sng" algn="ctr">${f}<a:prstDash val="solid"/><a:round/></a:ln></c:spPr>`
           : `<c:spPr>${f}</c:spPr>`;
         ser = putSpPr(ser, spPr);
+        // line/radar: our colour only sets the LINE (<a:ln>); the marker keeps its
+        // template default accent (so a purple line ends up with an orange marker).
+        // Give the marker the same fill + outline so it tracks the line colour.
+        if (isStroke) ser = colorMarker(ser, f);
       }
     }
     out += ser; cur = b; si++;
+  }
+  return out;
+}
+// Line/radar charts: the HWPX track renders these with visible circle markers
+// (its buildChartSpace emits <c:symbol val="circle"/> + a chart-level <c:marker
+// val="1"/> for line). The .hwp templates ship markers off (<c:symbol val="none"/>),
+// so when we're already editing the OLE we turn them on to keep .hwp and .hwpx
+// visually identical. Line: flip the per-series symbols AND add the chart-level
+// marker (CT_LineChart, position: after the sers, before <c:axId>). Radar
+// (CT_RadarChart has no chart-level marker element): flip the symbols only. Opt
+// out with op.markers === false. No-op for any other family.
+function _chApplyMarkers(xml) {
+  const fam = (xml.match(/<c:(line|radar)Chart>/) || [])[1];
+  if (!fam) return xml;
+  let out = xml.replace(/<c:symbol val="none"\/>/g, '<c:symbol val="circle"/>');
+  if (fam === 'line' && !/<c:marker val="1"\/>/.test(out)) {
+    const i = out.indexOf('<c:axId');
+    if (i >= 0) out = out.slice(0, i) + '<c:marker val="1"/>' + out.slice(i);
   }
   return out;
 }
@@ -4386,6 +4470,7 @@ function buildChartOleWithData(baseOleBytes, model, op) {
   let newXml = _icReadStream(cfb, hdr, fat, xEntry).toString('utf8');
   if (model) newXml = _chEditXml(newXml, model);
   if (op) newXml = _chApplyColors(newXml, op);
+  if (!op || op.markers !== false) newXml = _chApplyMarkers(newXml);
   // Keep OOXMLChartContents a REGULAR inner-CFB stream (>= the 4096-byte mini-stream
   // cutoff). Editing a 3-series template down to a single short-labelled series can
   // shrink it just under 4096 (e.g. categories "Q1"/"a" → ~4085 B); the CFB then
