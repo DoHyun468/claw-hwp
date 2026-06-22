@@ -212,6 +212,12 @@ const imagePatches = [];
 // patchHwpxPageMargin stamps these into the section pagePr post-export.
 let hwpxPageMargin = null;
 
+// True only when setup_document requested landscape. rhwp emits
+// landscape="WIDELY" for PORTRAIT docs too (the enum is not a reliable
+// orientation signal), so patchHwpxLandscape must gate on this actual request —
+// never on the enum — or it would flip every portrait .hwpx to landscape.
+let requestedLandscape = false;
+
 // Per-table outMargin overrides, in document (append_table) order. Each entry is
 // { before, after } in HWPUNIT (or null to use the default). patchHwpxTableOutMargin
 // consumes these in order so a caller can set spacing_before / spacing_after on an
@@ -908,6 +914,7 @@ const HANDLERS = {
     const pd = JSON.parse(doc.getPageDef(cursor.sec));
     if (op.orientation) {
       pd.landscape = String(op.orientation).toLowerCase() === "landscape";
+      requestedLandscape = pd.landscape;
     }
     if (op.page_size) {
       // HWPUNIT (1/7200 inch). Values match rhwp-studio's PAPER_DEFAULTS
@@ -2982,7 +2989,11 @@ async function patchHwpxCellHasMargin(filePath) {
 // landscape enum and lays the page out from width/height alone → it renders
 // portrait and wide content overflows the right edge. Force width > height (swap)
 // so the web viewer renders true landscape. This mirrors hwpx-edit's set_page_setup
-// (W>H is what Hancom honours). Portrait docs (no WIDELY, or already W>H) untouched.
+// (W>H is what Hancom honours).
+// CALLER MUST GATE on the actual landscape request (requestedLandscape): rhwp
+// stamps landscape="WIDELY" on PORTRAIT docs too, so this function does NOT look at
+// the enum — it just swaps any W<H page to W>H. Calling it on a portrait doc would
+// wrongly rotate it (regression fixed 2026-06-22).
 async function patchHwpxLandscape(filePath) {
   const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
   let total = 0;
@@ -2990,7 +3001,7 @@ async function patchHwpxLandscape(filePath) {
     if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
     let xml = await zip.file(name).async("string");
     const m = xml.match(/<hp:pagePr\b[^>]*?>/);
-    if (!m || !/landscape="WIDELY"/.test(m[0])) continue;
+    if (!m) continue;
     const w = Number((m[0].match(/\bwidth="(\d+)"/) || [])[1]);
     const h = Number((m[0].match(/\bheight="(\d+)"/) || [])[1]);
     if (w && h && w < h) {
@@ -3833,8 +3844,10 @@ async function readStdin() {
   }
 
   // Landscape: rhwp keeps portrait W<H even with landscape="WIDELY" → Hancom web
-  // renders portrait. Swap to W>H so it lays out landscape. See patchHwpxLandscape.
-  if (ext === ".hwpx") {
+  // renders portrait. Swap to W>H so it lays out landscape. ONLY when the caller
+  // actually requested landscape — rhwp stamps landscape="WIDELY" on portrait docs
+  // too, so gating on the enum would flip every portrait page. See patchHwpxLandscape.
+  if (ext === ".hwpx" && requestedLandscape) {
     try {
       const n = await patchHwpxLandscape(outPath);
       if (n > 0) log.push(`hwpx_patch: landscape page W↔H swap (Hancom-web orientation)`);
