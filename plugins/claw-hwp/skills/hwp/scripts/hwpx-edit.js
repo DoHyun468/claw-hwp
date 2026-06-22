@@ -3682,29 +3682,40 @@ function chartColorFill(color) {
   if (/^[0-9A-F]{6}$/.test(hex)) return `<a:solidFill><a:srgbClr val="${hex}"/></a:solidFill>`;
   return null; // unknown token → ignore, keep default palette
 }
-function serSpPr(color) {
+// `stroke` series (line/radar) carry colour in <a:ln> (GT chart-line-stroke-
+// schemeclr.hwpx), not a bare fill; fill series (bar/area/pie) use bare solidFill.
+function serSpPr(color, stroke) {
   const f = chartColorFill(color);
-  return f ? `<c:spPr>${f}</c:spPr>` : '<c:spPr/>';
+  if (!f) return '<c:spPr/>';
+  return stroke
+    ? `<c:spPr><a:ln w="28575" cap="flat" cmpd="sng" algn="ctr">${f}<a:prstDash val="solid"/><a:round/></a:ln></c:spPr>`
+    : `<c:spPr>${f}</c:spPr>`;
 }
 // Per-point (per-bar / per-slice) colour overrides via <c:dPt>. Used for pie
 // slices and for single-series bar/column charts that want each bar its own colour.
-function dPtXml(pointColors) {
+// `pie` → fuller dPt body (invertIfNegative/explosion) per GT chart-pie-dPt-schemeclr.
+function dPtXml(pointColors, pie) {
   if (!Array.isArray(pointColors) || !pointColors.length) return '';
   return pointColors.map((col, i) => {
     const f = chartColorFill(col);
-    return f ? `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${f}</c:spPr></c:dPt>` : '';
+    if (!f) return '';
+    const mid = pie
+      ? '<c:invertIfNegative val="0"/><c:bubble3D val="0"/><c:explosion val="0"/>'
+      : '<c:bubble3D val="0"/>';
+    return `<c:dPt><c:idx val="${i}"/>${mid}<c:spPr>${f}</c:spPr></c:dPt>`;
   }).join('');
 }
 // Standard series (cat + val): bar / line / area / radar / pie / doughnut.
-// `color` = whole-series fill; `pointColors` = per-point overrides (pie slices /
-// per-bar). Both optional — omitted → Hancom default palette (back-compat).
-function stdSer(idx, name, cat, values, explode, color, pointColors) {
+// `color` = whole-series colour (fill, or line stroke when `stroke`); `pointColors`
+// = per-point overrides (pie slices / per-bar). All optional — omitted → Hancom
+// default palette (back-compat). `pie` selects the pie-flavoured dPt body.
+function stdSer(idx, name, cat, values, explode, color, pointColors, stroke, pie) {
   const cl = colLetter(idx);
   return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>`
     + `<c:tx><c:strRef><c:f>Sheet1!$${cl}$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>${xmlEscape(name)}</c:v></c:pt></c:strCache></c:strRef></c:tx>`
-    + `${serSpPr(color)}<c:invertIfNegative val="0"/>`
+    + `${serSpPr(color, stroke)}<c:invertIfNegative val="0"/>`
     + (explode ? `<c:explosion val="25"/>` : '')
-    + dPtXml(pointColors)
+    + dPtXml(pointColors, pie)
     + `<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$${cat.length + 1}</c:f><c:strCache>${strCachePts(cat)}</c:strCache></c:strRef></c:cat>`
     + `<c:val><c:numRef><c:f>Sheet1!$${cl}$2:$${cl}$${values.length + 1}</c:f><c:numCache>${numCachePts(values)}</c:numCache></c:numRef></c:val>`
     + `</c:ser>`;
@@ -3745,10 +3756,12 @@ function buildChartSpace(spec, cat, series) {
       + valAxXml(ax1, 'b', ax2) + valAxXml(ax2, 'l', ax1);
   } else if (spec.pie) {
     const s0 = series[0];
-    plot = `<c:${spec.el}><c:varyColors val="1"/>${stdSer(0, s0.name, cat, s0.values, spec.explode, s0.color, s0.pointColors)}<c:firstSliceAng val="0"/>`
+    plot = `<c:${spec.el}><c:varyColors val="1"/>${stdSer(0, s0.name, cat, s0.values, spec.explode, s0.color, s0.pointColors, false, true)}<c:firstSliceAng val="0"/>`
       + (spec.hole != null ? `<c:holeSize val="${spec.hole}"/>` : '') + `</c:${spec.el}>`;
   } else {
-    const sers = series.map((s, i) => stdSer(i, s.name, cat, s.values, false, s.color, s.pointColors)).join('');
+    // line/radar render a stroke, not a fill — colour goes inside <a:ln>.
+    const stroke = spec.el === 'lineChart' || spec.el === 'radarChart' || !!spec.radar;
+    const sers = series.map((s, i) => stdSer(i, s.name, cat, s.values, false, s.color, s.pointColors, stroke, false)).join('');
     const horiz = spec.dir === 'bar';
     let inner = '';
     if (spec.dir) inner += `<c:barDir val="${spec.dir}"/>`;
