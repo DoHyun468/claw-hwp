@@ -4508,6 +4508,50 @@ function setGsoLikeChar(cluster, likeChar) {
   return cluster;
 }
 
+// Multi-chart-per-doc identity patch (GT: a Hancom 한컴독스 doc with two charts diffed
+// against the one-chart version). For each chart beyond the first, Hancom changes
+// exactly TWO bytes in the gso cluster: the gso CTRL_HEADER (tag 0x47, ' osg')
+// CommonObjAttr zOrder (INT32 @ body+24) and the SHAPE_COMPONENT_OLE (tag 0x54)
+// binDataID (u16 @ body+12). binDataID == the BIN_DATA storage ordinal N
+// (BIN000N.OLE); zOrder is prev+1 (0 for the first object). CommonObjAttr layout:
+// attr@4, yOff@8, xOff@12, w@16, h@20, zOrder@24, outerMargin@28..35, instanceId@36.
+// Hancom leaves instanceId@36 = 0 on BOTH charts (it needn't be unique when there's
+// no caption), and the PARA_HEADER instance_id likewise stays 0 — so only zOrder +
+// binDataID need patching on the template clusterHex; everything else is identical.
+function setChartClusterIds(cluster, binDataId, zOrder) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      if (sz >= 28) cluster.writeInt32LE(zOrder | 0, p + 24);           // CommonObjAttr zOrder
+    } else if (tag === 0x54) {                                          // SHAPE_COMPONENT_OLE
+      if (sz >= 14) cluster.writeUInt16LE(binDataId & 0xFFFF, p + 12);  // binDataID = storage ordinal
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Next gso zOrder = (max existing gso CTRL_HEADER zOrder @ body+24) + 1, or 0 when the
+// section has no drawing objects yet. Scans the inflated Section0 bytes so the new
+// chart stacks above every gso object already in the doc (charts, images, shapes),
+// matching how Hancom assigns zOrder sequentially per insertion.
+function nextGsoZOrder(raw) {
+  let p = 0, max = -1;
+  while (p + 4 <= raw.length) {
+    const h = raw.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = raw.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && raw.slice(p, p + 4).toString('latin1') === ' osg' && sz >= 28) {
+      max = Math.max(max, raw.readInt32LE(p + 24));
+    }
+    p += sz;
+  }
+  return max + 1;
+}
+
 // ── 개체 배치 (object placement / wrap) — unified across insert_* ops ─────────
 // One placement vocabulary shared with the HWPX track + set_object_property:
 //   wrap = inline (글자처럼, DEFAULT) | topbottom (자리차지) | square (어울림)
@@ -4732,22 +4776,14 @@ export async function insertChartInPlace(filePath, ops) {
     // hit this). Maximal compression keeps the mini footprint well under 128.
     if (oleBytes.length < 4096) oleBytes = deflateRawSync(Buffer.from(inflateRawSync(oleBytes)), { level: 9 });
 
-    // Reject if the doc already has BinData (storage-id remap not yet done).
-    {
-      const probe = readFileSync(filePath);
-      const pc = parseCfbHeader(probe);
-      const pf = readFat(probe, pc.fatAddrs, pc.ssz);
-      const pd = readDirectory(probe, pf, pc.ssz, pc.dirStart);
-      if (pd.entries.some((e) => e.type === 1 && e.name === 'BinData')) {
-        throw new Error('insert_chart: target already has a BinData folder — chart insert into docs with existing images/charts is not yet supported (use a clean document)');
-      }
-    }
-
-    // ── Step 1: CFB — create BinData folder + the OLE stream ───────────────
-    // CFB routes a stream by size: < 4096 B → mini-stream, else regular FAT.
-    // Hancom is strict about this (a small OLE forced into the regular FAT
-    // renders as a broken-object placeholder), so match the cutoff exactly —
-    // the bigger bar/line charts go regular, the smaller pie/doughnut go mini.
+    // ── Step 1: CFB — ensure BinData folder + add the BIN000N.OLE stream ───
+    // A clean doc → BIN0001.OLE; a doc that already holds chart/image BinData →
+    // the next free BIN000N.OLE (so a second chart no longer collides). CFB routes
+    // a stream by size: < 4096 B → mini-stream, else regular FAT. Hancom is strict
+    // about this (a small OLE forced into the regular FAT renders as a broken-object
+    // placeholder), so match the cutoff exactly — bigger bar/line charts go regular,
+    // smaller pie/doughnut go mini. GT (handoff gt 2-chart) confirms the multi-chart
+    // shape: append BIN000N + a 2nd BIN_DATA def (storage id N) + ID_MAPPINGS++.
     let buf = readFileSync(filePath);
     let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
     if (!mssz) mssz = MSSZ_DEFAULT_IMG;
@@ -4756,13 +4792,22 @@ export async function insertChartInPlace(filePath, ops) {
     let rootChain = walkChain(fat, dir.entries[0].start);
     let minifat = readMinifat(buf, fat, ssz, minifatStart);
 
-    const folderSlot = findUnusedDirSlot(dir.entries);
-    writeDirEntry(buf, dir.entries[folderSlot], 'BinData', 1, 0, 0);
-    insertEntryIntoTree(buf, dir.entries, 0, folderSlot);
-
+    let binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    if (binIdx < 0) {
+      ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+      dir = readDirectory(buf, fat, ssz, dirStart);
+      const folderSlot = findUnusedDirSlot(dir.entries);
+      if (folderSlot < 0) throw new Error('insert_chart: no free directory slot for the BinData folder');
+      writeDirEntry(buf, dir.entries[folderSlot], 'BinData', 1, 0, 0);
+      insertEntryIntoTree(buf, dir.entries, 0, folderSlot);
+    }
     dir = readDirectory(buf, fat, ssz, dirStart);
     rootChain = walkChain(fat, dir.entries[0].start);
-    let binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    const newName = pickFreeBinDataName(dir.entries, 'OLE');     // BIN000N.OLE (N = next free ordinal)
+    const storageId = parseInt(newName.match(/BIN(\d{4})\./)[1], 10);
+    ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
     const oleSlot = findUnusedDirSlot(dir.entries);
     if (oleSlot < 0) throw new Error('insert_chart: no free directory slot for the OLE stream');
 
@@ -4780,12 +4825,12 @@ export async function insertChartInPlace(filePath, ops) {
     }
     dir = readDirectory(buf, fat, ssz, dirStart);
     binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
-    writeDirEntry(buf, dir.entries[oleSlot], 'BIN0001.OLE', 2, oleStartSec, oleBytes.length, 0);
+    writeDirEntry(buf, dir.entries[oleSlot], newName, 2, oleStartSec, oleBytes.length, 0);
     insertEntryIntoTree(buf, dir.entries, binIdx, oleSlot);
     writeFileSync(filePath, buf);
 
-    // ── Step 2: DocInfo — one BIN_DATA def (attr 0x0002 = OLE storage) ─────
-    await addBinDataDefToDocInfo(filePath, 1, 'OLE', 0x0002);
+    // ── Step 2: DocInfo — BIN_DATA def (attr 0x0002 = OLE storage), storage id N ──
+    await addBinDataDefToDocInfo(filePath, storageId, 'OLE', 0x0002);
 
     // ── Step 3: Section0 — insert the chart cluster (one ole$ paragraph) ───
     {
@@ -4804,6 +4849,12 @@ export async function insertChartInPlace(filePath, ops) {
 
       const records = parseRecords(raw);
       const cluster = Buffer.from(tpl.clusterHex, 'hex');
+      // Stamp this chart's identity into the template cluster: binDataID = its storage
+      // ordinal N, zOrder = one past the section's current max gso zOrder. For the first
+      // chart these are 1 and 0 — the template's own values, so a no-op (byte-identical
+      // to the prior single-chart output). For a 2nd+ chart they make it reference
+      // BIN000N and stack above the existing object. (GT: handoff gt 2-chart.)
+      setChartClusterIds(cluster, storageId, nextGsoZOrder(raw));
       // Default to like-char so the chart reserves its height and surrounding
       // text flows above/below it (set op.float:true for the floating original).
       if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
@@ -4848,7 +4899,7 @@ export async function insertChartInPlace(filePath, ops) {
       writeFileSync(filePath, b2);
     }
 
-    summary.push({ section: 0, chart_type: type, ole: 'BinData/BIN0001.OLE' });
+    summary.push({ section: 0, chart_type: type, ole: `BinData/${newName}` });
   }
 
   const result = Object.assign([], summary);
