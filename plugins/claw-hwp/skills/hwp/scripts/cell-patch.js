@@ -4386,6 +4386,19 @@ function buildChartOleWithData(baseOleBytes, model, op) {
   let newXml = _icReadStream(cfb, hdr, fat, xEntry).toString('utf8');
   if (model) newXml = _chEditXml(newXml, model);
   if (op) newXml = _chApplyColors(newXml, op);
+  // Keep OOXMLChartContents a REGULAR inner-CFB stream (>= the 4096-byte mini-stream
+  // cutoff). Editing a 3-series template down to a single short-labelled series can
+  // shrink it just under 4096 (e.g. categories "Q1"/"a" → ~4085 B); the CFB then
+  // classifies it as a mini-stream while _icWriteOoxml still writes it into the
+  // regular FAT, and Hancom renders the whole chart OLE BLANK. Pad with an ignored
+  // XML comment so the byte length stays comfortably above the cutoff and the stream
+  // stays regular. (GT: render flips exactly at 4096 — 4095 B blank, 4097 B renders.)
+  const MIN_OOXML = 4160;
+  let xb = Buffer.byteLength(newXml, 'utf8');
+  if (xb < MIN_OOXML && newXml.indexOf('</c:chartSpace>') !== -1) {
+    const pad = '<!--' + ' '.repeat(Math.max(1, MIN_OOXML - xb - 7)) + '-->';
+    newXml = newXml.replace('</c:chartSpace>', pad + '</c:chartSpace>');
+  }
   cfb = _icWriteOoxml(cfb, newXml);
   const newInner = Buffer.alloc(4 + cfb.length); newInner.writeUInt32LE(cfb.length, 0); cfb.copy(newInner, 4);
   return deflateRawSync(newInner); // caller (insertChartInPlace) routes < 4096 B to the mini-stream
