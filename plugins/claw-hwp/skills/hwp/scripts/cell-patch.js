@@ -4713,39 +4713,17 @@ export async function insertChartInPlace(filePath, ops) {
         if (op.anchor && typeof op.anchor === 'string') {
           const ab = Buffer.from(op.anchor, 'utf16le');
           for (const c of clusters) { let hit = false; for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } } if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; } }
+        } else {
+          const t = findLastSimpleBodyParagraph(records);
+          insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
         }
-        // An inline (like-char) gso object in the document's TERMINAL paragraph
-        // does NOT render in Hancom web — GT (a chart inserted natively in Hancom,
-        // downloaded as .hwp) shows Hancom dodges this by anchoring its chart to a
-        // non-terminal paragraph and FLOATING it. We keep the chart inline, so the
-        // chart must never be the last paragraph while still landing at the END:
-        //   - trailing para already empty (e.g. the auto paragraph after a table) →
-        //     slot the chart in just above it; that empty para keeps the last role.
-        //   - trailing para has real content (the doc ends in a paragraph) → put the
-        //     chart at the TRUE end and append a fresh empty paragraph after it, so
-        //     the chart sits last (after the content) and the new empty para is
-        //     terminal. Without this the chart would render before the last line.
-        let trailing = Buffer.alloc(0);
-        const tail = findLastSimpleBodyParagraph(records);
-        const tailHeader = records[tail.startIdx];
-        const tailStart = tailHeader.headOff;
-        if (insertAt > tailStart) {
-          const tailCC = raw.readUInt32LE(tailHeader.dataOff) & 0x7FFFFFFF;
-          if (tailCC <= 1) {
-            insertAt = tailStart;
-          } else {
-            insertAt = tail.endIdx < records.length ? records[tail.endIdx].headOff : raw.length;
-            // An empty trailing paragraph in HWP is PARA_HEADER(line_segs=1) +
-            // PARA_CHAR_SHAPE + PARA_LINE_SEG — NOT a PARA_TEXT-with-EOP plain para
-            // (GT byte-compare: the natural trailing para after a table uses this
-            // line-seg form; the EOP-text form makes Hancom reject the file).
-            const eHdr = buildClonedParaHeader(tailHeader, raw, 1, false, pickFreshInstanceId(records, raw), 0, 1);
-            const eShp = buildSingleCharShapeRecord(records, raw, tail.startIdx, tail.endIdx, 1);
-            const eSeg = buildLineSegRecord(findAnyLineSegBody(records, raw), 1);
-            trailing = Buffer.concat([eHdr, eShp, eSeg]);
-          }
-        }
-        raw = Buffer.concat([raw.slice(0, insertAt), cluster, trailing, raw.slice(insertAt)]);
+        // The chart goes at the requested position (end when no anchor) — even the
+        // document's terminal paragraph renders fine now that inline charts carry
+        // the correct like-char attribute (TABLE_WRAP.inline = 0x1, matching Hancom's
+        // own floating→글자처럼 output and insert_image). The earlier 0x200001 bit-21
+        // was what made a terminal OLE chart render blank; no trailing-paragraph
+        // workaround is needed.
+        raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
         normalizeLastParaFlag(raw);
       }
 
@@ -7764,14 +7742,17 @@ const TABLE_OUTMARGIN_OFF = 28; // in-record offset of the 4 outer-margin u16s
 // (claw-hancomdocs table-cell-prop --page-split, .hwp download): none→0,
 // cell→1, table→2 (table == the default). 한컴 spec: 0 나누지않음 / 1 셀단위로나눔 / 2 나눔.
 const TABLE_PAGE_SPLIT = { none: 0, cell: 1, table: 2 };
-// Text-wrap / placement = bits in the table CTRL_HEADER attribute (offset 4).
-// GT-confirmed across all 5 modes (claw-hancomdocs table-cell-prop --table-wrap,
-// .hwp download): mask 0x600001 = bit0 (글자처럼 취급 / like-char) + bits 21-22
-// (wrap mode). Only the attribute changes (record size unchanged, no position
-// record added). inline keeps the like-char bit; the rest float with a 2-bit
-// wrap mode (square 00 / topbottom 01 / behind 10 / front 11).
+// Text-wrap / placement = bits in the gso/table CTRL_HEADER attribute (offset 4).
+// mask 0x600001 = bit0 (글자처럼 취급 / like-char) + bits 21-22 (float wrap mode).
+// inline (글자처럼) = ONLY the like-char bit (0x1); the wrap-mode bits stay 0 because
+// an inline object doesn't wrap text. The float modes clear like-char and set the
+// 2-bit wrap (square 00 / topbottom 01 / behind 10 / front 11).
+// ⚠️ inline was 0x200001 (like-char + an errant topbottom bit) — GT (a chart set to
+// 글자처럼 in Hancom + downloaded, and insert_image's $pic) both encode inline as a
+// bare 0x1. The stray bit 21 made a terminal-paragraph OLE chart render blank; 0x1
+// renders everywhere (verified). Only the attribute changes (record size unchanged).
 const TABLE_WRAP_MASK = 0x600001;
-const TABLE_WRAP = { inline: 0x200001, square: 0x0, topbottom: 0x200000, behind: 0x400000, front: 0x600000 };
+const TABLE_WRAP = { inline: 0x1, square: 0x0, topbottom: 0x200000, behind: 0x400000, front: 0x600000 };
 
 // Each table = its CTRL_HEADER (" lbt", outer margin) + the TABLE record (0x4d,
 // rows/cols/attr) that follows it. Return both so one op can patch either.
