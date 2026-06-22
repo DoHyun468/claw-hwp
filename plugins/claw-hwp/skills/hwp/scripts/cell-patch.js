@@ -4352,11 +4352,18 @@ function _chApplyColors(xml, op) {
     const b = xml.indexOf('</c:ser>', a) + 8;
     out += xml.slice(cur, a);
     let ser = xml.slice(a, b);
+    // Build <c:dPt> per-point colour blocks and splice them in at their schema
+    // position — right before <c:cat> (dPt precedes cat/val in a <c:ser>).
+    const mkDpts = (arr) => arr.map((c, i) => { const f = _chColorFill(c); return f ? `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${f}</c:spPr></c:dPt>` : ''; }).join('');
+    const insertDpt = (s, dpts) => { const ci = s.indexOf('<c:cat>'); const vi = s.indexOf('<c:val>'); const at = ci >= 0 ? ci : (vi >= 0 ? vi : -1); return at >= 0 ? s.slice(0, at) + dpts + s.slice(at) : (SPPR.test(s) ? s.replace(SPPR, (m) => m + dpts) : insertAfterTx(s, dpts)); };
     if (isPie) {
       // Pie/doughnut: one series, one colour per slice (point_colors > colors).
-      const slice = pointColors || colors || (single ? [single] : []);
-      const dpts = slice.map((c, i) => { const f = _chColorFill(c); return f ? `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${f}</c:spPr></c:dPt>` : ''; }).join('');
-      if (dpts) ser = SPPR.test(ser) ? ser.replace(SPPR, (m) => m + dpts) : insertAfterTx(ser, dpts);
+      const dpts = mkDpts(pointColors || colors || (single ? [single] : []));
+      if (dpts) ser = insertDpt(ser, dpts);
+    } else if (pointColors) {
+      // Per-bar / per-point gradient on the FIRST series (single-series bar/area →
+      // theme gradient, like the HWPX reference). Each data point gets its own <c:dPt>.
+      if (si === 0) { const dpts = mkDpts(pointColors); if (dpts) ser = insertDpt(ser, dpts); }
     } else {
       const col = colors ? colors[si % colors.length] : single;
       const f = _chColorFill(col);
