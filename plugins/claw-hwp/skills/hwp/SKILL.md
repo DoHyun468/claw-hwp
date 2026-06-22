@@ -152,6 +152,24 @@ echo '{
 
 Errors come back as `{"status": "error", "message": "...", "op_index": N}`. Always read the JSON to confirm — exit code 0 even on op-level failures isn't guaranteed.
 
+**Document theme (optional, top-level `theme` field).** Set a visual identity once instead of repeating colours/fonts on every op — add `"theme": "<name>"` beside `"path"`/`"operations"`. Five built-ins:
+
+| theme | 느낌 | 본문 글꼴 | 제목 글꼴 |
+|----|----|----|----|
+| `government` (기본) | 정부·공문서, 회색 제목 | 함초롬바탕 | 함초롬바탕 |
+| `corporate` | 기업·비즈니스, 네이비 제목 | 맑은 고딕 | 맑은 고딕 |
+| `modern` | 모던·테크, 블루 | Pretendard | Pretendard SemiBold |
+| `clean` | 클린·미니멀, 틸 | 해피니스 산스 레귤러 | 해피니스 산스 볼드 |
+| `warm` | 따뜻한·문화, 오렌지 | Apple SD 산돌고딕 Neo | HY헤드라인M |
+
+Omitting `theme` = `government` (unchanged default). A theme sets only heading colours + body/heading fonts; font sizes and spacing stay the same. Per-op `color` / `font_family` and per-run styling always win over the theme.
+
+**Extra themes from `themes/*.md`** — beyond the 5 built-ins, 10 more (converted from Anthropic's theme-factory, re-fonted to the Hancom A-set) load by name from the `themes/` folder: `ocean-depths`, `sunset-boulevard`, `forest-canopy`, `modern-minimalist`, `golden-hour`, `arctic-frost`, `desert-rose`, `tech-innovation`, `botanical-garden`, `midnight-galaxy`. Pass any of these as `theme`. To add your own, drop a `themes/<name>.md` with frontmatter `name / label / bodyFont / headingFont / headingColor / accent` (fonts must be from the A-set to render on Hancom web).
+
+Fine-tune without defining a whole theme via the top-level `theme_overrides` object — `{ "bodyFont": "...", "headingFont": "...", "accent": "#RRGGBB", "headingColors": { "1": "#RRGGBB", "2": "#RRGGBB", ... }, "headerFill": "#RRGGBB" }`. Use it when the user gives specific colour/font feedback (e.g. "제목을 진한 파랑으로", "본문은 굴림으로"); set just the fields you want to change. `headerFill` = 표 머리행 배경색(전체).
+
+All five themes use only render-confirmed fonts (see the **`font_family`** note below for which fonts render where). Theme colours/fonts take effect when **building a new document** (payload starts with `setup_document`); for in-place edits of an existing form, append ops stay plain text (same as the heading-styling limitation noted below).
+
 **Op vocabulary** (grouped by purpose):
 
 *Creation / appending content (used while building a doc top-down):*

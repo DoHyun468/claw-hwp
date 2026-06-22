@@ -465,19 +465,247 @@ const HEADING_DEFAULTS = {
   // got pushed to next pages with empty bottom space. Frontend §5(k) #1+#3
   // fixes (single-<text> merge, scale removal) should make natural values
   // visible enough now. spacer paragraphs supplement vertical breathing.
-  1: { fontSize: 18,   color: "#1A1A1A", spacingBefore: 1300, spacingAfter: 800 },
-  2: { fontSize: 14,   color: "#2D2D2D", spacingBefore: 1000, spacingAfter: 600 },
-  3: { fontSize: 12,   color: "#404040", spacingBefore: 800,  spacingAfter: 500 },
-  4: { fontSize: 11,   color: "#595959", spacingBefore: 600,  spacingAfter: 400 },
-  5: { fontSize: 10.5, color: "#595959", spacingBefore: 500,  spacingAfter: 350 },
-  6: { fontSize: 10,   color: "#595959", spacingBefore: 450,  spacingAfter: 300 },
+  // Bumped 2026-06-17: 1300/800 read as "모자라" (insufficient) on Hancom — a
+  // section heading needs a clear band above it and breathing room to its body.
+  // Values kept byte-identical to the HWPX track (shared §B default spec) so the
+  // rhwp builder emits the same spacing whether serialized to .hwp or .hwpx.
+  1: { fontSize: 18,   color: "#1A1A1A", spacingBefore: 2200, spacingAfter: 1100 },
+  2: { fontSize: 14,   color: "#2D2D2D", spacingBefore: 1700, spacingAfter: 900 },
+  3: { fontSize: 12,   color: "#404040", spacingBefore: 1400, spacingAfter: 750 },
+  4: { fontSize: 11,   color: "#595959", spacingBefore: 1100, spacingAfter: 600 },
+  5: { fontSize: 10.5, color: "#595959", spacingBefore: 900,  spacingAfter: 520 },
+  6: { fontSize: 10,   color: "#595959", spacingBefore: 800,  spacingAfter: 450 },
 };
 
-// Body line spacing 130% (rhwp default 160% is too airy). Heading 115% tighter.
-const BODY_LINE_SPACING = 130;
-const HEADING_LINE_SPACING = 115;
-// Body paragraph trailing gap (natural HWP value).
-const BODY_SPACING_AFTER = 600;
+// Body line spacing. 130% read as 빽빽 (cramped) on Hancom once the version.xml
+// xmlVersion 1.2→1.5 fix stopped paraPr margins from being halved; 150% gives a
+// report comfortable line rhythm without the 160% rhwp-default airiness.
+const BODY_LINE_SPACING = 150;
+const HEADING_LINE_SPACING = 120;
+// List items: a touch tighter than body line spacing, clearly separated from
+// each other (LIST_SPACING_AFTER ≈ 2.5mm) but grouped as a list.
+const LIST_LINE_SPACING = 140;
+const LIST_SPACING_AFTER = 700;
+// Body paragraph trailing gap. 600 HWPUNIT (~2.1mm) read as "packed" on Hancom web
+// (the title↔section gap at 1300 looked right), so use ~1000 (~3.5mm) for a clear
+// but not airy para↔para rhythm.
+const BODY_SPACING_AFTER = 1000;
+
+// Table cell inner margin. GT-confirmed (2026-06-21, hancomdocs capture A/B vs
+// the HWPX track): Hancom-web's .hwp renderer ignores the PER-CELL inner margin
+// and lays out cell content/height from the TABLE record's DEFAULT inMargin
+// instead. rhwp emits that default as left/right=510, top/bottom=141 → rows
+// render cramped no matter what padding we set on the cells. Post-export we set
+// the TABLE inMargin to 400 on ALL FOUR sides — byte-identical to the HWPX
+// track's <hp:cellMargin left/right/top/bottom="400"> (hasMargin=1) — so our
+// .hwp tables render with the same breathing room AND the same horizontal
+// padding. See setTableInMarginInPlace(). Per-cell paddings (append_table) are
+// kept at the same 400 so desktop Hancom (which honors per-cell) matches too.
+const TABLE_DEFAULT_INNER_MARGIN = 400;
+
+// Table outer BOTTOM margin (gap below a table). GT-matched to the HWPX track's
+// <hp:outMargin bottom="500"> (~10px). rhwp emits 283 (~1mm, ~5px) by default and
+// Hancom-web ignores the host paragraph's spacingAfter for a table-only paragraph,
+// so this is raw-patched into the table CTRL_HEADER post-export (see
+// setTableInMarginInPlace). Unscaled — it's a table-object attribute, not a paraPr
+// margin. Env override for empirical re-derivation only.
+const TABLE_OUTER_BOTTOM_MARGIN = Number(process.env.TABLE_OUTER_BOTTOM ?? 500);
+
+// .hwp paragraph-spacing render-match factor. GT-confirmed (2026-06-21, hancomdocs
+// capture A/B vs the HWPX track): the shared spacing constants above (HEADING_DEFAULTS,
+// BODY/LIST_SPACING_AFTER) are byte-identical to the HWPX track, but the two tracks
+// SERIALIZE them differently. The HWPX track wraps every paraPr margin in an
+// <hp:switch> whose rendered branch (<hp:default>) carries the constant scaled by
+// 0.7056 (e.g. H1 2200→1552, body-after 1000→706); Hancom-web renders that branch, so
+// a .hwpx heading sits ~0.7× as far from its neighbour as the raw constant would imply.
+// Our .hwp path writes the constant straight into PARA_SHAPE (1.0×), so an identical
+// document renders consistently LOOSER (+~7px per heading gap, ~+40px over a one-page
+// report). To land the SAME render we apply the same 0.7056 scale at the one chokepoint
+// where every heading/body/list margin reaches rhwp — WITHOUT editing the shared
+// constants (keeps the byte-identical merge surface intact, exactly like the HWPX track
+// keeps its constants raw and scales only on export). Applies to spacingBefore/After
+// only — lineSpacing is a PERCENT, identical in both tracks, and must stay unscaled.
+// Env overrides SCALE_BEFORE / SCALE_AFTER / SCALE_HEADING_AFTER are for empirical
+// re-derivation only; the defaults below are the locked values.
+// Empirically (band-for-band A/B vs the HWPX render): scaling EVERY before/after
+// margin uniformly by 0.7056 lands 14 of 16 row gaps exactly on the HWPX render, but
+// the body paragraph that immediately FOLLOWS a heading then sits too far below it.
+// That boundary is governed by the heading's spacingAfter, and because paragraphs
+// snapToGrid (="1", same as the HWPX track) it quantises NON-monotonically — shrinking
+// the heading's spacingAfter pushes the next body line down to a further grid line, so
+// the gap grows instead of shrinking. So spacingAfter on HEADINGS is left effectively
+// unscaled (it already lands ~right at 1.0×); everything else (all spacingBefore, plus
+// body/list/title spacingAfter) takes the 0.7056 render-match factor. Splitting the two
+// keeps all 16 gaps on the HWPX render. None of this touches the shared constants.
+const SCALE_BEFORE = Number(process.env.SCALE_BEFORE ?? 0.7056);
+const SCALE_AFTER = Number(process.env.SCALE_AFTER ?? 0.7056);
+const SCALE_HEADING_AFTER = Number(process.env.SCALE_HEADING_AFTER ?? 1.0);
+const scaleBy = (v, f) => (v == null ? v : Math.round(v * f));
+
+// ── Themes (heading colour + font) — shared with the HWPX track ──────────────
+// Ported byte-identical from the HWPX track (create.js is a shared file). Only the
+// rhwp-emit application (append_heading/paragraph colour+font via applyCharFormat →
+// binary CharShape) is used on the .hwp path; the .hwpx post-export patchers
+// (patchHwpxHeadings / patchHwpxTableHeaderFill …) are NOT part of the .hwp route.
+const THEMES = {
+  government: {
+    label: "정부·공문서 (회색, 기본값)",
+    bodyFont: null,
+    headingFont: null,
+    headingColors: {
+      1: HEADING_DEFAULTS[1].color, 2: HEADING_DEFAULTS[2].color,
+      3: HEADING_DEFAULTS[3].color, 4: HEADING_DEFAULTS[4].color,
+      5: HEADING_DEFAULTS[5].color, 6: HEADING_DEFAULTS[6].color,
+    },
+    accent: "#1F3864",
+    headerFill: "#EAEAEA",   // 표 머리행 회색(사용자 선호, 유지). 타 테마는 헤딩색 틴트 자동.
+  },
+  corporate: {
+    label: "기업·비즈니스 (네이비)",
+    bodyFont: "맑은 고딕",
+    headingFont: "맑은 고딕",
+    headingColors: {
+      1: "#304D68", 2: "#405E7A", 3: "#496888",
+      4: "#5A7A9E", 5: "#5A7A9E", 6: "#5A7A9E",
+    },
+    accent: "#1F4E79",
+  },
+  modern: {
+    label: "모던·테크 (블루)",
+    bodyFont: "Pretendard",
+    headingFont: "Pretendard SemiBold",
+    headingColors: {
+      1: "#212836", 2: "#1F2937", 3: "#374151",
+      4: "#4B5563", 5: "#4B5563", 6: "#4B5563",
+    },
+    accent: "#2563EB",
+  },
+  clean: {
+    label: "클린·미니멀 (틸)",
+    bodyFont: "해피니스 산스 레귤러",
+    headingFont: "해피니스 산스 볼드",
+    headingColors: {
+      1: "#1F2638", 2: "#1E293B", 3: "#334155",
+      4: "#475569", 5: "#475569", 6: "#475569",
+    },
+    accent: "#0F766E",
+  },
+  warm: {
+    label: "따뜻한·문화 (오렌지)",
+    bodyFont: "Apple SD 산돌고딕 Neo",
+    headingFont: "HY헤드라인M",
+    headingColors: {
+      1: "#382B21", 2: "#4F3C2D", 3: "#5E4433",
+      4: "#7C5A3E", 5: "#7C5A3E", 6: "#7C5A3E",
+    },
+    accent: "#C2410C",
+  },
+};
+
+// The theme in force for the current run; resolved once from the payload before
+// the op loop. Defaults to government so any code path that runs before
+// resolveTheme() (or a payload that omits `theme`) behaves exactly as before.
+let activeTheme = THEMES.government;
+
+// Load a converted theme from themes/<name>.md (the borrowed Anthropic
+// theme-factory set, re-fonted to the Hancom A-set). frontmatter → activeTheme
+// shape; the single headingColor fills all six heading levels. Returns null if
+// the file is missing/malformed so resolveTheme can fall back cleanly.
+const THEMES_DIR = path.join(__dirname, "..", "themes");
+function loadThemeFile(name) {
+  if (!/^[a-z0-9-]+$/i.test(String(name || ""))) return null;
+  const p = path.join(THEMES_DIR, `${name}.md`);
+  if (!fs.existsSync(p)) return null;
+  const m = /^---\s*\n([\s\S]*?)\n---/.exec(fs.readFileSync(p, "utf8"));
+  if (!m) return null;
+  const fm = {};
+  for (const line of m[1].split("\n")) {
+    const mm = /^([A-Za-z]+):\s*"?(.*?)"?\s*$/.exec(line);
+    if (mm) fm[mm[1]] = mm[2];
+  }
+  if (!fm.name) return null;
+  const hc = normalizeHexColor(fm.headingColor || "#1A1A1A");
+  return {
+    label: fm.label || name,
+    bodyFont: fm.bodyFont || null,
+    headingFont: fm.headingFont || null,
+    headingColors: { 1: hc, 2: hc, 3: hc, 4: hc, 5: hc, 6: hc },
+    accent: fm.accent ? normalizeHexColor(fm.accent) : "#1F3864",
+  };
+}
+
+// Derive a pale table-header fill from a heading colour: keep the hue, cap chroma
+// (한글다운 muted), force a light L so a colored-but-subtle band reads under dark
+// header text. Neutral source (government #1A1A1A) → light gray. So each theme's
+// 표 머리행 takes its own tint (docx-style) instead of a fixed gray.
+function tintColor(hex, light = 0.86, satCap = 0.34) {
+  const h = String(hex || "#1A1A1A").replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16) / 255, g = parseInt(h.slice(2, 4), 16) / 255, b = parseInt(h.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l0 = (max + min) / 2;
+  let hue = 0, s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l0 > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) hue = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) hue = (b - r) / d + 2;
+    else hue = (r - g) / d + 4;
+    hue /= 6;
+  }
+  const S = Math.min(s, satCap), L = light;
+  const hue2rgb = (p, q, t) => { if (t < 0) t += 1; if (t > 1) t -= 1; if (t < 1 / 6) return p + (q - p) * 6 * t; if (t < 1 / 2) return q; if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6; return p; };
+  let R, G, B;
+  if (S === 0) { R = G = B = L; }
+  else { const q = L < 0.5 ? L * (1 + S) : L + S - L * S; const p = 2 * L - q; R = hue2rgb(p, q, hue + 1 / 3); G = hue2rgb(p, q, hue); B = hue2rgb(p, q, hue - 1 / 3); }
+  const to2 = (x) => Math.round(x * 255).toString(16).padStart(2, "0").toUpperCase();
+  return `#${to2(R)}${to2(G)}${to2(B)}`;
+}
+
+// Resolve the active theme from the payload. Unknown `theme` names fall back to
+// government with a logged note (a typo must never abort a document). The
+// optional `theme_overrides` object deep-patches the chosen theme — bodyFont /
+// headingFont / accent / headingColors{level:hex} — so a caller can tweak the
+// look without defining a whole theme. Returns a fresh object; THEMES is never
+// mutated.
+function resolveTheme(payload, log) {
+  const name = payload.theme;
+  let base = THEMES.government;
+  if (name != null) {
+    if (THEMES[name]) base = THEMES[name];
+    else {
+      const loaded = loadThemeFile(name);
+      if (loaded) base = loaded;
+      else if (log) log.push(`theme '${name}' unknown — using 'government'. Valid: ${Object.keys(THEMES).join(", ")} + themes/*.md`);
+    }
+  }
+  const theme = { ...base, headingColors: { ...base.headingColors } };
+  const ov = payload.theme_overrides;
+  if (ov && typeof ov === "object") {
+    if (ov.bodyFont != null) theme.bodyFont = ov.bodyFont;
+    if (ov.headingFont != null) theme.headingFont = ov.headingFont;
+    if (ov.accent != null) theme.accent = ov.accent;
+    if (ov.headingColors && typeof ov.headingColors === "object") {
+      for (const k of Object.keys(ov.headingColors)) theme.headingColors[k] = ov.headingColors[k];
+    }
+    if (log) log.push(`theme_overrides applied (${Object.keys(ov).join(", ")})`);
+  }
+  // 표 머리행 채움색: 명시값(government 회색) 우선, 없으면 헤딩 L1 색에서 연한 틴트 파생.
+  // theme_overrides.headerFill 로 직접 지정 가능.
+  theme.headerFill = (ov && ov.headerFill) ? normalizeHexColor(ov.headerFill)
+    : (base.headerFill ?? tintColor(theme.headingColors[1] || "#1A1A1A"));
+  return theme;
+}
+
+// Resolve the active theme's font for a role ('body' | 'heading') to a
+// broadcast fontIds[7] on the supplied props object, registering the face in
+// DocInfo if needed. No-op when the theme leaves that role's font null
+// (government). Per-run / per-op fontIds set elsewhere still take precedence
+// because buildCharFormatProps prefers input.fontIds over defaults.fontIds.
+function themeFontIds(doc, role) {
+  const name = role === "heading" ? activeTheme.headingFont : activeTheme.bodyFont;
+  if (!name) return null;
+  const id = doc.findOrCreateFontId(String(name));
+  return id >= 0 ? Array(7).fill(id) : null;
+}
 
 function applyParaProps(doc, cursor, opts = {}) {
   // Apply paragraph-level properties: alignment + line spacing + before/after.
@@ -513,8 +741,10 @@ function applyParaProps(doc, cursor, opts = {}) {
     // re-apply default fill on the next paragraph if it matters.
   };
   if (opts.lineSpacing != null) props.lineSpacing = opts.lineSpacing;
-  if (opts.spacingBefore != null) props.spacingBefore = opts.spacingBefore;
-  if (opts.spacingAfter != null) props.spacingAfter = opts.spacingAfter;
+  if (opts.spacingBefore != null) props.spacingBefore = scaleBy(opts.spacingBefore, SCALE_BEFORE);
+  if (opts.spacingAfter != null) {
+    props.spacingAfter = scaleBy(opts.spacingAfter, opts.isHeading ? SCALE_HEADING_AFTER : SCALE_AFTER);
+  }
   unwrap(
     doc.applyParaFormat(cursor.sec, cursor.para, JSON.stringify(props)),
     "applyParaFormat(props)",
@@ -625,7 +855,10 @@ const HANDLERS = {
     const runs = Array.isArray(op.runs) && op.runs.length > 0
       ? op.runs
       : parseInlineRuns(op.text ?? "");
-    writeRunsAt(doc, cursor, runs);
+    const bDefaults = {};
+    const bFontIds = themeFontIds(doc, "body");
+    if (bFontIds) bDefaults.fontIds = bFontIds;
+    writeRunsAt(doc, cursor, runs, bDefaults);
     applyParaProps(doc, cursor, {
       align: op.align,
       lineSpacing: op.line_spacing ?? BODY_LINE_SPACING,
@@ -717,11 +950,19 @@ const HANDLERS = {
       ? op.runs
       : parseInlineRuns(op.text || "");
     const heightHU = Math.round(def.fontSize * 100);
-    writeRunsAt(doc, cursor, runs, {
+    // Theme controls colour + font; HEADING_DEFAULTS still owns size/spacing.
+    // A per-op `color` overrides the theme. On the .hwp path the colour/font go
+    // straight into the binary CharShape via rhwp applyCharFormat (no post-export
+    // patcher needed — that's the .hwpx-only route).
+    const headingColor = op.color ? normalizeHexColor(op.color) : (activeTheme.headingColors[level] ?? def.color);
+    const headingDefaults = {
       fontSize: heightHU,
       bold: true,
-      color: def.color,
-    });
+      color: headingColor,
+    };
+    const hFontIds = themeFontIds(doc, "heading");
+    if (hFontIds) headingDefaults.fontIds = hFontIds;
+    writeRunsAt(doc, cursor, runs, headingDefaults);
     headingPatches.push({
       paraIdx: cursor.para,
       heightHU,
@@ -734,6 +975,7 @@ const HANDLERS = {
       lineSpacing: HEADING_LINE_SPACING,
       spacingBefore: def.spacingBefore,
       spacingAfter: def.spacingAfter,
+      isHeading: true,
     });
     applyParaBorders(doc, cursor, op);
     log.push(`append_heading L${level} (${cursor.charOffset} chars)`);
@@ -806,8 +1048,12 @@ const HANDLERS = {
     // single-key calls didn't. This is the same recipe.
     const DEFAULT_BORDER = { type: 1, width: 1, color: "#000000" };
     const HEADER_BG = "#EAEAEA";   // soft Office-style header gray
-    const HEADER_PAD = 600;        // ~2.1mm vertical — taller header row
-    const BODY_PAD = 400;          // ~1.4mm — generous breathing room (vs default 141)
+    // Per-cell inner margin, uniform on all four sides — byte-identical to the
+    // HWPX track's <hp:cellMargin left/right/top/bottom="400">. This is what
+    // Hancom DESKTOP honors; Hancom WEB uses the TABLE default instead, which
+    // setTableInMarginInPlace() sets to the same 400 post-export. (Header rows
+    // are still distinguished by the gray fill + borders below, not by height.)
+    const CELL_PAD = TABLE_DEFAULT_INNER_MARGIN;  // 400
     // createTableEx ignores per-column colWidths in the rhwp build we use:
     // header row 0 ends up with width=1 (≈0cm) and body rows get total/cols
     // evenly distributed regardless of the colWidths argument. Reapplying
@@ -829,10 +1075,10 @@ const HANDLERS = {
         // Cell properties — width (override createTableEx's broken
         // distribution) + padding + (header only) borders & fill.
         const cellProps = {
-          paddingTop: isHeader ? HEADER_PAD : BODY_PAD,
-          paddingBottom: isHeader ? HEADER_PAD : BODY_PAD,
-          paddingLeft: 510,
-          paddingRight: 510,
+          paddingTop: CELL_PAD,
+          paddingBottom: CELL_PAD,
+          paddingLeft: CELL_PAD,
+          paddingRight: CELL_PAD,
         };
         if (colWidthsHwp) cellProps.width = colWidthsHwp[c];
         if (isHeader) {
@@ -928,6 +1174,11 @@ const HANDLERS = {
     //   a page (next paragraphs evaluate separately). Diagnosed via
     //   getPageRenderTree y-positions on a 3-table doc — page 2 had ~570pt
     //   empty bottom while a 150pt table waited on page 3.
+    // The gap BELOW the table is NOT set here: Hancom-web ignores the host
+    // paragraph's spacingAfter when the paragraph holds a table (verified — 500
+    // landed in the bytes but the render didn't budge). It's governed by the
+    // table object's outer BOTTOM margin instead, which setTableInMarginInPlace()
+    // raw-patches post-export to match the HWPX track. So keep both 0 here.
     try {
       doc.applyParaFormat(
         cursor.sec, tableParaIdx,
@@ -1051,13 +1302,17 @@ const HANDLERS = {
       const prefix = "• ";
       startNewParagraph(doc, cursor);
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
-      writeRunsAt(doc, cursor, runs);
-      // Tighter spacing for list items — 100 HWPUNIT after = ~0.35mm.
+      const liDefaults = {};
+      const liFontIds = themeFontIds(doc, "body");
+      if (liFontIds) liDefaults.fontIds = liFontIds;
+      writeRunsAt(doc, cursor, runs, liDefaults);
+      // List items breathe between each other but stay tighter than body
+      // paragraphs (700 HWPUNIT after ≈ 2.5mm) — 100 (≈0.35mm) read as packed.
       applyParaProps(doc, cursor, {
         align: "left",
-        lineSpacing: 120,
+        lineSpacing: LIST_LINE_SPACING,
         spacingBefore: 0,
-        spacingAfter: 100,
+        spacingAfter: LIST_SPACING_AFTER,
       });
     }
     log.push(`append_bullet_list (${items.length} items)`);
@@ -1070,12 +1325,15 @@ const HANDLERS = {
       const prefix = `${idx + 1}. `;
       startNewParagraph(doc, cursor);
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
-      writeRunsAt(doc, cursor, runs);
+      const liDefaults = {};
+      const liFontIds = themeFontIds(doc, "body");
+      if (liFontIds) liDefaults.fontIds = liFontIds;
+      writeRunsAt(doc, cursor, runs, liDefaults);
       applyParaProps(doc, cursor, {
         align: "left",
-        lineSpacing: 120,
+        lineSpacing: LIST_LINE_SPACING,
         spacingBefore: 0,
-        spacingAfter: 100,
+        spacingAfter: LIST_SPACING_AFTER,
       });
     });
     log.push(`append_numbered_list (${items.length} items)`);
@@ -1130,6 +1388,19 @@ const HANDLERS = {
     );
     // Refresh cursor after picture insertion.
     cursor.charOffset = doc.getParagraphLength(cursor.sec, cursor.para);
+    // Image paragraph spacing + alignment — kept identical to the HWPX track's
+    // append_image so a picture renders the same in .hwp and .hwpx: CENTER by
+    // default (a report figure reads centered; without this the host paragraph
+    // inherits the previous paragraph's justify and the image pins to the left
+    // margin), with the body trailing gap below it. spacingAfter takes the same
+    // 0.7056 render scale as body paragraphs via applyParaProps (1000→706),
+    // matching HWPX's exported value; the gap ABOVE comes from the preceding
+    // paragraph's spacingAfter (so spacingBefore stays 0).
+    applyParaProps(doc, cursor, {
+      align: op.align ?? "center",
+      spacingBefore: op.spacing_before ?? 0,
+      spacingAfter: op.spacing_after ?? BODY_SPACING_AFTER,
+    });
     // Record the position so the hwpx post-export patcher can inject a
     // matching <hp:pic> node here. binaryItemIDRef follows rhwp's BinData/
     // numbering which is 1-based by insertion order.
@@ -2167,6 +2438,156 @@ function stripHwpLayoutCache(filePath) {
   return totalDropped;
 }
 
+// GT-confirmed table-spacing fix (see TABLE_DEFAULT_INNER_MARGIN +
+// TABLE_OUTER_BOTTOM_MARGIN). Two raw-patches per table: (1) the TABLE record's
+// default inner margin → `margin` on all 4 sides (cell roominess / HWPX-matched
+// padding); (2) the table CTRL_HEADER's outer BOTTOM margin → `outerBottom` (gap
+// below the table — Hancom-web ignores the host paragraph's spacingAfter, so this
+// table-object margin is the only lever, matching HWPX's <hp:outMargin bottom>).
+// True in-place raw-patch: parse the CFB ourselves and overwrite the compressed
+// Section stream within its existing sector chain — NEVER CFB.write (injects the
+// sheetjs Sh33tJ5 marker Hancom rejects, the reason stripHwpLayoutCache above is
+// disabled). Best-effort: any section that would grow past its allocated chain is
+// left untouched (the re-deflate delta is a few bytes, so this ~never happens).
+function setTableInMarginInPlace(filePath, margin, outerBottom) {
+  const buf = fs.readFileSync(filePath); // mutated in place, then written back
+  // --- minimal CFB structural parse (read-only; no sheetjs write path) ---
+  const ssz = 1 << buf.readUInt16LE(30);
+  const mssz = 1 << buf.readUInt16LE(32);
+  const miniCutoff = buf.readUInt32LE(56);
+  const dirStart = buf.readUInt32LE(48);
+  const miniFatStart = buf.readUInt32LE(60);
+  const sect = (n) => 512 + n * ssz;
+  const difat = [];
+  for (let i = 0; i < 109; i++) {
+    const v = buf.readUInt32LE(76 + i * 4);
+    if (v < 0xFFFFFFFE) difat.push(v);
+  }
+  const FAT = [];
+  for (const f of difat) {
+    const base = sect(f);
+    for (let i = 0; i < ssz / 4; i++) FAT.push(buf.readUInt32LE(base + i * 4));
+  }
+  const chain = (start) => {
+    const out = []; let s = start, g = 0;
+    while (s !== 0xFFFFFFFE && s < 0xFFFFFFF0 && g++ < 1e6) { out.push(s); s = FAT[s]; }
+    return out;
+  };
+  const dirSectors = chain(dirStart);
+  const perDir = ssz / 128;
+  const dirEntry = (i) => sect(dirSectors[Math.floor(i / perDir)]) + (i % perDir) * 128;
+  const entName = (o) => {
+    const len = buf.readUInt16LE(o + 64); let s = "";
+    for (let i = 0; i < len / 2 - 1; i++) s += String.fromCharCode(buf.readUInt16LE(o + i * 2));
+    return s;
+  };
+  let rootOff = null;
+  const sections = [];
+  for (let i = 0; i < dirSectors.length * perDir; i++) {
+    const o = dirEntry(i);
+    const t = buf[o + 66];
+    if (!t) continue;
+    if (t === 5) rootOff = o;
+    if (/^Section\d+$/.test(entName(o))) sections.push(o);
+  }
+  if (rootOff == null || sections.length === 0) return 0;
+  // Section compression follows the global FileHeader flag (byte 36, bit 0).
+  // CFB.read here is read-only — the banned path is CFB.write, not CFB.read.
+  let compressed = true;
+  try {
+    const fhc = CFB.find(CFB.read(buf, { type: "buffer" }), "/FileHeader");
+    if (fhc) compressed = (Buffer.from(fhc.content)[36] & 1) === 1;
+  } catch { /* default to compressed */ }
+  // mini-stream plumbing (only needed for streams below the mini cutoff)
+  let miniFat = [], rootChain = [], miniOff = null;
+  const buildMini = () => {
+    if (miniOff) return;
+    const mf = chain(miniFatStart);
+    const mb = Buffer.alloc(mf.length * ssz);
+    mf.forEach((x, i) => buf.copy(mb, i * ssz, sect(x), sect(x) + ssz));
+    for (let i = 0; i < mb.length / 4; i++) miniFat.push(mb.readUInt32LE(i * 4));
+    rootChain = chain(buf.readUInt32LE(rootOff + 116));
+    miniOff = (mi) => sect(rootChain[Math.floor(mi / (ssz / mssz))]) + (mi % (ssz / mssz)) * mssz;
+  };
+  const miniChain = (start) => {
+    const out = []; let s = start, g = 0;
+    while (s !== 0xFFFFFFFE && s < 0xFFFFFFF0 && g++ < 1e6) { out.push(s); s = miniFat[s]; }
+    return out;
+  };
+  const readChain = (offs, unit, size) => {
+    const o = Buffer.alloc(offs.length * unit);
+    offs.forEach((dst, i) => buf.copy(o, i * unit, dst, dst + unit));
+    return o.slice(0, size);
+  };
+  let patched = 0;
+  for (const secOff of sections) {
+    const secSize = buf.readUInt32LE(secOff + 120);
+    const secStart = buf.readUInt32LE(secOff + 116);
+    if (secSize === 0) continue;
+    const inMini = secSize < miniCutoff;
+    let sectorOffs;
+    if (inMini) { buildMini(); sectorOffs = miniChain(secStart).map(miniOff); }
+    else sectorOffs = chain(secStart).map(sect);
+    const unit = inMini ? mssz : ssz;
+    const comp = readChain(sectorOffs, unit, secSize);
+    let data;
+    try { data = compressed ? zlib.inflateRawSync(comp) : comp; }
+    catch { continue; }
+    // walk records; patch two things per table:
+    //  (1) TABLE (tag 0x4D) inMargin → `margin` on all 4 sides (left@10, right@12,
+    //      top@14, bottom@16, INT16) — the cell inner margin / row roominess.
+    //  (2) the table's CTRL_HEADER (tag 0x47, ctrlId "tbl ") outer BOTTOM margin
+    //      → `outerBottom`. The host paragraph's spacingAfter is IGNORED by
+    //      Hancom-web for a table-only paragraph, so the gap below a table is
+    //      governed by the table object's own outer margin (the .hwp analog of
+    //      HWPX's <hp:outMargin bottom="500">). rhwp emits the 4 outer margins
+    //      (left@28/right@30/top@32/bottom@34, INT16) as 283 (~1mm) → ~5px below
+    //      the table; HWPX uses 500 → ~10px. We bump ONLY the bottom (top already
+    //      matches via the preceding paragraph's spacingAfter), and only when all
+    //      four read the rhwp 283 default — that confirms the offset and skips any
+    //      non-default layout (e.g. treat-as-char tables) rather than risk a clobber.
+    let off = 0, tablesHit = 0, ctrlHit = 0;
+    while (off + 4 <= data.length) {
+      const h = data.readUInt32LE(off);
+      const tag = h & 0x3FF;
+      let size = (h >>> 20) & 0xFFF, hl = 4;
+      if (size === 0xFFF) { size = data.readUInt32LE(off + 4); hl = 8; }
+      if (tag === 0x4D && size >= 18) {
+        const d = off + hl;
+        let changed = false;
+        for (const o of [10, 12, 14, 16]) {
+          if (data.readInt16LE(d + o) !== margin) { data.writeInt16LE(margin, d + o); changed = true; }
+        }
+        if (changed) tablesHit++;
+      } else if (tag === 0x47 && size >= 36 && outerBottom != null) {
+        const d = off + hl;
+        // ctrlId is stored reversed: bytes ' lbt' == "tbl "
+        const isTbl = data[d] === 0x20 && data[d + 1] === 0x6C && data[d + 2] === 0x62 && data[d + 3] === 0x74;
+        const om = [28, 30, 32, 34];
+        if (isTbl && om.every((o) => data.readInt16LE(d + o) === 283)) {
+          if (data.readInt16LE(d + 34) !== outerBottom) { data.writeInt16LE(outerBottom, d + 34); ctrlHit++; }
+        }
+      }
+      off += hl + size;
+    }
+    if (tablesHit === 0 && ctrlHit === 0) continue;
+    const newComp = compressed ? zlib.deflateRawSync(data, { level: 9 }) : data;
+    const capacity = sectorOffs.length * unit;
+    if (newComp.length > capacity) continue; // would grow the chain — skip (best-effort)
+    for (let i = 0; i < sectorOffs.length; i++) {
+      const dst = sectorOffs[i];
+      for (let j = 0; j < unit; j++) {
+        const di = i * unit + j;
+        buf[dst + j] = di < newComp.length ? newComp[di] : 0;
+      }
+    }
+    buf.writeUInt32LE(newComp.length, secOff + 120);
+    patched += tablesHit + ctrlHit;
+  }
+  if (patched > 0) fs.writeFileSync(filePath, buf);
+  return patched;
+}
+
 async function readStdin() {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -2189,6 +2610,11 @@ async function readStdin() {
 
   const outPath = payload.path;
   const ops = payload.operations || [];
+  // Resolve the run's theme (heading colour + font) from the payload before the
+  // op loop. Defaults to government; unknown names fall back with a logged note.
+  // Applies to the from-scratch / rhwp-emit path (append_*); raw-patch ops keep
+  // the existing document's styling.
+  activeTheme = resolveTheme(payload, log);
   if (!outPath) {
     process.stdout.write(JSON.stringify({ status: "error", message: "'path' is required" }) + "\n");
     process.exit(1);
@@ -3025,6 +3451,20 @@ async function readStdin() {
   // placeholder values rhwp emits still cause our local renderer to
   // mis-place text occasionally, but that's a renderer concern not a
   // save-path one. See CLAUDE.md for the principle.
+
+  // .hwp table-spacing fix (raw-patch, no CFB.write): (1) every TABLE record's
+  // default inner margin → 400 on all 4 sides (cell roominess + HWPX-matched
+  // horizontal padding — Hancom-web lays out from the table default, not per-cell);
+  // (2) each table CTRL_HEADER's outer BOTTOM margin → 500 so the gap below the
+  // table matches the HWPX track (~10px). See setTableInMarginInPlace().
+  if (ext === ".hwp") {
+    try {
+      const n = setTableInMarginInPlace(outPath, TABLE_DEFAULT_INNER_MARGIN, TABLE_OUTER_BOTTOM_MARGIN);
+      if (n > 0) log.push(`hwp_patch: ${n} table margin field(s) → inMargin ${TABLE_DEFAULT_INNER_MARGIN} (4 sides) + outer-bottom ${TABLE_OUTER_BOTTOM_MARGIN} (HWPX-matched)`);
+    } catch (err) {
+      log.push(`hwp_table_margin_patch failed: ${err.message}`);
+    }
+  }
 
   let verify = null;
   try {
