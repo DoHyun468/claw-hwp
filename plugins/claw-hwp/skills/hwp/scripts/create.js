@@ -2977,6 +2977,35 @@ async function patchHwpxCellHasMargin(filePath) {
   return total;
 }
 
+// Landscape fix. rhwp exports a landscape page as <hp:pagePr landscape="WIDELY">
+// but KEEPS the portrait dimensions (width < height). Hancom Docs web ignores the
+// landscape enum and lays the page out from width/height alone → it renders
+// portrait and wide content overflows the right edge. Force width > height (swap)
+// so the web viewer renders true landscape. This mirrors hwpx-edit's set_page_setup
+// (W>H is what Hancom honours). Portrait docs (no WIDELY, or already W>H) untouched.
+async function patchHwpxLandscape(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  let total = 0;
+  for (const name of Object.keys(zip.files)) {
+    if (!/^Contents\/section\d+\.xml$/.test(name)) continue;
+    let xml = await zip.file(name).async("string");
+    const m = xml.match(/<hp:pagePr\b[^>]*?>/);
+    if (!m || !/landscape="WIDELY"/.test(m[0])) continue;
+    const w = Number((m[0].match(/\bwidth="(\d+)"/) || [])[1]);
+    const h = Number((m[0].match(/\bheight="(\d+)"/) || [])[1]);
+    if (w && h && w < h) {
+      const tag = m[0].replace(/\bwidth="\d+"/, `width="${h}"`).replace(/\bheight="\d+"/, `height="${w}"`);
+      xml = xml.replace(m[0], tag);
+      zip.file(name, xml);
+      total++;
+    }
+  }
+  if (total > 0) {
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return total;
+}
+
 // Inject the header-row gray shade that rhwp's setCellProperties silently drops.
 // rhwp builds the header cell's BorderFill (4 solid borders) from our JSON but
 // serializes an EMPTY <hc:fillBrush> — the fill color (#EAEAEA) never reaches the
@@ -3800,6 +3829,17 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: ${n} cell hasMargin 0→1 (honor cellMargin)`);
     } catch (err) {
       log.push(`hwpx_cellhasmargin_patch failed: ${err.message}`);
+    }
+  }
+
+  // Landscape: rhwp keeps portrait W<H even with landscape="WIDELY" → Hancom web
+  // renders portrait. Swap to W>H so it lays out landscape. See patchHwpxLandscape.
+  if (ext === ".hwpx") {
+    try {
+      const n = await patchHwpxLandscape(outPath);
+      if (n > 0) log.push(`hwpx_patch: landscape page W↔H swap (Hancom-web orientation)`);
+    } catch (err) {
+      log.push(`hwpx_landscape_patch failed: ${err.message}`);
     }
   }
 
