@@ -4713,7 +4713,18 @@ export async function insertChartInPlace(filePath, ops) {
         if (op.anchor && typeof op.anchor === 'string') {
           const ab = Buffer.from(op.anchor, 'utf16le');
           for (const c of clusters) { let hit = false; for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } } if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; } }
-        } else { const t = findLastSimpleBodyParagraph(records); insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length; }
+        }
+        // Never leave the chart in the document's TERMINAL paragraph: an inline
+        // (like-char) gso object in the final paragraph does NOT render in Hancom
+        // web — GT (a chart inserted natively in Hancom, downloaded as .hwp) shows
+        // Hancom dodges this by anchoring its chart to a non-terminal paragraph and
+        // FLOATING it. We keep the chart inline, so instead clamp the insert point
+        // to BEFORE the trailing simple paragraph: the chart slots in just above it
+        // and that paragraph keeps the last-paragraph role. Fixes the no-anchor /
+        // unmatched-anchor case (chart appended at end → was the last para → blank).
+        const tail = findLastSimpleBodyParagraph(records);
+        const tailStart = records[tail.startIdx].headOff;
+        if (insertAt > tailStart) insertAt = tailStart;
         raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
         normalizeLastParaFlag(raw);
       }
