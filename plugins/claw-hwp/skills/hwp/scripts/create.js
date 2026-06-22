@@ -982,8 +982,17 @@ const HANDLERS = {
   },
 
   append_table(doc, op, cursor) {
-    const headers = op.headers || [];
-    const rows = op.rows || [];
+    let headers = op.headers || [];
+    let rows = op.rows || [];
+    // Auto-promote the first row to a header (theme tint + bold borders) when the
+    // caller gave only `rows` and didn't opt out — cold agents often put the
+    // header labels in rows[0], which would otherwise render as a plain white
+    // first row. `no_header:true` keeps a pure data/layout table header-less.
+    // Same safety net as the HWPX track (shared append_table).
+    if (headers.length === 0 && rows.length > 0 && !op.no_header) {
+      headers = rows[0];
+      rows = rows.slice(1);
+    }
     const cols = headers.length || (rows[0] ? rows[0].length : 0);
     if (cols === 0) throw new Error("append_table: need headers or non-empty rows");
     const totalRows = (headers.length ? 1 : 0) + rows.length;
@@ -1047,7 +1056,12 @@ const HANDLERS = {
     // together with fill, which is why their UI works and our earlier
     // single-key calls didn't. This is the same recipe.
     const DEFAULT_BORDER = { type: 1, width: 1, color: "#000000" };
-    const HEADER_BG = "#EAEAEA";   // soft Office-style header gray
+    // 머리행 채움색: 호출자(LLM)가 op.header_fill 로 자유 지정 > 테마 파생 틴트
+    // (헤딩 L1 색의 연한 톤; government 은 회색 #EAEAEA) > 회색 폴백. 연한 배경 +
+    // 검은 글자 컨벤션(한컴에 잘 맞음 — docx식 진한 배경+흰 글자 아님). .hwp 는
+    // rhwp setCellProperties(fillColor/patternColor) 가 셀 fill 을 바이너리에 직접
+    // 써서 렌더되므로 .hwpx 의 winBrush 후처리(patchHwpxTableHeaderFill)는 불필요.
+    const HEADER_BG = op.header_fill ? normalizeHexColor(op.header_fill) : (activeTheme.headerFill || "#EAEAEA");
     // Per-cell inner margin, uniform on all four sides — byte-identical to the
     // HWPX track's <hp:cellMargin left/right/top/bottom="400">. This is what
     // Hancom DESKTOP honors; Hancom WEB uses the TABLE default instead, which

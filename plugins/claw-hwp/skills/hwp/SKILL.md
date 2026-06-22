@@ -170,6 +170,8 @@ Fine-tune without defining a whole theme via the top-level `theme_overrides` obj
 
 All five themes use only render-confirmed fonts (see the **`font_family`** note below for which fonts render where). Theme colours/fonts take effect when **building a new document** (payload starts with `setup_document`); for in-place edits of an existing form, append ops stay plain text (same as the heading-styling limitation noted below).
 
+> **표 머리행 색 (새 문서 빌드 전용)** — 표를 만들면 **첫 행이 자동으로 머리행**이 되어 테마색 연한 틴트 + 굵게로 칠해진다(정부=회색, 그 외=헤딩색에서 파생한 연한 톤; 연한 배경 + 검은 글자가 한컴에 잘 맞는다 — docx식 진한 배경+흰 글자가 아님). 머리글은 `headers`로 넘기는 게 정석이고, `rows`에만 넣어도 `rows[0]`이 자동으로 머리행 승격된다. 색을 바꾸려면 `header_fill:"#RRGGBB"`(연한 톤 권장, 검은 글자 가독). 머리글이 없는 순수 데이터/레이아웃 표만 `no_header:true`로 끈다. ⚠️ 이 자동 틴트는 **새 문서 빌드**(payload가 `setup_document`로 시작)에만 적용된다 — 사용자가 준 **기존 양식/템플릿을 편집**할 땐 원본 표 스타일을 그대로 보존하고 머리행 색을 강제하지 않는다.
+
 **Op vocabulary** (grouped by purpose):
 
 *Creation / appending content (used while building a doc top-down):*
