@@ -61,6 +61,7 @@ op들이 **이미 템플릿 스타일을 물려받게** 설계돼 있다. 새 �
 | 표 (배치) | 래퍼 문단 prev=0 → 표 위 간격 = 앞 요소.after + 1.8mm = **제목→표 ≈ 제목→글**(이중간격 방지). 표 아래→다음 제목 = 그 제목 위 여백(`outMargin.bottom` 적응). 사방 대칭이라 본문 사이에 끼어도 균형. 이중 너비·연한 테두리·**머리행 테마색 틴트** | | | |
 | 표 (머리행 색) | — | — | **연한 틴트 + 검은 글자**(한컴에 잘 맞음 — docx식 진한 배경+흰 글자 아님). 기본 = **테마색 연한 틴트**(정부 #EAEAEA 회색, 그 외 헤딩색에서 `tintColor` 파생). **항상 보장**: `append_table`가 `headers` 없이 와도 `rows[0]`을 머리행으로 **자동 승격**(`no_header:true`면 끔)해 흰색 누수 차단. **LLM이 색 자유 지정**: 표별 `append_table {header_fill:"#hex"}` / 문서 전체 `theme_overrides.headerFill`. ⚠️ rhwp가 셀 fill을 빈 `<hc:fillBrush>`로 떨궈 후처리(`patchHwpxTableHeaderFill`, row-0 전용 borderFill에 winBrush 재주입, 표별 색 문서순 매핑)로 살림. 이 자동 틴트는 **새 빌드 전용** — 기존 템플릿 편집 땐 원본 보존. | |
 | **객체(이미지·차트·도형·수식)** | inline(treatAsChar=1, 자기 줄) | 세로 간격은 자기 문단 줄간격이 처리 | outMargin: 차트 2.5mm, 이미지·도형 0, 수식 양옆 0.2mm (제각각이나 inline이라 무방) | |
+| 그림 (`append_image` 문단) | — | — | **그림 문단 자체 = before 0 / after 본문 3.5mm(`BODY_SPACING_AFTER`) + 가운데 정렬** 기본(`applyParaProps`). `spacing_before`/`spacing_after`/`align`로 덮어쓰기. 객체 outMargin은 0이라 세로 간격은 전적으로 이 문단 margin이 만듦 → 본문 사이에 끼어도 위아래가 균형. | |
 | 용지/여백 | A4, 상하좌우 ~20mm (`setup_document`) | | | |
 
 → 정리: **본문 150% 줄간격 + 문단 뒤 3.5mm**, **제목은 120% 줄간격 + 레벨별 앞 큰 간격(L1 7.8 / L2 6mm)
