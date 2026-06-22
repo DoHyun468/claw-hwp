@@ -4714,18 +4714,38 @@ export async function insertChartInPlace(filePath, ops) {
           const ab = Buffer.from(op.anchor, 'utf16le');
           for (const c of clusters) { let hit = false; for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } } if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; } }
         }
-        // Never leave the chart in the document's TERMINAL paragraph: an inline
-        // (like-char) gso object in the final paragraph does NOT render in Hancom
-        // web — GT (a chart inserted natively in Hancom, downloaded as .hwp) shows
-        // Hancom dodges this by anchoring its chart to a non-terminal paragraph and
-        // FLOATING it. We keep the chart inline, so instead clamp the insert point
-        // to BEFORE the trailing simple paragraph: the chart slots in just above it
-        // and that paragraph keeps the last-paragraph role. Fixes the no-anchor /
-        // unmatched-anchor case (chart appended at end → was the last para → blank).
+        // An inline (like-char) gso object in the document's TERMINAL paragraph
+        // does NOT render in Hancom web — GT (a chart inserted natively in Hancom,
+        // downloaded as .hwp) shows Hancom dodges this by anchoring its chart to a
+        // non-terminal paragraph and FLOATING it. We keep the chart inline, so the
+        // chart must never be the last paragraph while still landing at the END:
+        //   - trailing para already empty (e.g. the auto paragraph after a table) →
+        //     slot the chart in just above it; that empty para keeps the last role.
+        //   - trailing para has real content (the doc ends in a paragraph) → put the
+        //     chart at the TRUE end and append a fresh empty paragraph after it, so
+        //     the chart sits last (after the content) and the new empty para is
+        //     terminal. Without this the chart would render before the last line.
+        let trailing = Buffer.alloc(0);
         const tail = findLastSimpleBodyParagraph(records);
-        const tailStart = records[tail.startIdx].headOff;
-        if (insertAt > tailStart) insertAt = tailStart;
-        raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+        const tailHeader = records[tail.startIdx];
+        const tailStart = tailHeader.headOff;
+        if (insertAt > tailStart) {
+          const tailCC = raw.readUInt32LE(tailHeader.dataOff) & 0x7FFFFFFF;
+          if (tailCC <= 1) {
+            insertAt = tailStart;
+          } else {
+            insertAt = tail.endIdx < records.length ? records[tail.endIdx].headOff : raw.length;
+            // An empty trailing paragraph in HWP is PARA_HEADER(line_segs=1) +
+            // PARA_CHAR_SHAPE + PARA_LINE_SEG — NOT a PARA_TEXT-with-EOP plain para
+            // (GT byte-compare: the natural trailing para after a table uses this
+            // line-seg form; the EOP-text form makes Hancom reject the file).
+            const eHdr = buildClonedParaHeader(tailHeader, raw, 1, false, pickFreshInstanceId(records, raw), 0, 1);
+            const eShp = buildSingleCharShapeRecord(records, raw, tail.startIdx, tail.endIdx, 1);
+            const eSeg = buildLineSegRecord(findAnyLineSegBody(records, raw), 1);
+            trailing = Buffer.concat([eHdr, eShp, eSeg]);
+          }
+        }
+        raw = Buffer.concat([raw.slice(0, insertAt), cluster, trailing, raw.slice(insertAt)]);
         normalizeLastParaFlag(raw);
       }
 
