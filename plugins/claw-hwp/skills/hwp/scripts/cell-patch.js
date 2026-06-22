@@ -4308,12 +4308,77 @@ function _icWriteOoxml(cfb, newXml) {
   let p = 0; for (const sec of full) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(buf, off, p, p + n); if (n < ssz) buf.fill(0, off + Math.max(0, n), off + ssz); p += n; }
   buf.writeUInt32LE(data.length, entryOff + 120); return buf;
 }
-function buildChartOleWithData(baseOleBytes, model) {
+// ── chart series / point colour (theme matching) ─────────────────────────
+// Inject colour into the OOXMLChartContents, mirroring the HWPX track's
+// buildChartSpace colour model so .hwp and .hwpx charts match a document theme
+// the same way. Hancom stores the colour differently per chart family (verified,
+// GT in handoff/shared/gt/chart-*-schemeclr.hwpx):
+//   - fill families (bar/area/scatter/bubble): bare <a:solidFill> in <c:spPr>
+//   - stroke families (line/radar): <a:solidFill> inside <a:ln> (a bare fill
+//     leaves the stroke colour unchanged)
+//   - pie/doughnut: one series, colour each slice via <c:dPt>
+// accent1-6 → <a:schemeClr> (Hancom's built-in chart palette); #RRGGBB →
+// <a:srgbClr> (literal — use this to MATCH a document theme colour).
+function _chColorFill(c) {
+  const s = String(c == null ? '' : c).trim();
+  if (/^accent[1-6]$/i.test(s)) return `<a:solidFill><a:schemeClr val="${s.toLowerCase()}"/></a:solidFill>`;
+  const hex = s.replace(/^#/, '').toUpperCase();
+  if (/^[0-9A-F]{6}$/.test(hex)) return `<a:solidFill><a:srgbClr val="${hex}"/></a:solidFill>`;
+  return null; // unrecognised → leave the template colour
+}
+function _chApplyColors(xml, op) {
+  const colors = Array.isArray(op.colors) && op.colors.length ? op.colors.map(String) : null;
+  const single = (op.color != null) ? String(op.color) : null;
+  const pointColors = Array.isArray(op.point_colors) && op.point_colors.length ? op.point_colors.map(String) : null;
+  if (!colors && !single && !pointColors) return xml;
+  const famM = xml.match(/<c:(\w+)Chart>/);           // bar, line, pie, bar3D, area3D, …
+  const famRaw = famM ? famM[1].toLowerCase() : 'bar';
+  const isStroke = /^(line|radar)/.test(famRaw);      // colour goes in <a:ln>, not a bare fill
+  const isPie = /^(pie|doughnut|ofpie)/.test(famRaw); // one series, colour each slice via <c:dPt>
+  // The series-level spPr — empty self-closing (bar/area templates), a populated
+  // one (rare), or ABSENT (line templates: tx → marker → cat, no spPr). When
+  // absent we INSERT one right after </c:tx> (its schema position, before marker).
+  const SPPR = /<c:spPr\/>|<c:spPr>[\s\S]*?<\/c:spPr>/;
+  const insertAfterTx = (ser, frag) => {
+    const i = ser.indexOf('</c:tx>');
+    if (i >= 0) return ser.slice(0, i + 7) + frag + ser.slice(i + 7);
+    return ser.replace(/(<c:order val="\d+"\/>)/, (m) => m + frag);
+  };
+  const putSpPr = (ser, spPrXml) => SPPR.test(ser) ? ser.replace(SPPR, spPrXml) : insertAfterTx(ser, spPrXml);
+  let out = '', cur = 0, si = 0;
+  for (;;) {
+    const a = xml.indexOf('<c:ser>', cur);
+    if (a < 0) { out += xml.slice(cur); break; }
+    const b = xml.indexOf('</c:ser>', a) + 8;
+    out += xml.slice(cur, a);
+    let ser = xml.slice(a, b);
+    if (isPie) {
+      // Pie/doughnut: one series, one colour per slice (point_colors > colors).
+      const slice = pointColors || colors || (single ? [single] : []);
+      const dpts = slice.map((c, i) => { const f = _chColorFill(c); return f ? `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${f}</c:spPr></c:dPt>` : ''; }).join('');
+      if (dpts) ser = SPPR.test(ser) ? ser.replace(SPPR, (m) => m + dpts) : insertAfterTx(ser, dpts);
+    } else {
+      const col = colors ? colors[si % colors.length] : single;
+      const f = _chColorFill(col);
+      if (f) {
+        const spPr = isStroke
+          ? `<c:spPr><a:ln w="28575" cap="flat" cmpd="sng" algn="ctr">${f}<a:prstDash val="solid"/><a:round/></a:ln></c:spPr>`
+          : `<c:spPr>${f}</c:spPr>`;
+        ser = putSpPr(ser, spPr);
+      }
+    }
+    out += ser; cur = b; si++;
+  }
+  return out;
+}
+function buildChartOleWithData(baseOleBytes, model, op) {
   const inner = Buffer.from(inflateRawSync(baseOleBytes));
   let cfb = Buffer.from(inner.slice(4));
   const hdr = _icHdr(cfb); const fat = _icFat(cfb, hdr.difat, hdr.ssz);
   const xEntry = _icFindEntry(cfb, hdr, fat, 'OOXMLChartContents'); if (xEntry < 0) throw new Error('chart data edit: OLE has no OOXMLChartContents');
-  const newXml = _chEditXml(_icReadStream(cfb, hdr, fat, xEntry).toString('utf8'), model);
+  let newXml = _icReadStream(cfb, hdr, fat, xEntry).toString('utf8');
+  if (model) newXml = _chEditXml(newXml, model);
+  if (op) newXml = _chApplyColors(newXml, op);
   cfb = _icWriteOoxml(cfb, newXml);
   const newInner = Buffer.alloc(4 + cfb.length); newInner.writeUInt32LE(cfb.length, 0); cfb.copy(newInner, 4);
   return deflateRawSync(newInner); // caller (insertChartInPlace) routes < 4096 B to the mini-stream
@@ -4553,7 +4618,8 @@ export async function insertChartInPlace(filePath, ops) {
 
     // Optional rows/cols/data editing — edit the OOXMLChartContents in the OLE.
     const dataModel = buildChartDataModel(op);
-    if (dataModel) oleBytes = buildChartOleWithData(oleBytes, dataModel);
+    const hasColor = (Array.isArray(op.colors) && op.colors.length > 0) || op.color != null || (Array.isArray(op.point_colors) && op.point_colors.length > 0);
+    if (dataModel || hasColor) oleBytes = buildChartOleWithData(oleBytes, dataModel, op);
 
     // A sub-4096 OLE goes in the mini-stream (below). Re-deflate it at max
     // compression first: a mini-stream that exactly fills a 128-entry mini-FAT
