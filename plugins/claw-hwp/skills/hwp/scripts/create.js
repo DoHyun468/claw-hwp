@@ -2774,6 +2774,8 @@ async function readStdin() {
   // keep it floating instead of the default like-char placement. Clean docs
   // only for now. See cell-patch.js insertChartInPlace.
   const CHART_OPS = new Set(['insert_chart']);
+  // 객체 삭제 (그림·차트·도형) — gso 제거 + BinData 리넘버링 (raw-patch). See cell-patch.js deleteObjectInPlace.
+  const DELETE_OBJECT_OPS = new Set(['delete_object']);
   // 수식 (equation) — raw-patch into an existing doc / table cell (EQEDIT "deqe"
   // control). op fields: script (Hancom equation source), anchor, or
   // cell:{row,col,para?,control?} to drop it inside a cell (centered). NOTE:
@@ -2809,7 +2811,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS, ...EQUATION_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS, ...DELETE_OBJECT_OPS, ...EQUATION_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -3166,6 +3168,15 @@ async function readStdin() {
         const chSummary = await insertChartInPlace(outPath, chartOps);
         subModes.push(`chart:${chSummary.mode || 'in-place'}`);
         for (const e of chSummary) allEdits.push({ kind: 'chart', ...e });
+      }
+      const deleteObjOps = ops.filter((o) => DELETE_OBJECT_OPS.has(o.type));
+      if (deleteObjOps.length > 0) {
+        const { deleteObjectInPlace } = await import('./cell-patch.js');
+        // Delete highest index first so a delete never shifts a later target's index.
+        const ordered = [...deleteObjOps].sort((a, b) => (b.index ?? 0) - (a.index ?? 0));
+        const delSummary = await deleteObjectInPlace(outPath, ordered);
+        subModes.push(`delete_object:${delSummary.mode || 'in-place'}`);
+        for (const e of delSummary) allEdits.push({ kind: 'delete_object', ...e });
       }
       const equationOps = ops.filter((o) => EQUATION_OPS.has(o.type));
       if (equationOps.length > 0) {

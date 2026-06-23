@@ -4990,6 +4990,125 @@ export async function insertChartInPlace(filePath, ops) {
   return result;
 }
 
+// ── delete a floating object (image / chart / shape) — raw-patch ──────────
+// Removes the targeted gso object completely. For BinData-backed objects
+// (images/charts) it then shifts every higher storage id down by 1 so the
+// BIN_DATA defs / stream pointers / gso binDataIDs stay contiguous: Hancom Docs
+// resolves a binDataID by position, so leaving a gap renders the higher objects
+// as broken-image placeholders (GT: claw-hancomdocs delete renumbers; the gap
+// case is render-confirmed broken, the renumbered case render-confirmed clean).
+// CFB streams are NOT renamed or removed (no red-black-tree surgery): the
+// dir-entry chain pointers among BIN000{S..N} are rotated so each name serves the
+// next object's bytes, the deleted object's bytes are zeroed, and BIN000N is left
+// as a harmless orphan (no def references it). op.index = 0-based gso ordinal in
+// document order (find_objects / extract order). To delete several, sort indices
+// descending — each delete re-reads the file and shifts lower indices.
+const PIC_BINID_OFF = 71;   // HWPTAG_SHAPE_COMPONENT_PICTURE (0x55) binItem id (u16)
+const OLE_BINID_OFF = 12;   // HWPTAG_SHAPE_COMPONENT_OLE (0x54) binData id (u16)
+function gsoBinIdOffset(raw, recs, gsoRecIdx) {
+  const lvl = recs[gsoRecIdx].level;
+  for (let j = gsoRecIdx + 1; j < recs.length && recs[j].level > lvl; j++) {
+    const r = recs[j];
+    if (r.tag === 0x55 && r.size >= PIC_BINID_OFF + 2) return r.dataOff + PIC_BINID_OFF;
+    if (r.tag === 0x54 && r.size >= OLE_BINID_OFF + 2) return r.dataOff + OLE_BINID_OFF;
+  }
+  return -1; // shape / non-BinData object
+}
+const _isGso = (buf, r) => r.tag === TAG_CTRL_HEADER && buf.slice(r.dataOff, r.dataOff + 4).toString('latin1') === ' osg';
+// read+inflate, mutate, deflate+write one CFB stream in place (mini or regular)
+function _rewriteStream(filePath, pathParts, mutate) {
+  let b2 = readFileSync(filePath);
+  const h = parseCfbHeader(b2);
+  let f2 = readFat(b2, h.fatAddrs, h.ssz);
+  const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+  let mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+  const ent = findStreamEntry(entries, pathParts);
+  const inMini = ent.size < 4096;
+  const rc = walkChain(f2, entries[0].start);
+  let chain = inMini ? walkChain(mf2, ent.start) : walkChain(f2, ent.start);
+  const comp = inMini ? readMiniChainBytes(b2, chain, rc, h.ssz, h.mssz, ent.size) : readChainBytes(b2, chain, h.ssz, ent.size);
+  const out = mutate(Buffer.from(inflateRawSync(comp)));
+  let newComp;
+  if (inMini) {
+    const e = deflateMiniChainWithExpansion({ buf: b2, ssz: h.ssz, mssz: h.mssz, fat: f2, fatAddrs: h.fatAddrs, minifat: mf2, minifatStart: h.minifatStart, rootChain: rc, rootEntry: entries[0] }, out, chain);
+    b2 = e.buf; newComp = e.compressed;
+    if (e.promoted) { writeChainBytes(b2, e.newRegularChain, h.ssz, newComp); b2.writeInt32LE(e.newRegularChain[0], ent.entryFileOffset + 0x74); }
+    else writeMiniChainBytes(b2, e.miniChain, e.rootChain, h.ssz, h.mssz, newComp);
+  } else {
+    const e = deflateAndFitWithExpansion(out, chain.length * h.ssz, h.ssz, f2, h.fatAddrs, chain, b2, false);
+    b2 = e.buf; newComp = e.compressed; writeChainBytes(b2, e.chain, h.ssz, newComp);
+  }
+  b2.writeUInt32LE(newComp.length, ent.entryFileOffset + 0x78);
+  b2.writeUInt32LE(0, ent.entryFileOffset + 0x7C);
+  writeFileSync(filePath, b2);
+}
+
+export async function deleteObjectInPlace(filePath, ops) {
+  const summary = [];
+  for (const op of ops) {
+    const targetIndex = Number.isInteger(op.index) ? op.index : 0;
+    let delId = null;
+
+    // ── Step 1: Section0 — drop gso #targetIndex's paragraph, shift higher gso ids ──
+    _rewriteStream(filePath, ['BodyText', 'Section0'], (raw) => {
+      const recs = parseRecords(raw);
+      let seen = -1, gi = -1;
+      for (let i = 0; i < recs.length; i++) if (_isGso(raw, recs[i])) { seen++; if (seen === targetIndex) { gi = i; break; } }
+      if (gi < 0) throw new Error(`delete_object: object index ${targetIndex} not found (${seen + 1} object(s))`);
+      const bidOff = gsoBinIdOffset(raw, recs, gi);
+      delId = bidOff >= 0 ? raw.readUInt16LE(bidOff) : null;
+      let a = gi; while (a > 0 && !(recs[a].tag === TAG_PARA_HEADER && recs[a].level === 0)) a--;
+      let b = a + 1; while (b < recs.length && !(recs[b].tag === TAG_PARA_HEADER && recs[b].level === 0)) b++;
+      let out = Buffer.concat([raw.slice(0, recs[a].headOff), raw.slice(b < recs.length ? recs[b].headOff : raw.length)]);
+      if (delId != null) {
+        const r2 = parseRecords(out);
+        for (let i = 0; i < r2.length; i++) if (_isGso(out, r2[i])) { const o = gsoBinIdOffset(out, r2, i); if (o >= 0) { const v = out.readUInt16LE(o); if (v > delId) out.writeUInt16LE(v - 1, o); } }
+      }
+      return out;
+    });
+
+    if (delId == null) { summary.push({ deleted_object: targetIndex, binData: null }); continue; }
+
+    // ── Step 2: DocInfo — remove BIN_DATA def delId, decrement higher ids + count ──
+    _rewriteStream(filePath, ['DocInfo'], (di) => {
+      for (const r of parseRecords(di)) if (r.tag === TAG_BIN_DATA_DEF && di.readUInt16LE(r.dataOff + 2) === delId) { di = Buffer.concat([di.slice(0, r.headOff), di.slice(r.headOff + (r.ext ? 8 : 4) + r.size)]); break; }
+      for (const r of parseRecords(di)) {
+        if (r.tag === TAG_BIN_DATA_DEF) { const sid = di.readUInt16LE(r.dataOff + 2); if (sid > delId) di.writeUInt16LE(sid - 1, r.dataOff + 2); }
+        if (r.tag === TAG_ID_MAPPINGS) di.writeUInt32LE((di.readUInt32LE(r.dataOff) - 1) >>> 0, r.dataOff);
+      }
+      return di;
+    });
+
+    // ── Step 3: CFB — rotate BIN000{delId..N} chain pointers + zero deleted bytes ──
+    {
+      let b2 = readFileSync(filePath);
+      const h = parseCfbHeader(b2);
+      const f2 = readFat(b2, h.fatAddrs, h.ssz);
+      const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+      const mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+      const rc = walkChain(f2, entries[0].start);
+      const byN = {}; let N = 0;
+      for (const e of entries) { const m = e.type === 2 && /^BIN(\d{4})\./.exec(e.name); if (m) { const n = parseInt(m[1], 10); byN[n] = e; if (n > N) N = n; } }
+      if (byN[delId]) {
+        const getP = (e) => ({ start: b2.readInt32LE(e.entryFileOffset + 0x74), size: b2.readUInt32LE(e.entryFileOffset + 0x78) });
+        const setP = (e, p) => { b2.writeInt32LE(p.start, e.entryFileOffset + 0x74); b2.writeUInt32LE(p.size, e.entryFileOffset + 0x78); };
+        const saved = getP(byN[delId]);
+        for (let k = delId; k < N; k++) if (byN[k] && byN[k + 1]) setP(byN[k], getP(byN[k + 1]));
+        if (byN[N]) {
+          setP(byN[N], saved);
+          const inMini = saved.size > 0 && saved.size < 4096; // zero the deleted object's bytes
+          const ch = saved.start >= 0 ? (inMini ? walkChain(mf2, saved.start) : walkChain(f2, saved.start)) : [];
+          for (const s of ch) { if (inMini) { const bo = s * h.mssz; const o = (512 + rc[Math.floor(bo / h.ssz)] * h.ssz) + (bo % h.ssz); b2.fill(0, o, o + h.mssz); } else b2.fill(0, 512 + s * h.ssz, 512 + s * h.ssz + h.ssz); }
+          b2.writeUInt32LE(0, byN[N].entryFileOffset + 0x78);
+        }
+      }
+      writeFileSync(filePath, b2);
+    }
+    summary.push({ deleted_object: targetIndex, binDataId: delId });
+  }
+  return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
+}
+
 
 // ── 도형 (shapes: rectangle / ellipse) raw-patch ──────────────────────────
 //
