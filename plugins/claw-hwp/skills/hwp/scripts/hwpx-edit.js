@@ -2988,6 +2988,331 @@ function embedImageBinary(doc, sourcePath, ext) {
 // 들어간다"). insert_image/insert_shape only append to the body — this is the
 // shared path for getting objects INTO a cell. Appended as a run on the cell's
 // first paragraph (after any existing text).
+// Place a seal/signature image RELATIVE TO an anchor text ("서명 또는 인" / "(서명)"
+// / "(인)" …). ALWAYS FLOATING (앞으로/front) so it NEVER grows the cell/table/page
+// (inline would push layout — forbidden). The horizontal position is COMPUTED from
+// the width of the text BEFORE the anchor (font metrics) — no render needed; render
+// is only for verify/feedback. Works in a body paragraph OR a table cell (offset is
+// relative to that paragraph's / cell's left edge — same math).
+//   mode "overlap" — seal CENTER on the anchor center (동심/concentric). Use when
+//     there's no room to the right (e.g. anchor near a cell edge / right margin).
+//   mode "right" (default) — seal just to the RIGHT of the anchor (right-parallel).
+// dx_mm / dy_mm OVERRIDE the computed offsets (para-left / para-top relative) when a
+// render shows it needs a nudge. size_mm = seal size (default 16). font_pt overrides
+// the auto-detected font size used for width estimation.
+const PT2MM = 25.4 / 72;
+function estTextWidthMm(s, pt) {
+  const em = pt * PT2MM;
+  let w = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0);
+    const wide = (c >= 0x1100 && c <= 0x11FF) || (c >= 0x3000 && c <= 0x303F) || (c >= 0x3130 && c <= 0x318F) || (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0xAC00 && c <= 0xD7A3) || (c >= 0xFF00 && c <= 0xFFEF);
+    w += wide ? em : em * 0.5; // full-width (Hangul/CJK) vs half-width (ASCII/space/punct)
+  }
+  return w;
+}
+function charPrFontPt(doc, charPrId) {
+  if (charPrId == null) return 10;
+  for (const n of Object.keys(doc.files)) {
+    if (!/header\.xml$/i.test(n)) continue;
+    const h = doc.read(n);
+    const m = h.match(new RegExp(`<hh:charPr\\b[^>]*\\bid="${charPrId}"[^>]*?\\bheight="(\\d+)"`))
+           || h.match(new RegExp(`<hh:charPr\\b[^>]*\\bheight="(\\d+)"[^>]*?\\bid="${charPrId}"`));
+    if (m) return Math.max(6, Number(m[1]) / 100);
+  }
+  return 10;
+}
+// Natural aspect ratio (width / height) of an image file, so a non-square
+// signature (e.g. a wide handwritten "홍 길 동") keeps its shape instead of
+// being squashed into a square. PNG/JPEG/BMP headers; defaults to 1 (square).
+function imageAspectWH(p) {
+  try {
+    const b = fs.readFileSync(p);
+    if (b.length > 24 && b[0] === 0x89 && b[1] === 0x50) { // PNG: IHDR w@16 h@20
+      const w = b.readUInt32BE(16), h = b.readUInt32BE(20);
+      if (w && h) return w / h;
+    } else if (b[0] === 0xff && b[1] === 0xd8) { // JPEG: scan SOFn markers
+      let i = 2;
+      while (i + 9 < b.length) {
+        if (b[i] !== 0xff) { i++; continue; }
+        const m = b[i + 1];
+        if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+          const h = b.readUInt16BE(i + 5), w = b.readUInt16BE(i + 7);
+          if (w && h) return w / h;
+        }
+        i += 2 + b.readUInt16BE(i + 2);
+      }
+    } else if (b[0] === 0x42 && b[1] === 0x4d && b.length > 26) { // BMP
+      const w = Math.abs(b.readInt32LE(18)), h = Math.abs(b.readInt32LE(22));
+      if (w && h) return w / h;
+    }
+  } catch { /* fall through */ }
+  return 1;
+}
+
+// Read a paraPr's line-spacing % and 위/아래 문단여백 (mm) for height estimation.
+// Prefers the HwpUnitChar <hp:case> margin — the one Hancom web actually renders.
+function sealParaPrMetrics(doc, paraPrId) {
+  const out = { pct: 160, prevMm: 0, nextMm: 0 };
+  if (paraPrId == null) return out;
+  for (const n of Object.keys(doc.files)) {
+    if (!/header\.xml$/i.test(n)) continue;
+    const h = doc.read(n);
+    const i = h.indexOf(`<hh:paraPr id="${paraPrId}"`);
+    if (i < 0) continue;
+    const end = h.indexOf('</hh:paraPr>', i);
+    const blk = h.slice(i, end < 0 ? i + 5000 : end);
+    const caseM = blk.match(/HwpUnitChar[\s\S]*?<hh:margin>([\s\S]*?)<\/hh:margin>/);
+    const marg = (caseM ? caseM[1] : (blk.match(/<hh:margin>([\s\S]*?)<\/hh:margin>/) || [, ''])[1]) || '';
+    const prev = marg.match(/<hc:prev value="(\d+)"/);
+    const next = marg.match(/<hc:next value="(\d+)"/);
+    if (prev) out.prevMm = Number(prev[1]) / 283.46;
+    if (next) out.nextMm = Number(next[1]) / 283.46;
+    const ls = blk.match(/<hh:lineSpacing[^>]*type="PERCENT"[^>]*value="(\d+)"/);
+    if (ls) out.pct = Number(ls[1]);
+    return out;
+  }
+  return out;
+}
+// Vertical advance (mm) from a paragraph's top to the next block's top.
+function sealParaAdvanceMm(doc, pInner, pAttrs, pageTextWmm) {
+  const pt = charPrFontPt(doc, (pInner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+  const m = sealParaPrMetrics(doc, (pAttrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
+  const txt = (pInner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((s) => s.replace(/<\/?hp:t>/g, '')).join('');
+  const lines = Math.max(1, Math.ceil(estTextWidthMm(txt, pt) / Math.max(10, pageTextWmm)));
+  return m.prevMm + lines * (pt * PT2MM * (m.pct / 100)) + m.nextMm;
+}
+// Vertical advance (mm) of a table block = outMargin top/bottom + Σ row heights.
+function sealTableAdvanceMm(doc, tblInner) {
+  const om = tblInner.match(/<hp:outMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
+  const top = om ? Number(om[1]) / 283.46 : 0;
+  const bot = om ? Number(om[2]) / 283.46 : 0;
+  let h = 0;
+  for (const r of scanTopLevel(tblInner, 'hp:tr')) {
+    let rh = 0;
+    for (const c of scanTopLevel(r.inner, 'hp:tc')) {
+      const sub = scanTopLevel(c.inner, 'hp:subList')[0];
+      const lines = sub ? Math.max(1, scanTopLevel(sub.inner, 'hp:p').filter((pp) => /<hp:t>/.test(pp.inner)).length) : 1;
+      const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+      const cm = c.inner.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
+      const mv = cm ? (Number(cm[1]) + Number(cm[2])) / 283.46 : 2.8;
+      rh = Math.max(rh, lines * (ptc * PT2MM * 1.3) + mv);
+    }
+    h += rh || 7;
+  }
+  return top + h + bot;
+}
+
+function opPlaceSeal(doc, op) {
+  const anchor = op.anchor;
+  if (!anchor) throw new Error('place_seal: "anchor" text is required (e.g. "서명 또는 인")');
+  if (!op.source) throw new Error('place_seal: "source" (seal/signature PNG) is required');
+  const fixedMm = op.size_mm != null ? Number(op.size_mm) : null;
+  const { itemId } = embedImageBinary(doc, op.source, op.ext);
+  // size_mm / auto-size drive the HEIGHT; width follows the image's aspect so a
+  // wide signature stays wide (never forced square).
+  const aspect = imageAspectWH(op.source) || 1;
+  const forcedMode = op.mode && String(op.mode).toLowerCase() !== 'auto'
+    ? (String(op.mode).toLowerCase() === 'overlap' ? 'overlap' : 'right')
+    : null; // null = decide automatically from the room beside the anchor
+  // Coordinate frame for the floating offsets (= hp:pos vert/horzRelTo):
+  //   PARA  (default) — origin = anchor paragraph top-left. Hancom CLAMPS the
+  //         object so it can't rise above that paragraph's top, so a stamp
+  //         taller than a one-line body paragraph rests on the line and peeks
+  //         downward (can't be vertically centred on the text by offset).
+  //   PAGE  — origin = body content top-left (inside margins). NO per-paragraph
+  //         clamp → with explicit dx_mm/dy_mm (page coords) the agent can centre
+  //         a stamp on any free-text line. (dx_mm/dy_mm strongly recommended;
+  //         the auto offsets below are PARA-relative.)
+  //   PAPER — origin = physical paper (0,0) corner.
+  // Default frame is chosen per location below: PARA for table cells (the cell's
+  // table is tall, no clamp), PAGE for free body text (so it aligns ON the line
+  // instead of being clamped low). op.frame overrides.
+  const userFrame = op.frame ? String(op.frame).toUpperCase() : null;
+  const paraText = (inner) => (inner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((s) => s.replace(/<\/?hp:t>/g, '')).join('');
+  const H = 283.46; // HWPUNIT per mm
+  // Sense a sensible seal size from the spot it lands in, unless size_mm is
+  // given. A name seal reads well at ~1.8× the anchor text's line height, so a
+  // bigger font gets a bigger seal and a small one-line cell gets a small one
+  // (it just peeks if the cell is shorter — see flowWithText note below). The
+  // size is then capped by the room available so it can't overflow: by the
+  // space to the right of the anchor (right mode) or by the box width (overlap),
+  // and finally clamped to a real-stamp range.
+  const clampMm = (v) => Math.max(7, Math.min(18, v));
+  // Returns the HEIGHT (mm); width = height × aspect. Caps the height so the
+  // (possibly wide) width still fits the room: by the space to the right of the
+  // anchor (right mode) or the box width (overlap).
+  const senseMm = (pt, ov, boxWidthMm, roomRightMm) => {
+    let h = pt * PT2MM * 1.3 * 1.6;
+    if (!ov && roomRightMm != null) h = Math.min(h, roomRightMm / aspect);
+    if (ov && boxWidthMm != null) h = Math.min(h, (boxWidthMm * 0.95) / aspect);
+    return Math.round(clampMm(h) * 10) / 10;
+  };
+  const sealRun = (sealMm, dxMm, dyMm, frm) => {
+    const hHwp = Math.round(sealMm * H);
+    const wHwp = Math.round(sealMm * aspect * H);
+    // treatAsChar="0" + flowWithText="0" = a truly fixed floating overlay: it
+    // NEVER reserves vertical space inside its anchor cell/paragraph, so the
+    // table row (and the page) can't grow to "fit" the seal. NOTE: a front /
+    // floating object with flowWithText="1" STILL makes Hancom auto-grow the
+    // cell to contain it — only flowWithText="0" stops that. A seal taller than
+    // the line then just peeks out above/below, by design, instead of stretching
+    // the cell. allowOverlap lets it sit on top of the text.
+    const pic = buildPic(doc, itemId, wHwp, hHwp)
+      .replace(/treatAsChar="[^"]*"/, 'treatAsChar="0"')
+      .replace(/flowWithText="[^"]*"/, 'flowWithText="0"')
+      .replace(/allowOverlap="[^"]*"/, 'allowOverlap="1"')
+      .replace(/textWrap="[^"]*"/, 'textWrap="IN_FRONT_OF_TEXT"')
+      .replace(/vertRelTo="[^"]*"/, `vertRelTo="${frm}"`)
+      .replace(/horzRelTo="[^"]*"/, `horzRelTo="${frm}"`)
+      .replace(/horzOffset="[^"]*"/, `horzOffset="${Math.round(dxMm * H)}"`)
+      .replace(/vertOffset="[^"]*"/, `vertOffset="${Math.round(dyMm * H)}"`);
+    return `<hp:run charPrIDRef="0">${pic}</hp:run>`;
+  };
+  // Compute the floating offset from the font metrics of the text before the
+  // anchor. A fixed (flowWithText="0") object's offsets are PARA-relative for a
+  // body paragraph, but for an object inside a TABLE CELL the origin is the
+  // table's anchor paragraph (text-area-left, table-top) — NOT the cell. So the
+  // caller passes originXMm/originYMm = the cell's content-corner measured from
+  // that origin (preceding column widths + row heights + table/cell margins),
+  // and 0/0 for free body text. boxWidthMm = the box's usable inner width (mm);
+  // roomWidthMm = the width within which "room to the right" is measured.
+  const calc = (inner, o) => {
+    const { originXMm = 0, originYMm = 0, boxWidthMm = null, roomWidthMm = null, vFactor = -0.08 } = o || {};
+    const txt = paraText(inner);
+    const pt = op.font_pt != null ? Number(op.font_pt) : charPrFontPt(doc, (inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+    const idx = txt.indexOf(anchor);
+    const startX = estTextWidthMm(idx >= 0 ? txt.slice(0, idx) : txt, pt);
+    const aw = estTextWidthMm(anchor, pt);
+    const roomRight = roomWidthMm != null ? Math.max(0, roomWidthMm - (startX + aw)) : null;
+    // Auto mode: park it to the right when there's comfortably room beside the
+    // anchor (the object's WIDTH must fit), otherwise sit on top (overlap).
+    const prov = fixedMm != null ? fixedMm : senseMm(pt, false, null, null);
+    const ov = forcedMode ? forcedMode === 'overlap'
+      : !(roomRight != null && roomRight >= prov * aspect + 2);
+    const sealMm = fixedMm != null ? fixedMm : senseMm(pt, ov, boxWidthMm, roomRight);
+    const wMm = sealMm * aspect;
+    // Vertical centre of the text line in the offset frame. vFactor × em:
+    // ≈ -0.08 when the origin is the line's own top (PARA cell / clamped body),
+    // ≈ +0.2 when the origin is the page/content top and originYMm carried the
+    // line's distance down to it (free-text PAGE frame). dy_mm overrides.
+    const lineMidMm = pt * PT2MM * vFactor;
+    let dx = originXMm + (ov ? (startX + aw / 2 - wMm / 2) : (startX + aw + 2));
+    let dy = originYMm + (lineMidMm - sealMm / 2);
+    if (op.dx_mm != null) dx = Number(op.dx_mm);
+    if (op.dy_mm != null) dy = Number(op.dy_mm);
+    return { sealMm, wMm, dx, dy, mode: ov ? 'overlap' : 'right' };
+  };
+  const r1 = (v) => Math.round(v * 10) / 10;
+  // 1) body top-level paragraphs (skip table-wrapper paragraphs). Free body text
+  // defaults to the PAGE frame so the stamp aligns ON the line: the PARA frame
+  // clamps a tall stamp to the line top (it then rests low), but PAGE has no
+  // such clamp. We compute the anchor line's distance from the page content top
+  // by summing the heights of the blocks above it (real paraPr line-spacing +
+  // 문단여백), then centre on the line. op.frame / dy_mm override.
+  for (const name of doc.sectionNames()) {
+    const xml = doc.read(name);
+    const roomWidthMm = pageTextWidth(doc, name) / H;
+    const blocks = scanTopLevel(xml, 'hp:p');
+    let k = -1;
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i].inner.includes('<hp:tbl')) continue;
+      if (paraText(blocks[i].inner).includes(anchor)) { k = i; break; }
+    }
+    if (k < 0) continue;
+    const p = blocks[k];
+    const frm = userFrame || 'PAGE';
+    let o;
+    if (frm === 'PAGE') {
+      let topMm = 0;
+      for (let i = 0; i < k; i++) {
+        const b = blocks[i];
+        if (b.inner.includes('<hp:tbl')) topMm += sealTableAdvanceMm(doc, scanTopLevel(b.inner, 'hp:tbl')[0].inner);
+        else topMm += sealParaAdvanceMm(doc, b.inner, b.attrs, roomWidthMm);
+      }
+      o = { originYMm: topMm, roomWidthMm, vFactor: 0.2 };
+    } else {
+      o = { roomWidthMm }; // user forced PARA/PAPER (PARA rests low — its choice)
+    }
+    const { sealMm, wMm, dx, dy, mode } = calc(p.inner, o);
+    doc.write(name, dropLinesegs(spliceEl(xml, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, frm)}</hp:p>`)));
+    return { placed: true, anchor, mode, frame: frm.toLowerCase(), where: 'paragraph', size_mm: sealMm, width_mm: r1(wMm), dx_mm: r1(dx), dy_mm: r1(dy) };
+  }
+  // 2) table cells — a fixed floating object placed in a cell positions itself
+  // relative to the table's anchor (text-area-left, table-top), so add the
+  // cell's content corner: preceding column widths + preceding row heights +
+  // table outMargin + this cell's 안여백. Column widths come from cellSz (rhwp
+  // ships garbage ≤100 → fall back to equal split of the table width); row
+  // heights are estimated from each row's tallest cell (line count × line height
+  // + 안여백), since cellSz height is unreliable. dx_mm/dy_mm override if a
+  // caller needs to nudge.
+  for (const name of doc.sectionNames()) {
+    let xml = doc.read(name);
+    const tbls = scanTopLevel(xml, 'hp:tbl');
+    for (let ti = tbls.length - 1; ti >= 0; ti--) {
+      const tbl = tbls[ti];
+      const rows = scanTopLevel(tbl.inner, 'hp:tr');
+      const colCnt = Math.max(1, Number((tbl.attrs.match(/colCnt="(\d+)"/) || [, 1])[1]));
+      const tblInner = Number((tbl.inner.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
+      const om = tbl.inner.match(/<hp:outMargin\b[^>]*\bleft="(\d+)"[^>]*\btop="(\d+)"/);
+      const outLMm = om ? Number(om[1]) / H : 0;
+      const outTMm = om ? Number(om[2]) / H : 0;
+      // Per-column width (HWPUNIT) from any non-garbage cellSz; else equal split.
+      const colW = {};
+      for (const r of rows) for (const c of scanTopLevel(r.inner, 'hp:tc')) {
+        const ca = Number((c.inner.match(/\bcolAddr="(\d+)"/) || [, -1])[1]);
+        const w = Number((c.inner.match(/<hp:cellSz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
+        if (ca >= 0 && w > 100 && colW[ca] == null) colW[ca] = w;
+      }
+      const colWmm = (c) => (colW[c] != null ? colW[c] : (tblInner ? tblInner / colCnt : 0)) / H;
+      // Estimated height (mm) of a row = tallest cell's (lines × lineH + 안여백).
+      const rowHmm = (rEl) => {
+        let h = 0;
+        for (const c of scanTopLevel(rEl.inner, 'hp:tc')) {
+          const sub = scanTopLevel(c.inner, 'hp:subList')[0];
+          const lines = sub ? Math.max(1, scanTopLevel(sub.inner, 'hp:p').filter((pp) => /<hp:t>/.test(pp.inner)).length) : 1;
+          const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+          const cm = c.inner.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
+          const mv = cm ? (Number(cm[1]) + Number(cm[2])) / H : 2.8;
+          h = Math.max(h, lines * (ptc * PT2MM * 1.3) + mv);
+        }
+        return h || 7;
+      };
+      for (let ri = rows.length - 1; ri >= 0; ri--) {
+        const tcs = scanTopLevel(rows[ri].inner, 'hp:tc');
+        for (let ci = tcs.length - 1; ci >= 0; ci--) {
+          const tc = tcs[ci];
+          if (!paraText(tc.inner).includes(anchor)) continue;
+          const sub = scanTopLevel(tc.inner, 'hp:subList')[0];
+          const p = scanTopLevel(sub.inner, 'hp:p')[0];
+          const tcCol = Number((tc.inner.match(/\bcolAddr="(\d+)"/) || [, ci])[1]);
+          const tcRow = Number((tc.inner.match(/\browAddr="(\d+)"/) || [, ri])[1]);
+          let colX = 0; for (let c = 0; c < tcCol; c++) colX += colWmm(c);
+          let rowY = 0; for (let r = 0; r < tcRow; r++) rowY += rowHmm(rows[r]);
+          const cm = tc.inner.match(/<hp:cellMargin\b[^>]*\bleft="(\d+)"[^>]*\bright="(\d+)"[^>]*\btop="(\d+)"/);
+          const cmL = cm ? Number(cm[1]) / H : 1.41;
+          const cmR = cm ? Number(cm[2]) / H : 1.41;
+          const cmT = cm ? Number(cm[3]) / H : 1.41;
+          const boxWidthMm = Math.max(2, colWmm(tcCol) - cmL - cmR);
+          const { sealMm, wMm, dx, dy, mode } = calc(p.inner, {
+            originXMm: outLMm + colX + cmL,
+            originYMm: outTMm + rowY + cmT,
+            boxWidthMm,
+            roomWidthMm: boxWidthMm,
+          });
+          const newSub = `<hp:subList${sub.attrs}>${spliceEl(sub.inner, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, 'PARA')}</hp:p>`)}</hp:subList>`;
+          const newTc = `<hp:tc${tc.attrs}>${spliceEl(tc.inner, sub, newSub)}</hp:tc>`;
+          const newRow = `<hp:tr${rows[ri].attrs}>${spliceEl(rows[ri].inner, tc, newTc)}</hp:tr>`;
+          xml = spliceEl(xml, tbl, `<hp:tbl${tbl.attrs}>${spliceEl(tbl.inner, rows[ri], newRow)}</hp:tbl>`);
+          doc.write(name, dropLinesegs(xml));
+          return { placed: true, anchor, mode, where: 'cell', table: ti, row: ri, col: ci, size_mm: sealMm, width_mm: r1(wMm), dx_mm: r1(dx), dy_mm: r1(dy) };
+        }
+      }
+    }
+  }
+  throw new Error(`place_seal: anchor "${anchor}" not found in any paragraph or cell`);
+}
+
 function placeObjectInCell(doc, tableIndex, row, col, objXml, opName) {
   const { section, el } = getTable(doc, tableIndex);
   const rows = scanTopLevel(el.inner, 'hp:tr');
@@ -4117,6 +4442,7 @@ function applyOp(doc, op) {
     case 'replace_image': return opReplaceImage(doc, op.target, op.source);
     case 'delete_image': return opDeleteImage(doc, op.target);
     case 'delete_object': return opDeleteObject(doc, op.target, op.index, op.renumber);
+    case 'place_seal': return opPlaceSeal(doc, op);
     case 'set_field_value': return opSetFieldValue(doc, op.name, op.value);
     case 'set_header': return opSetHeaderFooter(doc, 'header', op.text, op.applyPageType, op.align);
     case 'set_footer': return opSetHeaderFooter(doc, 'footer', op.text, op.applyPageType, op.align);
