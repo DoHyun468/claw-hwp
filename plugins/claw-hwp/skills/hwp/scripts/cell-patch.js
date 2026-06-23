@@ -108,7 +108,7 @@ function parseRecords(raw) {
 // rhwp's WASM parses them correctly, so we let it tell us the index and
 // then count LIST_HEADERs at the raw level.
 
-function locateCell(records, sectionParaIdx, controlIdx, cellIndex) {
+function locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara = 0) {
   // Find the target paragraph header (level 0)
   let para = -1;
   let paraStart = -1;
@@ -149,24 +149,39 @@ function locateCell(records, sectionParaIdx, controlIdx, cellIndex) {
   }
   if (cellStartRec < 0) throw new Error(`cell index ${cellIndex} not found in table at paragraph ${sectionParaIdx} control ${controlIdx} (only ${listCount} cells seen)`);
 
-  // Inside this cell: first PARA_HEADER right after LIST_HEADER (level 2).
-  let paraHeaderRec = -1;
+  // Inside this cell: the cellPara-th PARA_HEADER (level 2). A cell's paragraphs
+  // are level-2 PARA_HEADERs between this LIST_HEADER and the next cell's
+  // LIST_HEADER (or table end at level < 2); their text/shape children are level
+  // 3. cellPara 0 = the first paragraph (the common case). Higher indices target
+  // later paragraphs of a multi-paragraph cell (e.g. clearing each line of a form
+  // cell that holds several paragraphs of content).
+  let paraHeaderRec = -1, paraSeen = -1;
   for (let i = cellStartRec + 1; i < records.length; i++) {
     const r = records[i];
-    if (r.tag === TAG_PARA_HEADER && r.level === 2) { paraHeaderRec = i; break; }
     if (r.tag === TAG_LIST_HEADER && r.level === 2) break; // next cell
+    if (r.level < 2) break;                                  // back to table/section level
+    if (r.tag === TAG_PARA_HEADER && r.level === 2) {
+      paraSeen++;
+      if (paraSeen === cellPara) { paraHeaderRec = i; break; }
+    }
   }
-  if (paraHeaderRec < 0) throw new Error('cell paragraph header not found');
+  if (paraHeaderRec < 0) throw new Error(`cell paragraph ${cellPara} not found (cell has ${paraSeen + 1} paragraph(s))`);
 
-  // Optional PARA_TEXT and PARA_CHAR_SHAPE that follow (level 3).
-  let paraTextRec = null, charShapeRec = null;
+  // Optional PARA_TEXT / PARA_CHAR_SHAPE / PARA_LINE_SEG that follow (level 3).
+  // Also flag whether the paragraph hosts an inline object (a CTRL_HEADER child,
+  // e.g. an embedded 그림/figure): its anchor char lives in PARA_TEXT, so editing
+  // or clearing the text orphans the control and Hancom Docs rejects the file.
+  const paraLevel = records[paraHeaderRec].level;
+  let paraTextRec = null, charShapeRec = null, lineSegRec = null, hasInlineObject = false;
   for (let i = paraHeaderRec + 1; i < records.length; i++) {
     const r = records[i];
-    if (r.level <= 2) break; // back to cell-level
+    if (r.level <= paraLevel) break; // back to cell/paragraph level
     if (r.tag === TAG_PARA_TEXT && paraTextRec === null) paraTextRec = i;
     else if (r.tag === TAG_PARA_CHAR_SHAPE && charShapeRec === null) charShapeRec = i;
+    else if (r.tag === TAG_PARA_LINE_SEG && lineSegRec === null) lineSegRec = i;
+    else if (r.tag === TAG_CTRL_HEADER) hasInlineObject = true;
   }
-  return { listHeaderRec: cellStartRec, paraHeaderRec, paraTextRec, charShapeRec };
+  return { listHeaderRec: cellStartRec, paraHeaderRec, paraTextRec, charShapeRec, lineSegRec, hasInlineObject };
 }
 
 // ── HWP cell patching ─────────────────────────────────────────────────────
@@ -193,12 +208,55 @@ function makeParaTextRecord(text) {
   return Buffer.concat([head, body]);
 }
 
-function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text) {
-  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex);
-  const newTextCount = text.length + 1; // + EOP
+function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0) {
+  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara);
+  if (loc.hasInlineObject) {
+    // The paragraph hosts an inline object (e.g. an embedded 그림/figure). Rewriting
+    // its PARA_TEXT drops the object's anchor char and orphans the control, which
+    // Hancom Docs rejects ("문서를 열 수 없습니다"). Refuse rather than silently
+    // corrupt — the caller should target a different paragraph (cell_para) or remove
+    // the object separately.
+    throw new Error(`set_cell_text: cell paragraph ${cellPara} hosts an inline object (e.g. an embedded image) — editing its text would orphan the object. Target a text-only paragraph via cell_para, or remove the object first.`);
+  }
   const paraHeader = records[loc.paraHeaderRec];
-  // Update PARA_HEADER.text_count, preserving the high-bit flag.
   const oldCount = raw.readUInt32LE(paraHeader.dataOff);
+
+  if (text === '') {
+    // Empty paragraph — match HWP's native empty form: text_count = 1 and NO
+    // PARA_TEXT record at all (the EOP is implicit), with CHAR_SHAPE collapsed to
+    // its single run at charPos 0. Writing an explicit EOP-only PARA_TEXT, or
+    // leaving multi-run char shapes whose positions now exceed the 1-char
+    // paragraph, makes Hancom Docs reject the whole file ("문서를 열 수 없습니다").
+    // GT: native blank-form cells have PARA_HEADER(tc=1) + CHAR_SHAPE + LINE_SEG and
+    // NO PARA_TEXT. (cell-patch previously inserted a [EOP] PARA_TEXT here — the
+    // bug that broke every cleared cell on the cloud viewer.)
+    raw.writeUInt32LE((((oldCount & 0x80000000) >>> 0) | 1) >>> 0, paraHeader.dataOff);
+    // Collapse the layout caches to their first entry so they match the now 1-char
+    // (EOP-only) paragraph, then drop PARA_TEXT. Native empty cells keep CHAR_SHAPE
+    // at 1 run (8 B) and LINE_SEG at 1 segment (36 B); leaving a multi-line LINE_SEG
+    // or multi-run CHAR_SHAPE on a 1-char paragraph also makes Hancom reject the file.
+    // Splice back-to-front (LINE_SEG → CHAR_SHAPE → PARA_TEXT) so each record's
+    // original byte offset stays valid through the prior splice. Headers keep the
+    // original tag+level, only the size shrinks (so a small size is non-extended).
+    const shrinkRec = (recIdx, newSize) => {
+      const r = records[recIdx]; if (r.size <= newSize) return;
+      const head = Buffer.alloc(4);
+      head.writeUInt32LE(((newSize << 20) | (r.level << 10) | r.tag) >>> 0, 0);
+      const rLen = (r.ext ? 8 : 4) + r.size;
+      raw = Buffer.concat([raw.slice(0, r.headOff), head, raw.slice(r.dataOff, r.dataOff + newSize), raw.slice(r.headOff + rLen)]);
+    };
+    if (loc.lineSegRec !== null) shrinkRec(loc.lineSegRec, 36); // 1 line segment
+    if (loc.charShapeRec !== null) shrinkRec(loc.charShapeRec, 8); // 1 (charPos, shapeId) run
+    if (loc.paraTextRec !== null) {
+      const old = records[loc.paraTextRec];
+      const oldLen = (old.ext ? 8 : 4) + old.size;
+      raw = Buffer.concat([raw.slice(0, old.headOff), raw.slice(old.headOff + oldLen)]);
+    }
+    return raw;
+  }
+
+  const newTextCount = text.length + 1; // + EOP
+  // Update PARA_HEADER.text_count, preserving the high-bit flag.
   const newCount = ((oldCount & 0x80000000) >>> 0) | (newTextCount >>> 0);
   raw.writeUInt32LE(newCount >>> 0, paraHeader.dataOff);
 
@@ -994,12 +1052,15 @@ function patchInPlaceSectors(filePath, resolved) {
     let raw = Buffer.from(inflateRawSync(compressed));
 
     // Apply edits back-to-front in record order so byte offsets stay valid.
+    // cell_para descending too, so a multi-paragraph cell's later paragraphs are
+    // patched before its earlier ones (records are re-parsed per edit, and an
+    // empty replacement keeps the paragraph, so indices stay stable either way).
     const editsSorted = [...secEdits].sort((a, b) =>
-      (b.para - a.para) || (b.control - a.control) || (b.cellIndex - a.cellIndex)
+      (b.para - a.para) || (b.control - a.control) || (b.cellIndex - a.cellIndex) || ((b.cell_para ?? 0) - (a.cell_para ?? 0))
     );
     for (const e of editsSorted) {
       const records = parseRecords(raw);
-      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '');
+      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',

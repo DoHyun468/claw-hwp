@@ -1879,13 +1879,14 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
         const para = requireInt(op, 'para');
         const ctrl = requireInt(op, 'control');
         const text = op.text ?? '';
+        const cellPara = op.cell_para ?? 0; // which paragraph inside a multi-paragraph cell (default first)
         if (op.row != null && op.col != null) {
-          out.push({ section: sec, para, control: ctrl, row: op.row, col: op.col, text });
+          out.push({ section: sec, para, control: ctrl, row: op.row, col: op.col, text, cell_para: cellPara });
         } else if (op.cell != null) {
           // Convert flat cellIndex back to (row, col) via rhwp inspect.
           if (!doc) doc = new HwpDocument(new Uint8Array(fs.readFileSync(filePath)));
           const info = JSON.parse(doc.getCellInfo(sec, para, ctrl, op.cell));
-          out.push({ section: sec, para, control: ctrl, row: info.row, col: info.col, text });
+          out.push({ section: sec, para, control: ctrl, row: info.row, col: info.col, text, cell_para: cellPara });
         } else {
           throw new Error("set_cell_text: provide row+col or cell");
         }
