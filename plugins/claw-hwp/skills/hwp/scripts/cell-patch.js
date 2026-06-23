@@ -5059,26 +5059,34 @@ export async function deleteObjectInPlace(filePath, ops) {
       delId = bidOff >= 0 ? raw.readUInt16LE(bidOff) : null;
       let a = gi; while (a > 0 && !(recs[a].tag === TAG_PARA_HEADER && recs[a].level === 0)) a--;
       let b = a + 1; while (b < recs.length && !(recs[b].tag === TAG_PARA_HEADER && recs[b].level === 0)) b++;
-      let out = Buffer.concat([raw.slice(0, recs[a].headOff), raw.slice(b < recs.length ? recs[b].headOff : raw.length)]);
-      // If the removed paragraph was the section's LAST top-level paragraph, the
-      // section would now end on the previous paragraph's gso cluster with no terminal
-      // paragraph — Hancom rejects that (cannot_open). GT (Hancom deleting the last
-      // object) leaves a terminal empty paragraph: PARA_HEADER(nchars=0x80000001,
-      // control_mask=0) + CHAR_SHAPE. Rebuild one from the deleted paragraph's own
-      // PARA_HEADER + CHAR_SHAPE so its para_shape/char_shape ids are valid here.
-      if (b >= recs.length) {
-        const phRec = recs[a];
-        const ph = Buffer.from(raw.slice(phRec.headOff, phRec.dataOff + phRec.size));
-        const phDataOff = phRec.dataOff - phRec.headOff;
-        ph.writeUInt32LE(0x80000001, phDataOff);     // nchars: empty paragraph (high bit | 1)
-        ph.writeUInt32LE(0, phDataOff + 4);          // control_mask: no controls remain
-        let csRec = null;
-        for (let k = a + 1; k < recs.length && !(recs[k].tag === TAG_PARA_HEADER && recs[k].level === 0); k++) {
-          if (recs[k].tag === TAG_PARA_CHAR_SHAPE) { csRec = recs[k]; break; }
-        }
-        const cs = csRec ? raw.slice(csRec.headOff, csRec.dataOff + csRec.size) : Buffer.alloc(0);
-        out = Buffer.concat([out, ph, cs]);
+      // Replace the object's paragraph with an EMPTY paragraph in place — don't drop it.
+      // GT: Hancom deleting an object empties that paragraph (a blank line stays where
+      // the object was). This also matches Hancom for a MIDDLE object and is REQUIRED for
+      // the section's LAST object (else the section ends on a gso cluster → cannot_open),
+      // so one uniform rule keeps us GT-faithful in every position and internally
+      // consistent. Built from the deleted para's own PARA_HEADER + CHAR_SHAPE so the
+      // para_shape/char_shape ids stay valid; PARA_TEXT (inline anchor) + the gso cluster
+      // are dropped and the header rewritten to Hancom's empty-paragraph byte-shape
+      // (PARA_HEADER + CHAR_SHAPE, no PARA_TEXT/LINE_SEG; nchars per the rule below).
+      const phRec = recs[a];
+      const ph = Buffer.from(raw.slice(phRec.headOff, phRec.dataOff + phRec.size));
+      const phDataOff = phRec.dataOff - phRec.headOff;
+      // nchars: 1 char (the paragraph break). The high bit 0x80000000 marks the section's
+      // LAST paragraph — GT shows EXACTLY one para per section carries it (the terminator).
+      // If our empty para is now the last paragraph it MUST set it (else Hancom can't find
+      // the section end → cannot_open); if it's a MIDDLE para it must NOT (the high bit
+      // makes Hancom read a ~2-billion char count and stop rendering every following para).
+      const isLastPara = b >= recs.length;
+      ph.writeUInt32LE(isLastPara ? 0x80000001 : 1, phDataOff);
+      ph.writeUInt32LE(0, phDataOff + 4);          // control_mask: no controls remain
+      ph.writeUInt16LE(0, phDataOff + 16);         // line-seg count → 0: we keep no LINE_SEG (Hancom recomputes layout). GT confirms 0.
+      let csRec = null;
+      for (let k = a + 1; k < recs.length && !(recs[k].tag === TAG_PARA_HEADER && recs[k].level === 0); k++) {
+        if (recs[k].tag === TAG_PARA_CHAR_SHAPE) { csRec = recs[k]; break; }
       }
+      const cs = csRec ? raw.slice(csRec.headOff, csRec.dataOff + csRec.size) : Buffer.alloc(0);
+      const emptyPara = Buffer.concat([ph, cs]);
+      let out = Buffer.concat([raw.slice(0, recs[a].headOff), emptyPara, raw.slice(b < recs.length ? recs[b].headOff : raw.length)]);
       if (delId != null) {
         const r2 = parseRecords(out);
         for (let i = 0; i < r2.length; i++) if (_isGso(out, r2[i])) { const o = gsoBinIdOffset(out, r2, i); if (o >= 0) { const v = out.readUInt16LE(o); if (v > delId) out.writeUInt16LE(v - 1, o); } }
@@ -5156,7 +5164,37 @@ export async function deleteObjectInPlace(filePath, ops) {
     }
     summary.push({ deleted_object: targetIndex, binDataId: delId });
   }
+  // The stored page-1 thumbnail (PrvImage) is now stale — for an object that sat on page 1
+  // it would still show the thing we just deleted (a redaction leak). We can't render a
+  // faithful new thumbnail in a raw patch, so invalidate it; Hancom regenerates PrvImage on
+  // the next open/save and a file manager shows a blank thumbnail instead of a stale one.
+  if (summary.length) _invalidatePreviewImage(filePath);
   return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
+}
+
+// Zero + empty the PrvImage stream (see deleteObjectInPlace). PrvText is left intact —
+// deleting an object changes no body text, so the text preview stays valid.
+function _invalidatePreviewImage(filePath) {
+  const b = readFileSync(filePath);
+  const h = parseCfbHeader(b);
+  const fat = readFat(b, h.fatAddrs, h.ssz);
+  const { entries } = readDirectory(b, fat, h.ssz, h.dirStart);
+  const mf = readMinifat(b, fat, h.ssz, h.minifatStart);
+  const rc = entries[0].start >= 0 ? walkChain(fat, entries[0].start) : [];
+  const e = entries.find((x) => x.type === 2 && x.name === 'PrvImage');
+  if (!e) return;
+  const start = b.readInt32LE(e.entryFileOffset + 0x74);
+  const size = b.readUInt32LE(e.entryFileOffset + 0x78);
+  if (size > 0 && start >= 0) {
+    const mini = size < 4096;
+    for (const s of (mini ? walkChain(mf, start) : walkChain(fat, start))) {
+      if (mini) { const bo = s * h.mssz; const o = (512 + rc[Math.floor(bo / h.ssz)] * h.ssz) + (bo % h.ssz); b.fill(0, o, o + h.mssz); writeMinifatEntry(b, h.ssz, h.mssz, fat, h.minifatStart, s, FREESECT); }
+      else { b.fill(0, 512 + s * h.ssz, 512 + s * h.ssz + h.ssz); writeFatEntry(b, h.ssz, h.fatAddrs, s, FREESECT); }
+    }
+  }
+  b.writeInt32LE(ENDOFCHAIN, e.entryFileOffset + 0x74); // empty stream → Hancom regenerates
+  b.writeUInt32LE(0, e.entryFileOffset + 0x78);
+  writeFileSync(filePath, b);
 }
 
 
