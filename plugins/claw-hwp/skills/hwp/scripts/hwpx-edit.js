@@ -836,7 +836,7 @@ function opSetCaption(doc, target, index, text, side, gapMm) {
 // 객체는 target(image/chart/shape) + index 로 지목(set_caption 과 동일 주소 체계). 편집은
 // 객체의 <hp:sz>(크기)·<hp:pos>(위치/글자처럼취급)·textWrap attr(배치)·<hp:outMargin>(글
 // 과의 간격)·<hp:lineShape>(선·화살표)·<hc:winBrush>(채우기·투명도·무늬)를 in-place 수정.
-const OBJECT_TARGETS = { image: ['hp:pic'], chart: ['hp:chart'], shape: ['hp:rect', 'hp:ellipse', 'hp:line', 'hp:arc', 'hp:polygon', 'hp:curve'] };
+const OBJECT_TARGETS = { image: ['hp:pic'], chart: ['hp:chart'], equation: ['hp:equation'], shape: ['hp:rect', 'hp:ellipse', 'hp:line', 'hp:arc', 'hp:polygon', 'hp:curve'] };
 function findObject(doc, target, index) {
   const tags = OBJECT_TARGETS[String(target || '').toLowerCase()];
   if (!tags) throw new Error(`object target must be one of ${Object.keys(OBJECT_TARGETS).join('/')}`);
@@ -2827,6 +2827,48 @@ function opDeleteImage(doc, target) {
   return { entry, itemId, picsRemoved, deleted: true };
 }
 
+// Generic floating-object delete by (target, index) — same addressing as the
+// set_object_* family (findObject): target = image / chart / shape (rect·ellipse·
+// line·arc·polygon·curve, incl. textbox) / equation, index = 0-based in document
+// order. Removes the object's enclosing top-level <hp:p> (insert_* gives each
+// object its own paragraph → no empty line left), then drops its external part +
+// manifest item (image → BinData/, chart → Chart/). Shape/textbox/equation carry
+// no external part → only the paragraph is removed.
+// NUMBERING: Hancom renumbers remaining parts contiguous on delete (GT
+// delete-obj-*: deleting the middle image renumbers image3→image2). We do NOT —
+// refs are by id so a gap renders identically (verified on Hancom web), and
+// insert_image/embedChartSpace pick the next FREE number (gap-safe) so a gap
+// never collides. Leaving the gap = simpler, lower risk, render-identical.
+function opDeleteObject(doc, target, index) {
+  const f = findObject(doc, target, index); // throws if not found
+  const blob = (f.el.attrs || '') + (f.el.inner || '');
+  const binRef = (blob.match(/binaryItemIDRef="([^"]+)"/) || [])[1] || null;
+  const chartHref = (blob.match(/chartIDRef="([^"]+)"/) || [])[1] || null;
+  // 1) drop the enclosing top-level paragraph (fallback: just the element)
+  let xml = doc.read(f.name);
+  const host = scanTopLevel(xml, 'hp:p').find((p) => p.start <= f.el.start && f.el.end <= p.end);
+  xml = host ? spliceEl(xml, host, '') : spliceEl(xml, f.el, '');
+  doc.write(f.name, dropLinesegs(xml));
+  // 2) drop the external part + its manifest item (no dangling ref)
+  let removedPart = null;
+  const hpf = doc.hpfName();
+  if (binRef && hpf) {
+    let s = doc.read(hpf);
+    const hm = s.match(new RegExp(`<opf:item [^>]*id="${escapeRegex(binRef)}"[^>]*href="([^"]+)"[^>]*/>|<opf:item [^>]*href="([^"]+)"[^>]*id="${escapeRegex(binRef)}"[^>]*/>`));
+    removedPart = hm ? (hm[1] || hm[2]) : null;
+    s = s.replace(new RegExp(`<opf:item [^>]*id="${escapeRegex(binRef)}"[^>]*/>`), '');
+    doc.write(hpf, s);
+    if (removedPart && doc.files[removedPart]) delete doc.files[removedPart];
+  } else if (chartHref && hpf) {
+    let s = doc.read(hpf);
+    s = s.replace(new RegExp(`<opf:item [^>]*href="${escapeRegex(chartHref)}"[^>]*/>`), '');
+    doc.write(hpf, s);
+    if (doc.files[chartHref]) delete doc.files[chartHref];
+    removedPart = chartHref;
+  }
+  return { target, index: Math.max(0, Number(index) || 0), tag: f.tag, removedPart, deleted: true };
+}
+
 function opInsertImage(doc, sourcePath, ext, width, height, index) {
   ext = (ext || path.extname(sourcePath).slice(1) || 'png').toLowerCase();
   if (!MIME[ext]) throw new Error(`insert_image: unsupported ext .${ext} (png/jpg/bmp/gif)`);
@@ -4032,6 +4074,7 @@ function applyOp(doc, op) {
       op.index);
     case 'replace_image': return opReplaceImage(doc, op.target, op.source);
     case 'delete_image': return opDeleteImage(doc, op.target);
+    case 'delete_object': return opDeleteObject(doc, op.target, op.index);
     case 'set_field_value': return opSetFieldValue(doc, op.name, op.value);
     case 'set_header': return opSetHeaderFooter(doc, 'header', op.text, op.applyPageType, op.align);
     case 'set_footer': return opSetHeaderFooter(doc, 'footer', op.text, op.applyPageType, op.align);
