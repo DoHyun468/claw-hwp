@@ -51,6 +51,11 @@ This skill helps Claude work with Korean Hangul Word Processor documents — rea
 - **이미 서명/도장 이미지가 있는 사용자** → "파일 위치를 알려주세요" 하고, 그 PNG를 `~/.claw-hwp/`(600)로 복사한 뒤 `insert_image`로 서명란 위에 얹는다(`set_object_position {wrap:"front"}`로 칸 위 오버레이; 셀이면 `set_cell_image`). **누끼(배경 투명) PNG면 깔끔** — 흰 배경이 박스로 안 남는다.
 - **없는 사용자** → **4글자 정사각형 빨간 날인**을 만들어줄 수 있다고 안내:
   `python3 scripts/make_seal.py --name "홍길동" --out ~/.claw-hwp/seal.png` (→ 홍길동印, 빨간 이중테두리·투명배경) → `insert_image`. (python3 + Pillow 필요.)
+- **배치(객체속성으로 유연하게)** — 도장 위치는 한 가지로 고정 X, 서식 공간 따라 맞춘다:
+  - **배치 = 앞으로(`wrap:"front"`)** 가 도장에 맞음 — 글 위에 찍힌다. (behind=글 밑으로 가려 안 보임, 어울림/글자처럼=글을 밀어냄 → X.)
+  - **표 서명칸이면 `set_cell_image {table,row,col, width_mm~16}`** — 셀 가운데 자동, 좌표 계산 0 → **제일 안정. 표 있으면 이걸 우선.**
+  - **자유 텍스트 줄이면** `insert_image {index:서명문단, width_mm~17}` + `set_object_position {target:"image", index, wrap:"front", x_mm, y_mm}`. x=표시/이름 위치(문단 왼쪽 기준 mm), **y는 음수로 줄 위로 올림(≈ -(높이÷2 + 5) mm)** 후 렌더로 1~2회 미세조정. 크기는 `width_mm`/`height_mm` 또는 `set_object_size`(보통 16~18mm).
+  - 케이스: "(서명 또는 인)" 표시 위 / 이름 위 / 옆 빈칸 — **공간 차지에 따라 유연하게** 고른다.
 - **진짜 서명을 원하면** 출처를 알려준다: **macOS 미리보기/메일 → 마크업 → 서명 → "서명 생성"**(트랙패드로 그리거나 종이 서명을 카메라에 → 배경 자동 제거, 이미 투명 PNG) / 아이패드·아이폰 마크업 / remove.bg·Canva·포토샵(마술봉)·Acrobat 작성및서명 / signaturely·smallpdf 등 서명생성 사이트.
 - **보안**: 서명·도장 이미지도 개인정보 — `~/.claw-hwp/`에 두고 cwd 금지, 화면에 띄우거나 되풀이하지 않으며, 기본 ephemeral(끝나면 정리 안내). 한컴 web은 PNG 투명도 렌더 OK(검증됨).
 
