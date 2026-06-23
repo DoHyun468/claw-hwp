@@ -65,8 +65,9 @@
 - **size**: `width_mm`/`height_mm`(mm). 본문 전폭 ≈ 150mm(A4 좌우 여백 제외). 전폭 도표 110–120mm,
   square용 좁은 객체 ≤60mm, 셀 안은 셀폭 자동맞춤.
 - **margin_mm**: 객체-글 바깥 간격. inline/topbottom은 2~3mm로 충분, square는 3mm 권장(안 주면 글이 붙음).
-- **position(`x_mm`,`y_mm`)**: 종이/단 기준 오프셋. floating(square/behind/front)에서만 의미.
-  inline은 위치 무시(글 흐름 따라감).
+- **position(`x_mm`,`y_mm`)**: 오프셋. floating(square/behind/front)에서만 의미. inline은 위치 무시(글 흐름 따라감).
+- **`frame`(`para`/`page`/`paper`/`column`)**: x/y의 기준 원점 — para=앵커 문단 좌상단(⚠️문단 top 위로 클램프), page=본문영역 좌상단, paper=용지 코너, column=단. **줄 위로 자유롭게 올리려면 page/paper**(para는 클램프). `set_object_position`에서 지정.
+- **no-grow 자동**: `set_object_position`/`insert_*`로 wrap을 floating(front/square/…)으로 주면 `flowWithText="0"`가 자동 적용돼 **표/페이지가 안 커진다**(front라도 flowWithText=1이면 커지는 한컴 동작 회피). inline으로 주면 글자처럼 줄에 들어감.
 - **여러 객체 겹침**: 같은 index에 floating 객체 여러 개 = 겹침 → index를 다르게 하거나 x/y로 분리.
 
 ## 페이지 채우기(밀도) 팁

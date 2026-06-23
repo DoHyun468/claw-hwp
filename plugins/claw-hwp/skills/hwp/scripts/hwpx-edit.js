@@ -889,8 +889,29 @@ function opSetObjectPosition(doc, target, index, opts) {
     const w = String(opts.wrap).toLowerCase(), inline = w === 'inline';
     if (!inline && !(w in OBJ_WRAP)) throw new Error(`set_object_position: wrap must be inline/${Object.keys(OBJ_WRAP).join('/')}`);
     if (!inline) attrs = setOrAddAttr(attrs, 'textWrap', OBJ_WRAP[w]);
-    inner = inner.replace(/<hp:pos\b[^>]*\/>/, (m) => m.replace(/treatAsChar="[^"]*"/, `treatAsChar="${inline ? 1 : 0}"`));
+    // A floating object (treatAsChar=0) must also carry flowWithText="0" +
+    // allowOverlap="1": with flowWithText="1" Hancom reserves vertical space for
+    // it and GROWS the anchor cell/page even though it's "in front" — only "0"
+    // truly floats over the text. (Switching an inline image to front used to
+    // leave flowWithText="1", silently bloating the table.)
+    inner = inner.replace(/<hp:pos\b[^>]*\/>/, (m) => m
+      .replace(/treatAsChar="[^"]*"/, `treatAsChar="${inline ? 1 : 0}"`)
+      .replace(/flowWithText="[^"]*"/, `flowWithText="${inline ? 1 : 0}"`)
+      .replace(/allowOverlap="[^"]*"/, `allowOverlap="${inline ? 0 : 1}"`));
     out.wrap = w;
+  }
+  if (opts.frame != null) {
+    // Position frame (= hp:pos vert/horzRelTo). para = anchor paragraph top-left
+    // (Hancom CLAMPS it: can't rise above that paragraph's top, so a tall float
+    // on a one-line body paragraph rests low); page = body content top-left,
+    // paper = physical paper corner, column = text column — none of these have
+    // the per-paragraph clamp, so use page/paper to place freely above a line.
+    const fr = String(opts.frame).toUpperCase();
+    if (!['PARA', 'PAGE', 'PAPER', 'COLUMN'].includes(fr)) throw new Error('set_object_position: frame must be para/page/paper/column');
+    inner = inner.replace(/<hp:pos\b[^>]*\/>/, (m) => m
+      .replace(/vertRelTo="[^"]*"/, `vertRelTo="${fr}"`)
+      .replace(/horzRelTo="[^"]*"/, `horzRelTo="${fr}"`));
+    out.frame = fr.toLowerCase();
   }
   if (opts.x_mm != null || opts.y_mm != null) {
     inner = inner.replace(/<hp:pos\b[^>]*\/>/, (m) => {
