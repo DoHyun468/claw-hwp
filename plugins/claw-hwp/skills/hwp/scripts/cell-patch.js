@@ -208,15 +208,15 @@ function makeParaTextRecord(text) {
   return Buffer.concat([head, body]);
 }
 
-function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0) {
+function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0, removeObjects = false) {
   const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara);
-  if (loc.hasInlineObject) {
+  if (loc.hasInlineObject && !(text === '' && removeObjects)) {
     // The paragraph hosts an inline object (e.g. an embedded 그림/figure). Rewriting
     // its PARA_TEXT drops the object's anchor char and orphans the control, which
     // Hancom Docs rejects ("문서를 열 수 없습니다"). Refuse rather than silently
-    // corrupt — the caller should target a different paragraph (cell_para) or remove
-    // the object separately.
-    throw new Error(`set_cell_text: cell paragraph ${cellPara} hosts an inline object (e.g. an embedded image) — editing its text would orphan the object. Target a text-only paragraph via cell_para, or remove the object first.`);
+    // corrupt — clear it with text:"" + clear_objects:true to remove the object too,
+    // or target a text-only paragraph via cell_para.
+    throw new Error(`set_cell_text: cell paragraph ${cellPara} hosts an inline object (e.g. an embedded image) — editing its text would orphan the object. Pass clear_objects:true with text:"" to remove the object, or target a text-only paragraph via cell_para.`);
   }
   const paraHeader = records[loc.paraHeaderRec];
   const oldCount = raw.readUInt32LE(paraHeader.dataOff);
@@ -238,6 +238,27 @@ function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text
     // Splice back-to-front (LINE_SEG → CHAR_SHAPE → PARA_TEXT) so each record's
     // original byte offset stays valid through the prior splice. Headers keep the
     // original tag+level, only the size shrinks (so a small size is non-extended).
+    const recEnd = (r) => r.headOff + (r.ext ? 8 : 4) + r.size;
+    // Remove inline objects first (they sit AFTER the paragraph's PARA_TEXT/CHAR_SHAPE/
+    // LINE_SEG, so removing them keeps those lower offsets valid). An inline object is a
+    // CTRL_HEADER at paraLevel+1 plus every deeper record under it (the gso's caption
+    // paragraph, SHAPE_COMPONENT, etc.), up to the next record at paraLevel+1. Dropping
+    // the anchor control chars from PARA_TEXT (below) without removing the control would
+    // orphan it; removing both leaves a clean empty paragraph. (GT: handoff gso cluster.)
+    if (removeObjects) {
+      const paraLevel = records[loc.paraHeaderRec].level;
+      const ranges = [];
+      for (let i = loc.paraHeaderRec + 1; i < records.length; i++) {
+        const r = records[i];
+        if (r.level <= paraLevel) break;
+        if (r.tag === TAG_CTRL_HEADER && r.level === paraLevel + 1) {
+          let end = recEnd(r), j = i + 1;
+          for (; j < records.length && records[j].level > paraLevel + 1; j++) end = recEnd(records[j]);
+          ranges.push([r.headOff, end]); i = j - 1;
+        }
+      }
+      for (const [s, e] of ranges.sort((a, b) => b[0] - a[0])) raw = Buffer.concat([raw.slice(0, s), raw.slice(e)]);
+    }
     const shrinkRec = (recIdx, newSize) => {
       const r = records[recIdx]; if (r.size <= newSize) return;
       const head = Buffer.alloc(4);
@@ -1060,7 +1081,7 @@ function patchInPlaceSectors(filePath, resolved) {
     );
     for (const e of editsSorted) {
       const records = parseRecords(raw);
-      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0);
+      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',
