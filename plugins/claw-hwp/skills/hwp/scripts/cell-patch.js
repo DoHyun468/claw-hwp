@@ -5060,6 +5060,25 @@ export async function deleteObjectInPlace(filePath, ops) {
       let a = gi; while (a > 0 && !(recs[a].tag === TAG_PARA_HEADER && recs[a].level === 0)) a--;
       let b = a + 1; while (b < recs.length && !(recs[b].tag === TAG_PARA_HEADER && recs[b].level === 0)) b++;
       let out = Buffer.concat([raw.slice(0, recs[a].headOff), raw.slice(b < recs.length ? recs[b].headOff : raw.length)]);
+      // If the removed paragraph was the section's LAST top-level paragraph, the
+      // section would now end on the previous paragraph's gso cluster with no terminal
+      // paragraph — Hancom rejects that (cannot_open). GT (Hancom deleting the last
+      // object) leaves a terminal empty paragraph: PARA_HEADER(nchars=0x80000001,
+      // control_mask=0) + CHAR_SHAPE. Rebuild one from the deleted paragraph's own
+      // PARA_HEADER + CHAR_SHAPE so its para_shape/char_shape ids are valid here.
+      if (b >= recs.length) {
+        const phRec = recs[a];
+        const ph = Buffer.from(raw.slice(phRec.headOff, phRec.dataOff + phRec.size));
+        const phDataOff = phRec.dataOff - phRec.headOff;
+        ph.writeUInt32LE(0x80000001, phDataOff);     // nchars: empty paragraph (high bit | 1)
+        ph.writeUInt32LE(0, phDataOff + 4);          // control_mask: no controls remain
+        let csRec = null;
+        for (let k = a + 1; k < recs.length && !(recs[k].tag === TAG_PARA_HEADER && recs[k].level === 0); k++) {
+          if (recs[k].tag === TAG_PARA_CHAR_SHAPE) { csRec = recs[k]; break; }
+        }
+        const cs = csRec ? raw.slice(csRec.headOff, csRec.dataOff + csRec.size) : Buffer.alloc(0);
+        out = Buffer.concat([out, ph, cs]);
+      }
       if (delId != null) {
         const r2 = parseRecords(out);
         for (let i = 0; i < r2.length; i++) if (_isGso(out, r2[i])) { const o = gsoBinIdOffset(out, r2, i); if (o >= 0) { const v = out.readUInt16LE(o); if (v > delId) out.writeUInt16LE(v - 1, o); } }
@@ -5079,27 +5098,58 @@ export async function deleteObjectInPlace(filePath, ops) {
       return di;
     });
 
-    // ── Step 3: CFB — rotate BIN000{delId..N} chain pointers + zero deleted bytes ──
+    // ── Step 3: CFB — remove BIN000{delId} + renumber survivors to a contiguous
+    // BIN0001..BIN000(N-1), then rebuild the BinData child tree ──────────────────
+    // We RENAME each higher survivor's slot (k → k-1), keeping its own (start, size,
+    // ext) in place, rather than ROTATING (start,size) pointers between slots. A
+    // rotation makes Hancom reject the file whenever a renumber crosses the mini↔
+    // regular storage boundary (e.g. a chart's >4 KB regular stream and an image's
+    // <4 KB mini stream trading slots): sheetjs CFB.read tolerates the slot whose
+    // size no longer matches its sector class, but Hancom does not. Renaming leaves
+    // every stream in its own slot so its storage class never moves — and it mirrors
+    // Hancom's own delete, which renames image3→image2 and keeps N-1 entries.
     {
       let b2 = readFileSync(filePath);
       const h = parseCfbHeader(b2);
       const f2 = readFat(b2, h.fatAddrs, h.ssz);
       const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
       const mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
-      const rc = walkChain(f2, entries[0].start);
-      const byN = {}; let N = 0;
-      for (const e of entries) { const m = e.type === 2 && /^BIN(\d{4})\./.exec(e.name); if (m) { const n = parseInt(m[1], 10); byN[n] = e; if (n > N) N = n; } }
-      if (byN[delId]) {
-        const getP = (e) => ({ start: b2.readInt32LE(e.entryFileOffset + 0x74), size: b2.readUInt32LE(e.entryFileOffset + 0x78) });
-        const setP = (e, p) => { b2.writeInt32LE(p.start, e.entryFileOffset + 0x74); b2.writeUInt32LE(p.size, e.entryFileOffset + 0x78); };
-        const saved = getP(byN[delId]);
-        for (let k = delId; k < N; k++) if (byN[k] && byN[k + 1]) setP(byN[k], getP(byN[k + 1]));
-        if (byN[N]) {
-          setP(byN[N], saved);
-          const inMini = saved.size > 0 && saved.size < 4096; // zero the deleted object's bytes
-          const ch = saved.start >= 0 ? (inMini ? walkChain(mf2, saved.start) : walkChain(f2, saved.start)) : [];
-          for (const s of ch) { if (inMini) { const bo = s * h.mssz; const o = (512 + rc[Math.floor(bo / h.ssz)] * h.ssz) + (bo % h.ssz); b2.fill(0, o, o + h.mssz); } else b2.fill(0, 512 + s * h.ssz, 512 + s * h.ssz + h.ssz); }
-          b2.writeUInt32LE(0, byN[N].entryFileOffset + 0x78);
+      const rc = entries[0].start >= 0 ? walkChain(f2, entries[0].start) : [];
+      const slotOfBin = {}; let N = 0;
+      entries.forEach((e, idx) => { const m = e.type === 2 && /^BIN(\d{4})\./.exec(e.name); if (m) { const n = parseInt(m[1], 10); slotOfBin[n] = idx; if (n > N) N = n; } });
+      if (slotOfBin[delId] != null) {
+        const dEnt = entries[slotOfBin[delId]];
+        // 1. zero + free the deleted stream's own chain (prevents content extraction).
+        const dStart = b2.readInt32LE(dEnt.entryFileOffset + 0x74);
+        const dSize = b2.readUInt32LE(dEnt.entryFileOffset + 0x78);
+        const dMini = dSize > 0 && dSize < 4096;
+        const dChain = dStart >= 0 ? (dMini ? walkChain(mf2, dStart) : walkChain(f2, dStart)) : [];
+        for (const s of dChain) { if (dMini) { const bo = s * h.mssz; const o = (512 + rc[Math.floor(bo / h.ssz)] * h.ssz) + (bo % h.ssz); b2.fill(0, o, o + h.mssz); } else b2.fill(0, 512 + s * h.ssz, 512 + s * h.ssz + h.ssz); }
+        for (const s of dChain) { if (dMini) writeMinifatEntry(b2, h.ssz, h.mssz, f2, h.minifatStart, s, FREESECT); else writeFatEntry(b2, h.ssz, h.fatAddrs, s, FREESECT); }
+        // 2. free the deleted directory slot (zero it, NOSTREAM the pointers, type 0).
+        { const off = dEnt.entryFileOffset; b2.fill(0, off, off + 128); b2.writeInt32LE(-1, off + 0x44); b2.writeInt32LE(-1, off + 0x48); b2.writeInt32LE(-1, off + 0x4C); dEnt.type = 0; dEnt.name = ''; }
+        // 3. renumber survivors: BIN000k → BIN000(k-1) for k > delId. The 4 digits sit
+        //    at byte 6 (after "BIN", UTF-16LE); ext + start/size are untouched so each
+        //    stream keeps its sector class. Lower (k < delId) keep their names.
+        const survivors = [];
+        for (let k = 1; k <= N; k++) {
+          if (k === delId || slotOfBin[k] == null) continue;
+          const e = entries[slotOfBin[k]];
+          if (k > delId) { const nn = String(k - 1).padStart(4, '0'); Buffer.from(nn, 'utf16le').copy(b2, e.entryFileOffset + 6); e.name = 'BIN' + nn + e.name.slice(7); }
+          survivors.push(slotOfBin[k]);
+        }
+        // 4. rebuild the BinData child tree from the survivors — or, if none remain,
+        //    drop the now-empty BinData storage (a clean no-binary .hwp has NO BinData
+        //    folder; an empty folder makes Hancom reject the document).
+        const binDataIdx = entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+        if (binDataIdx >= 0) {
+          if (survivors.length > 0) {
+            rebuildChildTree(b2, entries, binDataIdx, survivors);
+          } else {
+            const rootKids = collectTreeNodes(entries, entries[0].child).filter((i) => i !== binDataIdx);
+            const off = entries[binDataIdx].entryFileOffset; b2.fill(0, off, off + 128); b2.writeInt32LE(-1, off + 0x44); b2.writeInt32LE(-1, off + 0x48); b2.writeInt32LE(-1, off + 0x4C); entries[binDataIdx].type = 0; entries[binDataIdx].name = '';
+            rebuildChildTree(b2, entries, 0, rootKids);
+          }
         }
       }
       writeFileSync(filePath, b2);
@@ -5804,6 +5854,41 @@ function insertEntryIntoTree(buf, entries, parentIdx, newIdx) {
       throw new Error(`insertEntryIntoTree: duplicate name "${newName}"`);
     }
   }
+}
+
+// Collect every node in a storage's child tree — the left/right-sibling BST rooted at
+// `rootSlot`. Does NOT descend into nodes' own `child` subtrees, so it returns only the
+// direct children of one storage (e.g. all of Root Entry's top-level entries).
+function collectTreeNodes(entries, rootSlot) {
+  const out = [];
+  if (rootSlot == null || rootSlot < 0) return out;
+  const stack = [rootSlot];
+  const seen = new Set();
+  while (stack.length) {
+    const i = stack.pop();
+    if (i < 0 || i >= entries.length || seen.has(i)) continue;
+    seen.add(i);
+    out.push(i);
+    if (entries[i].leftSibling >= 0) stack.push(entries[i].leftSibling);
+    if (entries[i].rightSibling >= 0) stack.push(entries[i].rightSibling);
+  }
+  return out;
+}
+
+// Rebuild a storage's child tree from scratch over `kids` (slot indices): clear the
+// parent's child pointer and each kid's SIBLING links (left/right) — never a kid's own
+// `child`, so folders keep their subtrees — then re-insert each via the same simple-BST
+// insert used on creation. Lets us remove an entry from a tree by collecting the
+// survivors and rebuilding, without implementing general BST node deletion.
+function rebuildChildTree(buf, entries, parentIdx, kids) {
+  buf.writeInt32LE(-1, entries[parentIdx].entryFileOffset + 0x4C);
+  entries[parentIdx].child = -1;
+  for (const idx of kids) {
+    const off = entries[idx].entryFileOffset;
+    buf.writeInt32LE(-1, off + 0x44); entries[idx].leftSibling = -1;
+    buf.writeInt32LE(-1, off + 0x48); entries[idx].rightSibling = -1;
+  }
+  for (const idx of kids) insertEntryIntoTree(buf, entries, parentIdx, idx);
 }
 
 function writeDirEntry(buf, entry, name, type, startSector, byteSize, color = 0) {
