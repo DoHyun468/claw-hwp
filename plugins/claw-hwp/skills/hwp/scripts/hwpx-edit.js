@@ -2827,6 +2827,45 @@ function opDeleteImage(doc, target) {
   return { entry, itemId, picsRemoved, deleted: true };
 }
 
+// Renumber a part family so its numbers are contiguous (1..N), matching what
+// Hancom itself does on delete (GT delete-obj-*: deleting the middle image
+// renumbers image3→image2, no gap). `prefix`='image'|'chart', `dir`='BinData'|
+// 'Chart', `refStyle`='id' (image → binaryItemIDRef=the id) | 'href' (chart →
+// chartIDRef=the part name). Renames the file, the manifest item's id+href, and
+// every section ref — atomically per move, ascending so targets are always free.
+function renumberParts(doc, prefix, dir, refStyle) {
+  const hpf = doc.hpfName();
+  if (!hpf) return 0;
+  let manifest = doc.read(hpf);
+  const items = [];
+  for (const m of manifest.matchAll(/<opf:item\b[^>]*\/>/g)) {
+    const idm = m[0].match(new RegExp(`id="(${prefix}(\\d+))"`));
+    const hm = m[0].match(/href="([^"]+)"/);
+    if (idm && hm && hm[1].indexOf(`${dir}/`) === 0) items.push({ id: idm[1], n: Number(idm[2]), href: hm[1] });
+  }
+  items.sort((a, b) => a.n - b.n);
+  let moved = 0;
+  items.forEach((it, i) => {
+    const target = i + 1;
+    if (it.n === target) return;
+    const ext = (it.href.match(/\.([^.\/]+)$/) || [, ''])[1];
+    const newHref = `${dir}/${prefix}${target}${ext ? '.' + ext : ''}`;
+    const newId = `${prefix}${target}`;
+    if (doc.files[it.href]) { doc.files[newHref] = doc.files[it.href]; delete doc.files[it.href]; }
+    manifest = manifest.replace(`id="${it.id}"`, `id="${newId}"`).replace(`href="${it.href}"`, `href="${newHref}"`);
+    for (const sn of doc.sectionNames()) {
+      let sx = doc.read(sn);
+      sx = refStyle === 'href'
+        ? sx.split(`chartIDRef="${it.href}"`).join(`chartIDRef="${newHref}"`)
+        : sx.split(`binaryItemIDRef="${it.id}"`).join(`binaryItemIDRef="${newId}"`);
+      doc.write(sn, sx);
+    }
+    moved++;
+  });
+  doc.write(hpf, manifest);
+  return moved;
+}
+
 // Generic floating-object delete by (target, index) — same addressing as the
 // set_object_* family (findObject): target = image / chart / shape (rect·ellipse·
 // line·arc·polygon·curve, incl. textbox) / equation, index = 0-based in document
@@ -2834,12 +2873,11 @@ function opDeleteImage(doc, target) {
 // object its own paragraph → no empty line left), then drops its external part +
 // manifest item (image → BinData/, chart → Chart/). Shape/textbox/equation carry
 // no external part → only the paragraph is removed.
-// NUMBERING: Hancom renumbers remaining parts contiguous on delete (GT
-// delete-obj-*: deleting the middle image renumbers image3→image2). We do NOT —
-// refs are by id so a gap renders identically (verified on Hancom web), and
-// insert_image/embedChartSpace pick the next FREE number (gap-safe) so a gap
-// never collides. Leaving the gap = simpler, lower risk, render-identical.
-function opDeleteObject(doc, target, index) {
+// NUMBERING: by default we RENUMBER the remaining parts contiguous (image3→image2)
+// to match Hancom's own delete byte-for-byte (GT delete-obj-after-mid-removed).
+// `renumber:false` keeps the gap (image1+image3) — also valid (refs are by id so
+// it renders identically, and insert is gap-safe).
+function opDeleteObject(doc, target, index, renumber) {
   const f = findObject(doc, target, index); // throws if not found
   const blob = (f.el.attrs || '') + (f.el.inner || '');
   const binRef = (blob.match(/binaryItemIDRef="([^"]+)"/) || [])[1] || null;
@@ -2851,7 +2889,9 @@ function opDeleteObject(doc, target, index) {
   doc.write(f.name, dropLinesegs(xml));
   // 2) drop the external part + its manifest item (no dangling ref)
   let removedPart = null;
+  let renumbered = 0;
   const hpf = doc.hpfName();
+  const doRenumber = renumber !== false; // default ON (match Hancom GT)
   if (binRef && hpf) {
     let s = doc.read(hpf);
     const hm = s.match(new RegExp(`<opf:item [^>]*id="${escapeRegex(binRef)}"[^>]*href="([^"]+)"[^>]*/>|<opf:item [^>]*href="([^"]+)"[^>]*id="${escapeRegex(binRef)}"[^>]*/>`));
@@ -2859,14 +2899,16 @@ function opDeleteObject(doc, target, index) {
     s = s.replace(new RegExp(`<opf:item [^>]*id="${escapeRegex(binRef)}"[^>]*/>`), '');
     doc.write(hpf, s);
     if (removedPart && doc.files[removedPart]) delete doc.files[removedPart];
+    if (doRenumber) renumbered = renumberParts(doc, 'image', 'BinData', 'id');
   } else if (chartHref && hpf) {
     let s = doc.read(hpf);
     s = s.replace(new RegExp(`<opf:item [^>]*href="${escapeRegex(chartHref)}"[^>]*/>`), '');
     doc.write(hpf, s);
     if (doc.files[chartHref]) delete doc.files[chartHref];
     removedPart = chartHref;
+    if (doRenumber) renumbered = renumberParts(doc, 'chart', 'Chart', 'href');
   }
-  return { target, index: Math.max(0, Number(index) || 0), tag: f.tag, removedPart, deleted: true };
+  return { target, index: Math.max(0, Number(index) || 0), tag: f.tag, removedPart, renumbered, deleted: true };
 }
 
 function opInsertImage(doc, sourcePath, ext, width, height, index) {
@@ -4074,7 +4116,7 @@ function applyOp(doc, op) {
       op.index);
     case 'replace_image': return opReplaceImage(doc, op.target, op.source);
     case 'delete_image': return opDeleteImage(doc, op.target);
-    case 'delete_object': return opDeleteObject(doc, op.target, op.index);
+    case 'delete_object': return opDeleteObject(doc, op.target, op.index, op.renumber);
     case 'set_field_value': return opSetFieldValue(doc, op.name, op.value);
     case 'set_header': return opSetHeaderFooter(doc, 'header', op.text, op.applyPageType, op.align);
     case 'set_footer': return opSetHeaderFooter(doc, 'footer', op.text, op.applyPageType, op.align);
