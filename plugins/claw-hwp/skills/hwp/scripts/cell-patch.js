@@ -854,7 +854,10 @@ function findStreamEntry(entries, pathParts) {
 // We open the doc, walk getCellInfo until we find the matching (row, col),
 // then immediately discard the doc — rhwp is never used to write bytes.
 async function resolveCellIndexes(filePath, edits) {
-  const rhwp = await import(`${__dirname}/vendor/rhwp/rhwp.js`);
+  // Windows: a bare `${__dirname}/…` string is parsed by the ESM loader as a
+  // URL whose scheme is the drive letter ("c:") and rejected. pathToFileURL
+  // yields a valid file:// URL on every platform (no-op shape change on POSIX).
+  const rhwp = await import(url.pathToFileURL(path.join(__dirname, 'vendor/rhwp/rhwp.js')).href);
   await rhwp.default({
     module_or_path: readFileSync(`${__dirname}/vendor/rhwp/rhwp_bg.wasm`),
   });
@@ -1144,7 +1147,9 @@ function patchInPlaceSectors(filePath, resolved) {
 // it does mean output here is not byte-clean against the input. We only
 // take this path when the in-place patch can't fit, never by default.
 async function patchViaSheetjs(filePath, resolved) {
-  const CFB = await import(`${__dirname}/vendor/cfb/cfb.js`);
+  // file:// URL so the ESM loader doesn't read the Windows drive letter as a
+  // URL scheme (see resolveCellIndexes above); identical resolution on POSIX.
+  const CFB = await import(url.pathToFileURL(path.join(__dirname, 'vendor/cfb/cfb.js')).href);
   const cfb = CFB.parse(readFileSync(filePath));
 
   const bySection = new Map();

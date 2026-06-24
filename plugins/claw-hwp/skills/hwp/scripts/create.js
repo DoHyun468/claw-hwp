@@ -2865,7 +2865,9 @@ async function readStdin() {
         if (!globalThis.__rhwp_loaded_for_template) {
           await rhwp.default({
             module_or_path: fs.readFileSync(
-              path.resolve(path.dirname(new URL(import.meta.url).pathname), "vendor/rhwp/rhwp_bg.wasm")
+              // __dirname (via fileURLToPath) — NOT new URL(...).pathname, which
+              // on Windows yields "/C:/…" and path.resolve doubles it to "C:\C:\…".
+              path.resolve(__dirname, "vendor/rhwp/rhwp_bg.wasm")
             ),
           });
           if (typeof globalThis.measureTextWidth !== "function") {
@@ -2952,7 +2954,9 @@ async function readStdin() {
               if (!globalThis.__rhwp_loaded_for_template) {
                 await rhwpForTable.default({
                   module_or_path: fs.readFileSync(
-                    path.resolve(path.dirname(new URL(import.meta.url).pathname), 'vendor/rhwp/rhwp_bg.wasm')
+                    // __dirname (fileURLToPath) — new URL(...).pathname gives
+                    // "/C:/…" on Windows, which path.resolve doubles to "C:\C:\…".
+                    path.resolve(__dirname, 'vendor/rhwp/rhwp_bg.wasm')
                   ),
                 });
                 if (typeof globalThis.measureTextWidth !== 'function') {
