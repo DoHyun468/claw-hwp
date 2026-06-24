@@ -4295,30 +4295,39 @@ export async function insertImageInPlace(filePath, ops) {
         let attached = false;
         if (wrapMode !== 'inline' && op.anchor && typeof op.anchor === 'string') {
           const ab = Buffer.from(op.anchor, 'utf16le');
-          let cl = null, ptRec = null;
-          for (const c of clusters) {
-            for (let i = c.startIdx + 1; i < c.endIdx; i++) {
-              const r = records[i];
-              if (r.tag === TAG_PARA_TEXT && r.level === 1 && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { cl = c; ptRec = r; break; }
-            }
-            if (ptRec) break;
+          // Find the anchor PARA_TEXT at ANY depth — body (level 1) OR a table cell
+          // (level 3). The gso attaches to that paragraph wherever it lives.
+          let ptIdx = -1;
+          for (let i = 0; i < records.length; i++) {
+            const r = records[i];
+            if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { ptIdx = i; break; }
           }
-          if (ptRec) {
-            const cr = parseRecords(cluster);                       // the full-para image cluster
-            const ctrlR = cr.find((r) => r.tag === TAG_CTRL_HEADER);
-            const gsoPart = Buffer.from(cluster.slice(ctrlR.headOff)); // CTRL_HEADER + SHAPE_COMPONENT + CTRL_DATA (size/wrap/pos already applied)
-            const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex'); // inline gso anchor (8 wchars), before EOP
-            const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
-            const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
-            const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, oldBody.length + gsoChar.length), oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
-            const phOff = records[cl.startIdx].dataOff;             // anchor PARA_HEADER: char_count += 8, control_mask |= 0x800
-            const curCount = raw.readUInt32LE(phOff);
-            raw.writeUInt32LE((((curCount & 0x80000000) >>> 0) | ((curCount & 0x7FFFFFFF) + 8)) >>> 0, phOff);
-            raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
-            const clusterEndOff = cl.endIdx < records.length ? records[cl.endIdx].headOff : raw.length;
-            raw = Buffer.concat([raw.slice(0, clusterEndOff), gsoPart, raw.slice(clusterEndOff)]); // gso at para end (after PARA_TEXT → ptRec offsets stay valid)
-            raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
-            attached = true;
+          if (ptIdx !== -1) {
+            const ptRec = records[ptIdx];
+            const phLevel = ptRec.level - 1;        // PARA_HEADER is one level above its text (body 0 / cell 2)
+            const delta = ptRec.level - 1;          // shift the body-built gso part down into the cell's depth (+2 for cells)
+            let phIdx = -1;                          // anchor PARA_HEADER = nearest preceding header at phLevel
+            for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_PARA_HEADER && records[i].level === phLevel) { phIdx = i; break; } }
+            let endIdx = records.length;            // paragraph end = next record at level <= phLevel (next para / cell / table edge)
+            for (let i = ptIdx + 1; i < records.length; i++) { if (records[i].level <= phLevel) { endIdx = i; break; } }
+            if (phIdx !== -1) {
+              const cr = parseRecords(cluster);                       // the full-para image cluster
+              const ctrlR = cr.find((r) => r.tag === TAG_CTRL_HEADER);
+              let gsoPart = Buffer.from(cluster.slice(ctrlR.headOff)); // CTRL_HEADER + SHAPE_COMPONENT + CTRL_DATA (size/wrap/pos already applied)
+              if (delta !== 0) gsoPart = relevelCluster(gsoPart, delta); // re-level into the cell (CTRL 1→3, COMP/DATA 2→4)
+              const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex'); // inline gso anchor (8 wchars), before EOP
+              const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+              const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+              const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, ptRec.level, oldBody.length + gsoChar.length), oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
+              const phOff = records[phIdx].dataOff;                   // anchor PARA_HEADER: char_count += 8, control_mask |= 0x800
+              const curCount = raw.readUInt32LE(phOff);
+              raw.writeUInt32LE((((curCount & 0x80000000) >>> 0) | ((curCount & 0x7FFFFFFF) + 8)) >>> 0, phOff);
+              raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
+              const paraEndOff = endIdx < records.length ? records[endIdx].headOff : raw.length;
+              raw = Buffer.concat([raw.slice(0, paraEndOff), gsoPart, raw.slice(paraEndOff)]); // gso at para end (after PARA_TEXT → ptRec offsets stay valid)
+              raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+              attached = true;
+            }
           }
         }
         if (!attached) {
@@ -4380,9 +4389,46 @@ function sealCtrlWcharLen(code) {
 // halfwidth (incl. space) = 0.5 em; control chars = 0. (handoff §2 metric.)
 function sealGlyphEm(code) {
   if (code < 0x20) return 0;
-  if (code <= 0x7e) return 0.5;
+  if (code <= 0x7e) return 0.5;   // ASCII incl. space ≈ half-width
   if (code >= 0xff61 && code <= 0xffdc) return 0.5; // halfwidth forms
   return 1.0;
+}
+
+// A center/right-aligned paragraph shifts its whole text block away from the left
+// edge, which a left-anchored startX walk doesn't see — on a center-aligned form
+// cell that makes the seal drift symmetrically off the marker. Read the anchor
+// paragraph's alignment (PARA_SHAPE) and, for center/right, return the block shift
+// (mm) to add to the seal's x: center → (availW − textW)/2, right → availW − textW.
+// availW = the cell's content width (forms put signature lines in cells) or a body
+// text-area default. textW = font-metric width of the whole paragraph.
+function sealAlignShift(buf, records, ptIdx, body, em, textAreaMm) {
+  const ptRec = records[ptIdx];
+  const phLevel = ptRec.level - 1;
+  let phIdx = -1;
+  for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_PARA_HEADER && records[i].level === phLevel) { phIdx = i; break; } }
+  if (phIdx === -1) return 0;
+  const raw = readDecodedStreamFromCfb(buf, ['BodyText', 'Section0']);
+  const psId = raw.readUInt16LE(records[phIdx].dataOff + 8); // PARA_HEADER body off8 = para_shape_id
+  let docInfo;
+  try { docInfo = readDecodedStreamFromCfb(buf, ['DocInfo']); } catch { return 0; }
+  const di = parseRecords(docInfo);
+  const shapes = di.filter((r) => r.tag === 0x19); // HWPTAG_PARA_SHAPE
+  if (psId >= shapes.length) return 0;
+  const align = (docInfo.readUInt32LE(shapes[psId].dataOff) >> 2) & 0x7; // 0 just,1 left,2 right,3 center
+  if (align !== 2 && align !== 3) return 0;
+  // available width: cell content width if the anchor lives in a table cell, else body text area
+  let availMm = textAreaMm;
+  if (ptRec.level >= 3) {
+    let lh = -1;
+    for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_LIST_HEADER && records[i].level === 2) { lh = i; break; } }
+    if (lh !== -1) {
+      const d = records[lh].dataOff;
+      const w = raw.readUInt32LE(d + 16), mL = raw.readUInt16LE(d + 24), mR = raw.readUInt16LE(d + 26);
+      availMm = (w - mL - mR) / HWPUNIT_PER_MM;
+    }
+  }
+  const textW = sealMeasureWidthMM(body, body.length, em);
+  return align === 3 ? (availMm - textW) / 2 : (availMm - textW);
 }
 // Sum the glyph advance (mm) of the PARA_TEXT body up to `uptoByteOff`, skipping
 // inline-control runs by their wchar length so the offset walk stays aligned.
@@ -4416,11 +4462,12 @@ export async function placeSealInPlace(filePath, ops) {
     const raw = readDecodedStreamFromCfb(buf, ['BodyText', 'Section0']);
     const records = parseRecords(raw);
     const ab = Buffer.from(op.anchor, 'utf16le');
-    let ptRec = null, anchorByteInBody = -1;
-    for (const r of records) {
+    let ptRec = null, ptIdx = -1, anchorByteInBody = -1;
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
       if (r.tag !== TAG_PARA_TEXT || r.size <= 0) continue;
       const idx = raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab);
-      if (idx !== -1) { ptRec = r; anchorByteInBody = idx; break; }
+      if (idx !== -1) { ptRec = r; ptIdx = i; anchorByteInBody = idx; break; }
     }
     if (!ptRec) throw new Error(`place_seal: anchor "${op.anchor}" not found in body text`);
     const body = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
@@ -4440,7 +4487,11 @@ export async function placeSealInPlace(filePath, ops) {
     if (mode !== 'overlap' && mode !== 'right') throw new Error('place_seal: mode must be overlap / right / auto');
 
     let posX = mode === 'right' ? startX + aw + 2 : startX + aw / 2 - size / 2;
-    posX += (op.dx_mm || 0);
+    // Center/right-aligned paragraphs (common in form cells) shift the whole text
+    // block — add that shift so the seal tracks the on-screen marker, not the
+    // left-anchored estimate. (No-op for left/justify; agent can still nudge dx.)
+    const alignShift = sealAlignShift(buf, records, ptIdx, body, em, TEXT_AREA_W);
+    posX += alignShift + (op.dx_mm || 0);
     const frame = String(op.frame || 'para').toLowerCase();
     // Centre the seal on the line: lift it by half the overhang. PARA clamps this to
     // 0 on a free top line (→ top-aligned, GT-equivalent); cells & PAGE frame honour it.
