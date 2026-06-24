@@ -258,7 +258,7 @@ function cmdFill(args) {
       if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: name, key: f.key, status: 'EMPTY_KEY' }); continue; }
       const val = formatValue(String(raw), f.format); // reshape in-tool (date/phone/rrn/…)
       if (f.placeholder != null) values[f.placeholder] = val;
-      else if (f.table != null && f.row != null && f.col != null) operations.push({ type: 'set_cell_text', table: f.table, row: f.row, col: f.col, text: val });
+      else if (f.table != null && f.row != null && f.col != null) operations.push({ type: 'set_cell_text', table: f.table, row: f.row, col: f.col, text: val, fit: f.fit ?? true });
       else refuse(`.hwpx field '${f.key}' needs 'placeholder' OR 'table'+'row'+'col' (label+offset is .hwp-only)`);
       attempted.push({ field: name, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
     }

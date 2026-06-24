@@ -438,7 +438,29 @@ function getTable(doc, tableIndex) {
 
 // Set the inner text of one <hp:tc>, collapsing its first paragraph to a single
 // run. Preserves the <hp:subList> wrapper and trailing cell metadata.
-function setCellInner(tcInner, text) {
+function xmlUnescape(s) {
+  return String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+// Length-preserving fill for a positioning-layout cell ("라벨   (마커)" — label +
+// padding spaces + a marker pinned at a fixed column). Whole-cell overwrite would
+// shift the marker / wrap the line if the new string differs in length, so when
+// `fit` is on we splice the value INTO the longest run of 2+ spaces and delete
+// exactly as many spaces as we add (keeping one leading space off the label).
+// Same algorithm as the .hwp path (cell-patch.js fitValueIntoLayout, commit bb02bfd).
+// Falls back to the raw value when there's no padding run big enough to absorb it.
+function fitValueIntoLayout(orig, value) {
+  let best = null;
+  const re = / {2,}/g;
+  let m;
+  while ((m = re.exec(orig)) !== null) {
+    if (!best || m[0].length > best.len) best = { idx: m.index, len: m[0].length };
+  }
+  if (!best || best.len < value.length) return value; // not enough padding → no-op-ish (use value)
+  const keep = best.len > value.length ? 1 : 0;
+  return orig.slice(0, best.idx + keep) + value + orig.slice(best.idx + keep + value.length);
+}
+
+function setCellInner(tcInner, text, fit) {
   // The first <hp:p> inside the subList holds the cell content.
   const subs = scanTopLevel(tcInner, 'hp:subList');
   if (!subs.length) return tcInner;
@@ -446,6 +468,17 @@ function setCellInner(tcInner, text) {
   const ps = scanTopLevel(sub.inner, 'hp:p');
   if (!ps.length) return tcInner;
   const p = ps[0];
+  // fit = preserve the cell's visual length. Read the current text (merged <hp:t>
+  // runs, un-escaped) and splice the value in without changing total length. Skip
+  // when the paragraph hosts an inline control/object (field/image/nested table/…)
+  // — we can't cleanly isolate the text there, so write the value as-is.
+  if (fit) {
+    const hasInline = /<hp:(ctrl|pic|tbl|chart|equation|rect|ellipse|line|arc|polygon|curve|connectLine|drawText)\b/.test(p.inner);
+    if (!hasInline) {
+      const orig = xmlUnescape((p.inner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((t) => t.replace(/<\/?hp:t>/g, '')).join(''));
+      text = fitValueIntoLayout(orig, text);
+    }
+  }
   const charPrId = (p.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
   const newP = `<hp:p${p.attrs}>${runWithText(charPrId, text)}</hp:p>`;
   const newSubInner = spliceEl(sub.inner, p, newP);
@@ -453,7 +486,7 @@ function setCellInner(tcInner, text) {
   return spliceEl(tcInner, sub, newSub);
 }
 
-function opSetCellText(doc, tableIndex, row, col, text) {
+function opSetCellText(doc, tableIndex, row, col, text, fit) {
   const { section, el } = getTable(doc, tableIndex);
   const tbl = el.inner;
   const rows = scanTopLevel(tbl, 'hp:tr');
@@ -471,7 +504,7 @@ function opSetCellText(doc, tableIndex, row, col, text) {
     targetIdx = col; // fall back to positional
   }
   const tc = tcs[targetIdx];
-  const newTcInner = setCellInner(tc.inner, text);
+  const newTcInner = setCellInner(tc.inner, text, fit);
   const newTc = `<hp:tc${tc.attrs}>${newTcInner}</hp:tc>`;
   const newRowInner = spliceEl(rows[row].inner, tc, newTc);
   const newRow = `<hp:tr${rows[row].attrs}>${newRowInner}</hp:tr>`;
@@ -4514,7 +4547,7 @@ function applyOp(doc, op) {
     case 'set_paragraph_text': return opSetParagraphText(doc, op.index, op.text);
     case 'append_paragraph': return opAppendParagraph(doc, op.text);
     case 'delete_paragraph': return opDeleteParagraph(doc, op.index);
-    case 'set_cell_text': return opSetCellText(doc, op.table, op.row, op.col, op.text);
+    case 'set_cell_text': return opSetCellText(doc, op.table, op.row, op.col, op.text, op.fit);
     case 'append_table_row': return opAppendTableRow(doc, op.table, op.cells);
     case 'delete_table_row': return opDeleteTableRow(doc, op.table, op.row);
     case 'append_table_column': return opAppendTableColumn(doc, op.table, op.cells);
