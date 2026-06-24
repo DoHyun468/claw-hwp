@@ -32,6 +32,7 @@ This skill helps Claude work with Korean Hangul Word Processor documents — rea
 **포맷별 매핑 (`fill`의 채우기 엔진):**
 - **`.hwp`** → `create.js` raw-patch. 매핑 필드 = `{key, label, col_offset?, row_offset?, format?}` (라벨 셀 찾아 인접 칸 채움).
 - **`.hwpx`** → `hwpx-edit.js`. 매핑 필드 = `{key, placeholder, format?}`(서식의 빈칸 텍스트를 control/run-aware로 치환 — 권장) **또는** `{key, table, row, col, format?}`(위치). **label+offset은 .hwp 전용**(HWPX엔 by-label 없음). 값은 동일하게 도구가 in-tool로 읽어 stdin에만 흘림.
+  - ⚠️ **형식 있는 칸(밑줄·괄호·뒤에 (서명)/(인) 마커)엔 `placeholder`를 써라** — 그 빈칸 텍스트(예: `placeholder:"____________"`, `"(    )"`)만 run-aware로 바꿔 주변 라벨·마커를 **보존**한다. `table/row/col`은 **셀 전체를 값으로 덮어써** 밑줄·마커가 사라지고(실측: `"____ (서명)"` → `"홍길동"`), 게다가 secure-fill은 값이 마스킹돼 에이전트가 길이를 미리 못 맞춘다. → **`table/row/col`은 빈 값칸(라벨 옆 빈 셀)에만**, 형식 칸은 `placeholder`로.
 
 **Cowork / 원격 샌드박스 흐름 (detect의 `likely_sandbox: true`)**
 - ⛔ **업로드 = 이미 유입 (최우선):** 사용자가 값을 채운 `.txt/.csv/.md`를 **업로드하는 순간** 시스템이 그 본문을 네 컨텍스트에 **자동 주입**한다(네가 열지 않아도). 🚫 헤더·권한·secure-fill 로도 못 막는다. → **PII가 든 파일을 업로드하게 하지 마라.** 유일한 방어는 아래 (A)/(B).
