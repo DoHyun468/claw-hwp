@@ -27,8 +27,21 @@ export function describeTable(doc, sec, para, ctrl) {
       break;
     }
     if (!info || typeof info.row !== "number") break;
+    // Read EVERY paragraph of the cell, not just the first — Korean forms split
+    // a label across lines ("사업장"/"소재지", "공"/"급"/"자"), and getTextInCell
+    // returns one paragraph at a time. Join with "\n" so the full label is
+    // visible (set_cell_text_by_label normalises whitespace before matching).
     let text = "";
-    try { text = doc.getTextInCell(sec, para, ctrl, i, 0, 0, 100000); } catch {}
+    try {
+      const nPara = doc.getCellParagraphCount(sec, para, ctrl, i);
+      const parts = [];
+      for (let pi = 0; pi < nPara; pi++) {
+        try { parts.push(doc.getTextInCell(sec, para, ctrl, i, pi, 0, 100000)); } catch {}
+      }
+      text = parts.join("\n");
+    } catch {
+      try { text = doc.getTextInCell(sec, para, ctrl, i, 0, 0, 100000); } catch {}
+    }
     cells.push({
       idx: i,
       row: info.row,

@@ -108,7 +108,7 @@ function parseRecords(raw) {
 // rhwp's WASM parses them correctly, so we let it tell us the index and
 // then count LIST_HEADERs at the raw level.
 
-function locateCell(records, sectionParaIdx, controlIdx, cellIndex) {
+function locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara = 0) {
   // Find the target paragraph header (level 0)
   let para = -1;
   let paraStart = -1;
@@ -149,24 +149,39 @@ function locateCell(records, sectionParaIdx, controlIdx, cellIndex) {
   }
   if (cellStartRec < 0) throw new Error(`cell index ${cellIndex} not found in table at paragraph ${sectionParaIdx} control ${controlIdx} (only ${listCount} cells seen)`);
 
-  // Inside this cell: first PARA_HEADER right after LIST_HEADER (level 2).
-  let paraHeaderRec = -1;
+  // Inside this cell: the cellPara-th PARA_HEADER (level 2). A cell's paragraphs
+  // are level-2 PARA_HEADERs between this LIST_HEADER and the next cell's
+  // LIST_HEADER (or table end at level < 2); their text/shape children are level
+  // 3. cellPara 0 = the first paragraph (the common case). Higher indices target
+  // later paragraphs of a multi-paragraph cell (e.g. clearing each line of a form
+  // cell that holds several paragraphs of content).
+  let paraHeaderRec = -1, paraSeen = -1;
   for (let i = cellStartRec + 1; i < records.length; i++) {
     const r = records[i];
-    if (r.tag === TAG_PARA_HEADER && r.level === 2) { paraHeaderRec = i; break; }
     if (r.tag === TAG_LIST_HEADER && r.level === 2) break; // next cell
+    if (r.level < 2) break;                                  // back to table/section level
+    if (r.tag === TAG_PARA_HEADER && r.level === 2) {
+      paraSeen++;
+      if (paraSeen === cellPara) { paraHeaderRec = i; break; }
+    }
   }
-  if (paraHeaderRec < 0) throw new Error('cell paragraph header not found');
+  if (paraHeaderRec < 0) throw new Error(`cell paragraph ${cellPara} not found (cell has ${paraSeen + 1} paragraph(s))`);
 
-  // Optional PARA_TEXT and PARA_CHAR_SHAPE that follow (level 3).
-  let paraTextRec = null, charShapeRec = null;
+  // Optional PARA_TEXT / PARA_CHAR_SHAPE / PARA_LINE_SEG that follow (level 3).
+  // Also flag whether the paragraph hosts an inline object (a CTRL_HEADER child,
+  // e.g. an embedded 그림/figure): its anchor char lives in PARA_TEXT, so editing
+  // or clearing the text orphans the control and Hancom Docs rejects the file.
+  const paraLevel = records[paraHeaderRec].level;
+  let paraTextRec = null, charShapeRec = null, lineSegRec = null, hasInlineObject = false;
   for (let i = paraHeaderRec + 1; i < records.length; i++) {
     const r = records[i];
-    if (r.level <= 2) break; // back to cell-level
+    if (r.level <= paraLevel) break; // back to cell/paragraph level
     if (r.tag === TAG_PARA_TEXT && paraTextRec === null) paraTextRec = i;
     else if (r.tag === TAG_PARA_CHAR_SHAPE && charShapeRec === null) charShapeRec = i;
+    else if (r.tag === TAG_PARA_LINE_SEG && lineSegRec === null) lineSegRec = i;
+    else if (r.tag === TAG_CTRL_HEADER) hasInlineObject = true;
   }
-  return { listHeaderRec: cellStartRec, paraHeaderRec, paraTextRec, charShapeRec };
+  return { listHeaderRec: cellStartRec, paraHeaderRec, paraTextRec, charShapeRec, lineSegRec, hasInlineObject };
 }
 
 // ── HWP cell patching ─────────────────────────────────────────────────────
@@ -193,12 +208,76 @@ function makeParaTextRecord(text) {
   return Buffer.concat([head, body]);
 }
 
-function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text) {
-  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex);
-  const newTextCount = text.length + 1; // + EOP
+function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0, removeObjects = false) {
+  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara);
+  if (loc.hasInlineObject && !(text === '' && removeObjects)) {
+    // The paragraph hosts an inline object (e.g. an embedded 그림/figure). Rewriting
+    // its PARA_TEXT drops the object's anchor char and orphans the control, which
+    // Hancom Docs rejects ("문서를 열 수 없습니다"). Refuse rather than silently
+    // corrupt — clear it with text:"" + clear_objects:true to remove the object too,
+    // or target a text-only paragraph via cell_para.
+    throw new Error(`set_cell_text: cell paragraph ${cellPara} hosts an inline object (e.g. an embedded image) — editing its text would orphan the object. Pass clear_objects:true with text:"" to remove the object, or target a text-only paragraph via cell_para.`);
+  }
   const paraHeader = records[loc.paraHeaderRec];
-  // Update PARA_HEADER.text_count, preserving the high-bit flag.
   const oldCount = raw.readUInt32LE(paraHeader.dataOff);
+
+  if (text === '') {
+    // Empty paragraph — match HWP's native empty form: text_count = 1 and NO
+    // PARA_TEXT record at all (the EOP is implicit), with CHAR_SHAPE collapsed to
+    // its single run at charPos 0. Writing an explicit EOP-only PARA_TEXT, or
+    // leaving multi-run char shapes whose positions now exceed the 1-char
+    // paragraph, makes Hancom Docs reject the whole file ("문서를 열 수 없습니다").
+    // GT: native blank-form cells have PARA_HEADER(tc=1) + CHAR_SHAPE + LINE_SEG and
+    // NO PARA_TEXT. (cell-patch previously inserted a [EOP] PARA_TEXT here — the
+    // bug that broke every cleared cell on the cloud viewer.)
+    raw.writeUInt32LE((((oldCount & 0x80000000) >>> 0) | 1) >>> 0, paraHeader.dataOff);
+    // Collapse the layout caches to their first entry so they match the now 1-char
+    // (EOP-only) paragraph, then drop PARA_TEXT. Native empty cells keep CHAR_SHAPE
+    // at 1 run (8 B) and LINE_SEG at 1 segment (36 B); leaving a multi-line LINE_SEG
+    // or multi-run CHAR_SHAPE on a 1-char paragraph also makes Hancom reject the file.
+    // Splice back-to-front (LINE_SEG → CHAR_SHAPE → PARA_TEXT) so each record's
+    // original byte offset stays valid through the prior splice. Headers keep the
+    // original tag+level, only the size shrinks (so a small size is non-extended).
+    const recEnd = (r) => r.headOff + (r.ext ? 8 : 4) + r.size;
+    // Remove inline objects first (they sit AFTER the paragraph's PARA_TEXT/CHAR_SHAPE/
+    // LINE_SEG, so removing them keeps those lower offsets valid). An inline object is a
+    // CTRL_HEADER at paraLevel+1 plus every deeper record under it (the gso's caption
+    // paragraph, SHAPE_COMPONENT, etc.), up to the next record at paraLevel+1. Dropping
+    // the anchor control chars from PARA_TEXT (below) without removing the control would
+    // orphan it; removing both leaves a clean empty paragraph. (GT: handoff gso cluster.)
+    if (removeObjects) {
+      const paraLevel = records[loc.paraHeaderRec].level;
+      const ranges = [];
+      for (let i = loc.paraHeaderRec + 1; i < records.length; i++) {
+        const r = records[i];
+        if (r.level <= paraLevel) break;
+        if (r.tag === TAG_CTRL_HEADER && r.level === paraLevel + 1) {
+          let end = recEnd(r), j = i + 1;
+          for (; j < records.length && records[j].level > paraLevel + 1; j++) end = recEnd(records[j]);
+          ranges.push([r.headOff, end]); i = j - 1;
+        }
+      }
+      for (const [s, e] of ranges.sort((a, b) => b[0] - a[0])) raw = Buffer.concat([raw.slice(0, s), raw.slice(e)]);
+    }
+    const shrinkRec = (recIdx, newSize) => {
+      const r = records[recIdx]; if (r.size <= newSize) return;
+      const head = Buffer.alloc(4);
+      head.writeUInt32LE(((newSize << 20) | (r.level << 10) | r.tag) >>> 0, 0);
+      const rLen = (r.ext ? 8 : 4) + r.size;
+      raw = Buffer.concat([raw.slice(0, r.headOff), head, raw.slice(r.dataOff, r.dataOff + newSize), raw.slice(r.headOff + rLen)]);
+    };
+    if (loc.lineSegRec !== null) shrinkRec(loc.lineSegRec, 36); // 1 line segment
+    if (loc.charShapeRec !== null) shrinkRec(loc.charShapeRec, 8); // 1 (charPos, shapeId) run
+    if (loc.paraTextRec !== null) {
+      const old = records[loc.paraTextRec];
+      const oldLen = (old.ext ? 8 : 4) + old.size;
+      raw = Buffer.concat([raw.slice(0, old.headOff), raw.slice(old.headOff + oldLen)]);
+    }
+    return raw;
+  }
+
+  const newTextCount = text.length + 1; // + EOP
+  // Update PARA_HEADER.text_count, preserving the high-bit flag.
   const newCount = ((oldCount & 0x80000000) >>> 0) | (newTextCount >>> 0);
   raw.writeUInt32LE(newCount >>> 0, paraHeader.dataOff);
 
@@ -818,10 +897,14 @@ async function resolveCellIndexes(filePath, edits) {
 // content it matches the original size well; if the patched content grew,
 // stronger compression usually claws back the difference.
 function deflateToFit(data, capacity) {
-  const levels = [
-    constants.Z_DEFAULT_COMPRESSION,
-    7, 8, 9,
-  ];
+  // Level 9 (max compression) first — NOT the zlib default (6). Hancom's HWP
+  // inflater rejects some valid level-6 bitstreams (content-dependent: the file
+  // opens nowhere, "손상/형식 오류"), while the same content deflated at level 9
+  // opens — and level 9 is what rhwp / Hancom themselves emit. Level 9 is also
+  // the smallest, so it fits whenever any lower level would. (GT-confirmed
+  // 2026-06-18: a table-row insert produced byte-identical records + CFB to an
+  // rhwp-valid file, differing ONLY in the Section0 deflate; level 9 fixed it.)
+  const levels = [9, 8, 7, constants.Z_DEFAULT_COMPRESSION];
   let best = null;
   for (const level of levels) {
     const out = deflateRawSync(data, { level });
@@ -990,12 +1073,15 @@ function patchInPlaceSectors(filePath, resolved) {
     let raw = Buffer.from(inflateRawSync(compressed));
 
     // Apply edits back-to-front in record order so byte offsets stay valid.
+    // cell_para descending too, so a multi-paragraph cell's later paragraphs are
+    // patched before its earlier ones (records are re-parsed per edit, and an
+    // empty replacement keeps the paragraph, so indices stay stable either way).
     const editsSorted = [...secEdits].sort((a, b) =>
-      (b.para - a.para) || (b.control - a.control) || (b.cellIndex - a.cellIndex)
+      (b.para - a.para) || (b.control - a.control) || (b.cellIndex - a.cellIndex) || ((b.cell_para ?? 0) - (a.cell_para ?? 0))
     );
     for (const e of editsSorted) {
       const records = parseRecords(raw);
-      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '');
+      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',
@@ -2361,6 +2447,3500 @@ export async function appendParagraphInPlace(filePath, ops) {
 }
 
 
+// ── 문단 띠 / 가로 구분선 (para-line horizontal divider) raw-patch ──────────
+//
+// GT-first (paraline_native.hwp, captured from Hancom's "문단 띠"): Hancom
+// inserts a NEW paragraph whose only content is a gso (drawing object)
+// holding a thin, full-text-width rectangle — i.e. a horizontal divider
+// line. The cluster is self-contained in BodyText/Section0: the line's fill
+// color lives inline in SHAPE_COMPONENT and a vector rectangle needs no
+// BinData stream, so DocInfo is left untouched (no new BorderFill/style).
+//
+// Cluster shape (6 records, verbatim from GT except the noted patches):
+//   PARA_HEADER  lvl0  control_mask=0x800 (has-gso), 9 chars, line_segs=0
+//   PARA_TEXT    lvl1  inline extended gso ctrl char (8 code units) + EOP
+//   PARA_CHAR_SHAPE lvl1  charPos0 / charShape0
+//   CTRL_HEADER  lvl1  'gso ' CommonObjAttr — instance_id refreshed
+//   SHAPE_COMPONENT lvl2 '$rec' — width scaled to page text-width
+//   SHAPE_COMPONENT_RECTANGLE lvl3 — 4 corner points, width scaled
+//
+// GT rectangle width 0xa618 (42520) == its page text-width (paperW −
+// marginL − marginR). For A4 docs this equals 42520, so the emitted bytes
+// match GT exactly; for other page widths we scale the SHAPE_COMPONENT and
+// rectangle extents. Hancom itself leaves the CommonObjAttr width nominal
+// (10000) — the SHAPE_COMPONENT extent governs the rendered line — so we
+// keep CTRL_HEADER verbatim aside from the instance_id refresh.
+const PARALINE_GSO_CTRL_HEX  = '206f736710a329100000000000000000102700002c010000000000000000000000000000e0169142000000000d0038bbe8b260b75cb82000acc001ac15d6200085c7c8b2e4b22e00';
+const PARALINE_SHAPE_HEX     = '636572246365722400000000000000000000010018a600002c01000018a600002c01000000000b00000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000000000000000000000000000c000010000000000000000000000ffffffff000000000000000000b2b2b2000000000000000000e11691020000';
+const PARALINE_RECT_HEX      = '00000000000000000018a600000000000018a600002c010000000000002c010000';
+const PARALINE_GT_TEXT_WIDTH = 42520; // 0xa618 — GT base doc's page text-width
+
+const TAG_SHAPE_COMPONENT = 0x4c;
+const TAG_SHAPE_COMPONENT_RECTANGLE = 0x4f;
+
+function buildParaLineCluster(textWidth, paraInstanceId, gsoInstanceId) {
+  // PARA_HEADER (24B — the change-tracking-aware form Hancom emits in the GT;
+  // trailing 2 bytes = change_tracking_state, left 0). The last-paragraph flag
+  // (MSB of char_count) is left clear here and normalized across the section
+  // after the splice.
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(9, 0);              // char_count = 9 (gso 8 units + EOP)
+  ph.writeUInt32LE(0x800, 4);         // control_mask: has-gso bit
+  ph.writeUInt16LE(0, 8);             // para_shape_id 0
+  ph.writeUInt8(0, 10);               // style_id
+  ph.writeUInt8(0, 11);               // break_val
+  ph.writeUInt16LE(1, 12);            // num_char_shapes
+  ph.writeUInt16LE(0, 14);            // range_tags_count
+  ph.writeUInt16LE(0, 16);            // line_segs_count = 0 (GT; Hancom relays out)
+  ph.writeUInt32LE(paraInstanceId >>> 0, 18);
+  // bytes 22..23: change_tracking_state = 0
+
+  // PARA_TEXT (18B): inline extended gso ctrl char (8 code units) + EOP.
+  const pt = Buffer.alloc(18);
+  pt.writeUInt16LE(0x000b, 0);
+  pt[2] = 0x20; pt[3] = 0x6f; pt[4] = 0x73; pt[5] = 0x67; // 'gso '
+  pt.writeUInt16LE(0x000b, 14);
+  pt.writeUInt16LE(0x000d, 16);        // EOP
+
+  const cs = Buffer.alloc(8);          // PARA_CHAR_SHAPE: charPos 0, charShape 0
+
+  const ch = Buffer.from(PARALINE_GSO_CTRL_HEX, 'hex');
+  ch.writeUInt32LE(gsoInstanceId >>> 0, 36); // refresh gso instance_id (CommonObjAttr@36)
+
+  const sc = Buffer.from(PARALINE_SHAPE_HEX, 'hex');
+  const rc = Buffer.from(PARALINE_RECT_HEX, 'hex');
+  if (textWidth !== PARALINE_GT_TEXT_WIDTH) {
+    sc.writeUInt32LE(textWidth >>> 0, 20); // SHAPE_COMPONENT curWidth
+    sc.writeUInt32LE(textWidth >>> 0, 28); // SHAPE_COMPONENT initWidth
+    rc.writeUInt32LE(textWidth >>> 0, 9);  // rectangle x of points 1,2 (right edge)
+    rc.writeUInt32LE(textWidth >>> 0, 17);
+  }
+
+  const parts = [
+    [TAG_PARA_HEADER, 0, ph],
+    [TAG_PARA_TEXT, 1, pt],
+    [TAG_PARA_CHAR_SHAPE, 1, cs],
+    [TAG_CTRL_HEADER, 1, ch],
+    [TAG_SHAPE_COMPONENT, 2, sc],
+    [TAG_SHAPE_COMPONENT_RECTANGLE, 3, rc],
+  ];
+  const chunks = [];
+  for (const [tag, lvl, body] of parts) {
+    chunks.push(buildRecordHeader(tag, lvl, body.length), body);
+  }
+  return Buffer.concat(chunks);
+}
+
+// Shift every record's nesting level by `delta` (preserving tag + size). Used to
+// drop a body-built gso cluster (image/shape) into a table cell, whose paragraphs
+// sit two levels deeper than the body (cell PARA_HEADER = level 2 vs body level 0).
+function relevelCluster(cluster, delta) {
+  const out = Buffer.from(cluster);
+  let p = 0;
+  while (p + 4 <= out.length) {
+    const h = out.readUInt32LE(p);
+    let size = (h >>> 20) & 0xfff;
+    let hd = 4;
+    if (size === 0xfff) { size = out.readUInt32LE(p + 4); hd = 8; }
+    const level = (((h >>> 10) & 0x3ff) + delta) & 0x3ff;
+    out.writeUInt32LE(((h & ~(0x3ff << 10)) | (level << 10)) >>> 0, p);
+    p += hd + size;
+  }
+  return out;
+}
+
+// Set the gso object's outer top+bottom margin (개체 위/아래 여백) inside a built
+// cluster — finds the ' osg' CTRL_HEADER and writes u16 HWPUNIT at the top(@32)/
+// bottom(@34) slots of its CommonObjAttr outMargin (left@28/right@30 left as-is).
+// Used so objects dropped into a cell get a little vertical breathing room (the
+// cell row grows to fit). Left/right stay default per user.
+function setGsoOutMarginTopBottom(cluster, hu) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p);
+    const tag = h & 0x3ff; let size = (h >>> 20) & 0xfff; let hd = 4;
+    if (size === 0xfff) { size = cluster.readUInt32LE(p + 4); hd = 8; }
+    const body = p + hd;
+    if (tag === TAG_CTRL_HEADER && size >= 36 && cluster.slice(body, body + 4).toString('latin1') === GSO_CTRL_ID) {
+      cluster.writeUInt16LE(hu & 0xFFFF, body + 32);
+      cluster.writeUInt16LE(hu & 0xFFFF, body + 34);
+      return;
+    }
+    p += hd + size;
+  }
+}
+const CELL_OBJ_VMARGIN_HU = 283; // ~1 mm default top/bottom margin for in-cell objects
+
+// Set the first PARA_HEADER's para_shape_id (body @8) in a built object cluster —
+// used to center an object paragraph dropped into a cell.
+function setClusterParaShape(cluster, psId) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p);
+    const tag = h & 0x3ff; let size = (h >>> 20) & 0xfff; let hd = 4;
+    if (size === 0xfff) { size = cluster.readUInt32LE(p + 4); hd = 8; }
+    if (tag === TAG_PARA_HEADER) { cluster.writeUInt16LE(psId & 0xFFFF, p + hd + 8); return; }
+    p += hd + size;
+  }
+}
+
+// Drop a body-built self-contained gso cluster (image / shape / chart) into a table
+// cell: re-level +2, center it, add the default vertical margin, splice at the cell
+// end, bump the cell's paragraph count, fix the cell's last-para flag. Returns the
+// new `raw`. (locateCell-by-row/col via tableCellRecords.)
+function spliceGsoIntoCell(raw, cluster, para, control, row, col, centerPsId) {
+  const target = tableCellRecords(parseRecords(raw), raw, para, control)
+    .find((c) => c.row === row && c.col === col);
+  if (!target) throw new Error(`cell (row=${row}, col=${col}) not found in table at para ${para} control ${control}`);
+  const cellCluster = relevelCluster(cluster, 2);
+  setClusterParaShape(cellCluster, centerPsId);
+  setGsoOutMarginTopBottom(cellCluster, CELL_OBJ_VMARGIN_HU);
+  raw = Buffer.concat([raw.slice(0, target.endByte), cellCluster, raw.slice(target.endByte)]);
+  const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
+    .find((c) => c.row === row && c.col === col);
+  const lhDataOff = t2.startByte + 4;
+  raw.writeUInt16LE((raw.readUInt16LE(lhDataOff) + 1) & 0xFFFF, lhDataOff); // nParagraphs++
+  normalizeCellLastParaFlag(raw, t2.startByte, t2.endByte, 2);
+  return raw;
+}
+
+// Inside a cell whose first paragraph is at `cellParaLevel` (2 for table cells):
+// set the last-paragraph flag (MSB of char_count) on the LAST PARA_HEADER of that
+// level within [startByte, endByte) and clear it on the earlier ones. Mirrors
+// normalizeLastParaFlag but scoped to a cell (whose paragraphs are level 2).
+function normalizeCellLastParaFlag(raw, startByte, endByte, cellParaLevel) {
+  const records = parseRecords(raw);
+  let lastIdx = -1;
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.headOff < startByte || r.headOff >= endByte) continue;
+    if (r.tag === TAG_PARA_HEADER && r.level === cellParaLevel) lastIdx = i;
+  }
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.headOff < startByte || r.headOff >= endByte) continue;
+    if (r.tag !== TAG_PARA_HEADER || r.level !== cellParaLevel || r.size < 4) continue;
+    const low = raw.readUInt32LE(r.dataOff) & 0x7FFFFFFF;
+    raw.writeUInt32LE(((i === lastIdx ? 0x80000000 : 0) | low) >>> 0, r.dataOff);
+  }
+}
+
+// Ensure exactly the last level-0 PARA_HEADER carries the last-paragraph
+// flag (MSB of char_count). Length-preserving in-place edit on `raw`.
+// Hancom moves this flag onto a newly-inserted trailing paragraph, and
+// rejects sections where it is absent or duplicated.
+function normalizeLastParaFlag(raw) {
+  const records = parseRecords(raw);
+  let lastIdx = -1;
+  for (let i = 0; i < records.length; i++) {
+    if (records[i].tag === TAG_PARA_HEADER && records[i].level === 0) lastIdx = i;
+  }
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag !== TAG_PARA_HEADER || r.level !== 0 || r.size < 4) continue;
+    const low = raw.readUInt32LE(r.dataOff) & 0x7FFFFFFF;
+    raw.writeUInt32LE(((i === lastIdx ? 0x80000000 : 0) | low) >>> 0, r.dataOff);
+  }
+}
+
+// Page text-width (HWPUNIT) = paper width − left margin − right margin,
+// read from the section's PAGE_DEF. Falls back to the GT A4 text-width.
+function readTextWidthFromPageDef(records, raw) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= 16) {
+      const tw = raw.readUInt32LE(r.dataOff) - raw.readUInt32LE(r.dataOff + 8) - raw.readUInt32LE(r.dataOff + 12);
+      if (tw > 0) return tw >>> 0;
+    }
+  }
+  return PARALINE_GT_TEXT_WIDTH;
+}
+
+// Insert a horizontal divider line (문단 띠) as a new paragraph. Each op:
+//   { anchor?: string }   — insert right after the paragraph whose text
+//                           contains `anchor`; if omitted, after the last
+//                           simple body paragraph.
+export async function insertParaLineInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const records = parseRecords(raw);
+    const textWidth = readTextWidthFromPageDef(records, raw);
+
+    // Insertion point.
+    let insertAt;
+    let anchorUsed = null;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const clusters = findClusterBoundaries(records);
+      let found = null;
+      for (const c of clusters) {
+        // Scan PARA_TEXT at ANY level inside the cluster: in fully
+        // table-based forms the anchor text lives in cell paragraphs
+        // (level 3+), not the top-level body. We insert the divider after
+        // the whole top-level cluster that contains the match.
+        let text = '';
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT) {
+            text += raw.slice(r.dataOff, r.dataOff + r.size).toString('utf16le');
+          }
+        }
+        if (text.includes(op.anchor)) { found = c; break; }
+      }
+      if (!found) throw new Error(`insert_para_line: anchor not found: ${JSON.stringify(op.anchor)}`);
+      insertAt = found.endIdx < records.length ? records[found.endIdx].headOff : raw.length;
+      anchorUsed = op.anchor;
+    } else {
+      const template = findLastSimpleBodyParagraph(records);
+      insertAt = template.endIdx < records.length ? records[template.endIdx].headOff : raw.length;
+    }
+
+    const paraInstanceId = pickFreshInstanceId(records, raw);
+    const gsoInstanceId = (paraInstanceId + 0x100) >>> 0;
+    const cluster = buildParaLineCluster(textWidth, paraInstanceId, gsoInstanceId);
+    raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+    normalizeLastParaFlag(raw);
+    summary.push({ section: 0, anchor: anchorUsed, text_width: textWidth });
+  }
+
+  // Deflate + write back (same infrastructure as appendParagraphInPlace).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 누름틀 / 입력 필드 (form field) raw-patch ──────────────────────────────
+//
+// GT-first (field_native.hwp, captured from Hancom's 입력 › 필드/누름틀): a
+// 누름틀 is the HWP "field" mechanism — an inline field-begin char (0x0003)
+// and field-end char (0x0004) wrapping the guide text, plus a CTRL_HEADER
+// ('%clk', stored reversed as "klc%") carrying the field command string, and
+// a small 0x57 field-data record. Self-contained in Section0 — no DocInfo
+// change (it reuses existing char shapes).
+//
+//   PARA_TEXT: <existing text up to anchor> [FIELD_BEGIN 8u] <guide> [FIELD_END 8u] …
+//   PARA_HEADER: char_count += 16 (begin+end) + guide.length;
+//                control_mask |= 0x18  (control-char bitmask: chars 0x03 & 0x04 now present)
+//   + CTRL_HEADER '%clk' (lvl1) at the end of the paragraph's controls
+//   + 0x57 field-data record (lvl2)
+//
+// control_mask is a bitmask of which control-char codes (0..31) appear in the
+// paragraph, so OR-ing in (1<<3)|(1<<4) is correct for any document.
+//
+// The same field mechanism backs hyperlinks (0x0003/0x0004 + a CTRL command
+// string), so this is also the anchor-based path to hyperlinks that avoids
+// the cloud editor's fragile drag-select.
+const FIELD_BEGIN_HEX = '03006b6c632500000000000000000300'; // 0x0003 + '%clk' + 0x0003 (8 units)
+const FIELD_END_HEX   = '04006b6c630901000000000000000400'; // 0x0004 + '%clk' + 0x0004 (8 units)
+const FIELD_CTRL_ID   = Buffer.from('6b6c6325', 'hex');      // 'klc%' (= '%clk' reversed)
+// 0x57 field-data record body (18 bytes) — reproduced from GT verbatim.
+const FIELD_DATA_HEX  = '1b020100000000400100030085c725b880b7';
+const TAG_FIELD_DATA  = 0x57;
+
+// Build the field command string Hancom stores in the '%clk' CTRL_HEADER.
+function buildFieldCommand(guide) {
+  return `Clickhere:set:56:Direction:wstring:${guide.length}:${guide} HelpState:wstring:0:  `;
+}
+
+// CTRL_HEADER '%clk' body: ctrlId + 01000000 + 09 + u16 cmdLen + cmd(UTF16) + u32 instanceId + 00000000
+function buildFieldCtrlRecord(guide, instanceId) {
+  const cmd = buildFieldCommand(guide);
+  const cmdBuf = Buffer.from(cmd, 'utf16le');
+  const body = Buffer.concat([
+    FIELD_CTRL_ID,
+    Buffer.from([0x01, 0x00, 0x00, 0x00, 0x09]),
+    (() => { const b = Buffer.alloc(2); b.writeUInt16LE(cmd.length, 0); return b; })(),
+    cmdBuf,
+    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(instanceId >>> 0, 0); return b; })(),
+    Buffer.from([0x00, 0x00, 0x00, 0x00]),
+  ]);
+  return Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, body.length), body]);
+}
+
+function buildFieldDataRecord() {
+  const body = Buffer.from(FIELD_DATA_HEX, 'hex');
+  return Buffer.concat([buildRecordHeader(TAG_FIELD_DATA, 2, body.length), body]);
+}
+
+// Insert a 누름틀 form field after the anchor text. Each op:
+//   { anchor: string, guide?: string, field_name?: string }
+//   - anchor: text to place the field right after (must be plain text in a
+//             level-1 PARA_TEXT of a top-level paragraph)
+//   - guide:  the placeholder/guide text shown in the field (default '입력')
+export async function insertFieldInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') {
+      throw new Error('insert_field: an "anchor" string is required');
+    }
+    const guide = (typeof op.guide === 'string' && op.guide) ? op.guide : '입력';
+    const records = parseRecords(raw);
+
+    // Locate the top-level paragraph cluster containing the anchor, and the
+    // level-1 PARA_TEXT record holding the anchor text.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorByteOff = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const body = raw.slice(r.dataOff, r.dataOff + r.size);
+        const at = body.indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorByteOff = at + anchorBuf.length; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`insert_field: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const instanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Build the new PARA_TEXT body: insert FIELD_BEGIN + guide + FIELD_END
+    //    right after the anchor text.
+    const fieldBegin = Buffer.from(FIELD_BEGIN_HEX, 'hex');
+    const fieldEnd = Buffer.from(FIELD_END_HEX, 'hex');
+    const guideBuf = Buffer.from(guide, 'utf16le');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const newBody = Buffer.concat([
+      oldBody.slice(0, anchorByteOff), fieldBegin, guideBuf, fieldEnd, oldBody.slice(anchorByteOff),
+    ]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Field control records appended at the end of the paragraph's cluster.
+    const ctrlRec = buildFieldCtrlRecord(guide, instanceId);
+    const dataRec = buildFieldDataRecord();
+    const fieldCtrlBlock = Buffer.concat([ctrlRec, dataRec]);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch (length-preserving): char_count += (16 + guide.len),
+    //    control_mask |= 0x18 (chars 0x03 & 0x04 now present).
+    const addedUnits = 8 + guide.length + 8; // begin(8u) + guide + end(8u)
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    const newCount = ((flag | ((curCount & 0x7FFFFFFF) + addedUnits)) >>> 0);
+    const newMask = (raw.readUInt32LE(phOff + 4) | 0x18) >>> 0;
+
+    // Apply: header edit in place, then splice high→low (cluster-end first,
+    // then PARA_TEXT replacement) so earlier offsets stay valid.
+    raw.writeUInt32LE(newCount, phOff);
+    raw.writeUInt32LE(newMask, phOff + 4);
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), fieldCtrlBlock, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([
+      raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size),
+    ]);
+
+    summary.push({ section: 0, anchor: op.anchor, guide, field_name: op.field_name ?? null });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 책갈피 (bookmark) raw-patch ────────────────────────────────────────────
+// GT-first (Hancom's 입력 › 책갈피): a bookmark is an invisible point-marker in
+// the same inline-control family as fields/gso. After the anchor text it adds
+// an 8-unit inline control (char 0x0016 + 'bokm' id + reserved + 0x0016), then
+// a 'bokm' CTRL_HEADER and a 0x57 FIELD_DATA record holding the mark name:
+//   PARA_TEXT:  … <anchor> [0x16 'bokm' 0×4u 0x16  (8 units)] …
+//   PARA_HEADER: char_count += 8; control_mask |= 0x400000 (char 0x16 present)
+//   + CTRL_HEADER 'bokm' (lvl1, 4-byte id) + FIELD_DATA 0x57 (lvl2: 10-byte
+//     GT prefix + nameLen + UTF-16 name)
+// Self-contained in Section0 — no DocInfo change. Renders nothing visible;
+// verify by reopening in Hancom (책갈피 목록) — there is no visual mark.
+const BOOKMARK_MARK_HEX = '16006d6b6f6200000000000000001600'; // 0x16 + 'bokm'(rev) + reserved + 0x16 (8 units)
+const BOOKMARK_CTRL_ID = Buffer.from('6d6b6f62', 'hex');      // 'bokm' stored reversed
+const BOOKMARK_DATA_PREFIX = Buffer.from('1b020100000000400100', 'hex'); // 10-byte GT-verbatim prefix
+
+function buildBookmarkCtrlRecord() {
+  return Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, BOOKMARK_CTRL_ID.length), BOOKMARK_CTRL_ID]);
+}
+function buildBookmarkDataRecord(name) {
+  const nameBuf = Buffer.from(name, 'utf16le');
+  const lenBuf = Buffer.alloc(2); lenBuf.writeUInt16LE(name.length, 0);
+  const body = Buffer.concat([BOOKMARK_DATA_PREFIX, lenBuf, nameBuf]);
+  return Buffer.concat([buildRecordHeader(TAG_FIELD_DATA, 2, body.length), body]);
+}
+
+// Insert a bookmark at `anchor`. Each op: { anchor: string, mark_name: string }
+export async function insertBookmarkInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('insert_bookmark: an "anchor" string is required');
+    const markName = (typeof op.mark_name === 'string' && op.mark_name) ? op.mark_name : '책갈피';
+    const records = parseRecords(raw);
+
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorByteOff = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const at = raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorByteOff = at + anchorBuf.length; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`insert_bookmark: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+
+    // 1) Insert the 8-unit inline bookmark marker right after the anchor text.
+    const mark = Buffer.from(BOOKMARK_MARK_HEX, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const newBody = Buffer.concat([oldBody.slice(0, anchorByteOff), mark, oldBody.slice(anchorByteOff)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) bokm control records appended at the end of the paragraph cluster.
+    const ctrlBlock = Buffer.concat([buildBookmarkCtrlRecord(), buildBookmarkDataRecord(markName)]);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER: char_count += 8, control_mask |= 0x400000 (char 0x16).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0, phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x400000) >>> 0, phOff + 4);
+
+    // Splice high→low so earlier offsets stay valid.
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), ctrlBlock, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor, mark_name: markName });
+  }
+
+  // Deflate + write back (identical to insertFieldInPlace).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, chain);
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart; newCompressed = ext.compressed;
+    if (ext.promoted) { chain = ext.newRegularChain; writeChainBytes(buf, chain, ssz, newCompressed); buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74); }
+    else { rootChain = ext.rootChain; chain = ext.miniChain; writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed); }
+  } else {
+    const ext = deflateAndFitWithExpansion(raw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain; newCompressed = ext.compressed; writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 하이퍼링크 (hyperlink) raw-patch ───────────────────────────────────────
+//
+// GT-first (hyperlink_native.hwp, captured from Hancom's 입력 › 하이퍼링크):
+// a hyperlink is the same HWP field mechanism as 누름틀 (insertFieldInPlace),
+// except it WRAPS existing anchor text instead of inserting guide text, uses
+// ctrl id '%hlk' (stored reversed as "klh%"), carries a different field
+// command string, and has no 0x57 data record:
+//
+//   PARA_TEXT: … [FIELD_BEGIN 8u] <anchor text> [FIELD_END 8u] …
+//   PARA_HEADER: char_count += 16; control_mask |= 0x18 (chars 0x03 & 0x04)
+//   + CTRL_HEADER '%hlk' (lvl1) with command  "<url>;1;0;0;"  (':' → '\:')
+//
+// v1 ships a FUNCTIONAL link (correct URL, clickable) but does NOT recolor
+// the anchor text blue/underline — Hancom stores that as extra char-shape
+// ranges referencing DocInfo char shapes, which would need DocInfo synthesis.
+// Callers wanting the blue underline can layer apply_text_style on the same
+// anchor text. Self-contained in Section0 — no DocInfo change.
+const HLINK_BEGIN_HEX = '03006b6c682500000000000000000300'; // 0x0003 + '%hlk' + 0x0003
+const HLINK_END_HEX   = '04006b6c680000000000000000000400'; // 0x0004 + '%hlk' + 0x0004
+const HLINK_CTRL_ID   = Buffer.from('6b6c6825', 'hex');      // 'klh%' (= '%hlk' reversed)
+// 5-byte property prefix between ctrlId and the command length (GT verbatim).
+const HLINK_CTRL_PREFIX = Buffer.from([0x00, 0x28, 0x00, 0x00, 0x00]);
+
+function buildHyperlinkCommand(url) {
+  // Hancom escapes ':' as '\:' in the field command (':' is its separator).
+  return `${String(url).replace(/:/g, '\\:')};1;0;0;`;
+}
+
+function buildHyperlinkCtrlRecord(url, instanceId) {
+  const cmd = buildHyperlinkCommand(url);
+  const cmdBuf = Buffer.from(cmd, 'utf16le');
+  const lenBuf = Buffer.alloc(2); lenBuf.writeUInt16LE(cmd.length, 0);
+  const instBuf = Buffer.alloc(4); instBuf.writeUInt32LE(instanceId >>> 0, 0);
+  const body = Buffer.concat([
+    HLINK_CTRL_ID, HLINK_CTRL_PREFIX, lenBuf, cmdBuf, instBuf, Buffer.from([0, 0, 0, 0]),
+  ]);
+  return Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, body.length), body]);
+}
+
+// Turn existing anchor text into a hyperlink. Each op:
+//   { anchor: string, url: string }
+//   - anchor must be plain text in a level-1 PARA_TEXT of a top-level paragraph
+export async function insertHyperlinkInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('hyperlink: an "anchor" string is required');
+    if (!op.url || typeof op.url !== 'string') throw new Error('hyperlink: a "url" string is required');
+    const records = parseRecords(raw);
+
+    // Locate the anchor text inside a level-1 PARA_TEXT of a top-level paragraph.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorStart = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const body = raw.slice(r.dataOff, r.dataOff + r.size);
+        const at = body.indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorStart = at; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`hyperlink: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const instanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Wrap the anchor text: FIELD_BEGIN before it, FIELD_END after it.
+    const fieldBegin = Buffer.from(HLINK_BEGIN_HEX, 'hex');
+    const fieldEnd = Buffer.from(HLINK_END_HEX, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const anchorEnd = anchorStart + anchorBuf.length;
+    const newBody = Buffer.concat([
+      oldBody.slice(0, anchorStart), fieldBegin,
+      oldBody.slice(anchorStart, anchorEnd), fieldEnd,
+      oldBody.slice(anchorEnd),
+    ]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) CTRL_HEADER '%hlk' appended at the end of the paragraph's controls.
+    const ctrlRec = buildHyperlinkCtrlRecord(op.url, instanceId);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 16 (begin+end), control_mask |= 0x18.
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 16)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x18) >>> 0, phOff + 4);
+
+    // Splice high→low: CTRL at cluster end first, then PARA_TEXT replacement.
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), ctrlRec, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor, url: op.url });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 각주 (footnote) raw-patch ──────────────────────────────────────────────
+//
+// GT-first (footnote_native.hwp, captured from Hancom's 입력 › 주석 › 각주):
+//   - Main paragraph: an inline footnote-reference char (0x0011, ctrl id
+//     "fn  ") is inserted at the anchor; PARA_HEADER char_count += 8 and
+//     control_mask |= (1<<0x11)=0x20000.
+//   - The footnote content is appended as a nested cluster on the same
+//     paragraph (after its other controls):
+//       CTRL_HEADER "fn  "  (lvl1)
+//       LIST_HEADER         (lvl2, nParas=1)
+//       PARA_HEADER         (lvl2) — style = the doc's "Footnote" style index,
+//                                    para_shape/char_shape = that style's refs
+//       PARA_TEXT           (lvl3) — auto-number ctrl (0x0012 "onta") + " " +
+//                                    footnote text + EOP
+//       PARA_CHAR_SHAPE     (lvl3)
+//       CTRL_HEADER "onta"  (lvl3) — the auto-number control
+//
+// DocInfo is only READ, never written: every HWP doc ships a standard
+// "Footnote" style, and the footnote separator line + numbering are rendered
+// by Hancom from the always-present FOOTNOTE_SHAPE records. So this is a
+// resolution (not synthesis) op — self-contained writes stay in Section0.
+// 각주(footnote) / 미주(endnote) share the same structure — they differ only
+// in the field ctrl id ('fn  ' vs 'en  '), the named style they resolve, and
+// the auto-number control's note-type byte (1 = footnote, 2 = endnote).
+const NOTE_KINDS = {
+  footnote: { refCharHex: '110020206e6600000000000000001100', ctrlId: '20206e66', styleName: 'Footnote', ontaType: 1 },
+  endnote:  { refCharHex: '110020206e6500000000000000001100', ctrlId: '20206e65', styleName: 'Endnote',  ontaType: 2 },
+};
+const NOTE_LIST_HEADER_HEX = '01000000000000000000000000000000'; // nParas=1
+const NOTE_AUTONUM_HEX     = '12006f6e746100000000000000001200'; // 0x0012 + 'onta' + 0x0012
+
+const TAG_STYLE_DI = 0x1a;  // HWPTAG_STYLE in DocInfo
+
+// Read a named style by its Korean OR English name: its index (0-based among
+// STYLE records) plus the para_shape and char_shape ids it references. The
+// returned `found` flag distinguishes a real match from the {0,0,0} fallback.
+function resolveNoteStyle(buf, styleName) {
+  const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
+  let sidx = 0;
+  for (const r of parseRecords(di)) {
+    if (r.tag !== TAG_STYLE_DI) continue;
+    const sb = di.slice(r.dataOff, r.dataOff + r.size);
+    const nlen = sb.readUInt16LE(0);
+    let off = 2;
+    const kor = sb.slice(off, off + nlen * 2).toString('utf16le'); off += nlen * 2;
+    const elen = sb.readUInt16LE(off); off += 2;
+    const eng = sb.slice(off, off + elen * 2).toString('utf16le'); off += elen * 2;
+    // off → prop(u8) next(u8) lang(u16) paraShape(u16) charShape(u16)
+    if (eng === styleName || kor === styleName) {
+      return { index: sidx, paraShape: sb.readUInt16LE(off + 4), charShape: sb.readUInt16LE(off + 6), found: true };
+    }
+    sidx++;
+  }
+  // Fallback: no such named style — use style 0 / shape 0.
+  return { index: 0, paraShape: 0, charShape: 0, found: false };
+}
+
+// List every style's (korean, english) names — used to report choices when a
+// requested style name isn't found.
+function listStyleNames(buf) {
+  const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
+  const names = [];
+  for (const r of parseRecords(di)) {
+    if (r.tag !== TAG_STYLE_DI) continue;
+    const sb = di.slice(r.dataOff, r.dataOff + r.size);
+    const nlen = sb.readUInt16LE(0);
+    const kor = sb.slice(2, 2 + nlen * 2).toString('utf16le');
+    const elen = sb.readUInt16LE(2 + nlen * 2);
+    const eng = sb.slice(4 + nlen * 2, 4 + nlen * 2 + elen * 2).toString('utf16le');
+    names.push(kor || eng);
+  }
+  return names;
+}
+
+// Apply a named paragraph style to the paragraph containing `anchor`. This is
+// a length-preserving PARA_HEADER edit: style id (offset 10) and para_shape id
+// (offset 8) are repointed to the resolved style. Character shapes are left
+// as-is (matching Hancom's 스타일 combo, which sets paragraph-level style only).
+export async function applyNamedStyleInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', applied_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('apply_style: an "anchor" string is required');
+    if (!op.style || typeof op.style !== 'string') throw new Error('apply_style: a "style" name is required');
+    const style = resolveNoteStyle(buf, op.style);
+    if (!style.found) {
+      throw new Error(`apply_style: style not found: ${JSON.stringify(op.style)} (available: ${listStyleNames(buf).join(', ')})`);
+    }
+    const records = parseRecords(raw);
+    const clusters = findClusterBoundaries(records);
+    let phRec = null;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag === TAG_PARA_TEXT && r.level === 1 &&
+            raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf) !== -1) {
+          phRec = records[c.startIdx]; break;
+        }
+      }
+      if (phRec) break;
+    }
+    if (!phRec) throw new Error(`apply_style: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    // Length-preserving: para_shape id @8 (u16), style id @10 (u8).
+    raw.writeUInt16LE(style.paraShape & 0xFFFF, phRec.dataOff + 8);
+    raw.writeUInt8(style.index & 0xFF, phRec.dataOff + 10);
+    summary.push({ section: 0, anchor: op.anchor, style: op.style, style_index: style.index });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.applied_count = summary.length;
+  return result;
+}
+
+// Build a note (footnote/endnote) content cluster (6 records).
+function buildNoteCluster(text, style, noteInstanceId, kind) {
+  // CTRL_HEADER 'fn  '/'en  ' (20B): ctrlId + 01000000 + 00002900 + 00000000 + instanceId
+  const ctrlBody = Buffer.concat([
+    Buffer.from(kind.ctrlId, 'hex'),
+    Buffer.from('010000000000290000000000', 'hex'),
+    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(noteInstanceId >>> 0, 0); return b; })(),
+  ]);
+  const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, ctrlBody.length), ctrlBody]);
+
+  const listHeader = Buffer.concat([
+    buildRecordHeader(TAG_LIST_HEADER, 2, 16), Buffer.from(NOTE_LIST_HEADER_HEX, 'hex'),
+  ]);
+
+  // PARA_TEXT (lvl3): auto-number ctrl + " " + text + EOP
+  const ptBody = Buffer.concat([
+    Buffer.from(NOTE_AUTONUM_HEX, 'hex'), Buffer.from(' ' + text + PARA_TEXT_EOP, 'utf16le'),
+  ]);
+  const charCount = 8 + 1 + text.length + 1; // autonum(8u) + space + text + EOP
+
+  // PARA_HEADER (lvl2, 24B): last-para flag set; style/para_shape resolved.
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(((0x80000000 | (charCount & 0x7FFFFFFF)) >>> 0), 0);
+  ph.writeUInt32LE(0x40000, 4);             // control_mask: char 0x12 (auto-number) present
+  ph.writeUInt16LE(style.paraShape & 0xFFFF, 8);
+  ph.writeUInt8(style.index & 0xFF, 10);    // style id = resolved note-style index
+  ph.writeUInt8(0, 11);
+  ph.writeUInt16LE(1, 12);                  // num_char_shapes
+  ph.writeUInt16LE(0, 14);
+  ph.writeUInt16LE(0, 16);                  // line_segs_count
+  ph.writeUInt32LE(0, 18);
+  const paraHeader = Buffer.concat([buildRecordHeader(TAG_PARA_HEADER, 2, 24), ph]);
+
+  const paraText = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 3, ptBody.length), ptBody]);
+
+  const csBody = Buffer.alloc(8);
+  csBody.writeUInt32LE(0, 0);
+  csBody.writeUInt32LE(style.charShape >>> 0, 4);
+  const charShape = Buffer.concat([buildRecordHeader(TAG_PARA_CHAR_SHAPE, 3, 8), csBody]);
+
+  // Auto-number CTRL_HEADER 'onta': ctrlId + u32 noteType (1=footnote,2=endnote)
+  // + 01000000 + 00002900
+  const ontaBody = Buffer.concat([
+    Buffer.from('6f6e7461', 'hex'),
+    (() => { const b = Buffer.alloc(4); b.writeUInt32LE(kind.ontaType >>> 0, 0); return b; })(),
+    Buffer.from('0100000000002900', 'hex'),
+  ]);
+  const onta = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 3, 16), ontaBody]);
+
+  return Buffer.concat([ctrl, listHeader, paraHeader, paraText, charShape, onta]);
+}
+
+// Insert a footnote/endnote anchored to text. `kind` is NOTE_KINDS.footnote
+// or NOTE_KINDS.endnote. Each op:
+//   { anchor: string, text: string }
+//   - anchor: text the note mark goes right after (level-1 PARA_TEXT of a
+//             top-level paragraph)
+//   - text:   the note content (footnote: bottom of page; endnote: doc end)
+async function insertNoteInPlace(filePath, ops, kind) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const noteStyle = resolveNoteStyle(buf, kind.styleName);
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error(`${kind.styleName}: an "anchor" string is required`);
+    const text = (typeof op.text === 'string') ? op.text : '';
+    const records = parseRecords(raw);
+
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null, anchorEnd = -1;
+    const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag !== TAG_PARA_TEXT || r.level !== 1) continue;
+        const body = raw.slice(r.dataOff, r.dataOff + r.size);
+        const at = body.indexOf(anchorBuf);
+        if (at !== -1) { cluster = c; ptRec = r; anchorEnd = at + anchorBuf.length; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`${kind.styleName}: anchor not found in a top-level paragraph: ${JSON.stringify(op.anchor)}`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const noteInstanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Insert the note-reference char after the anchor in PARA_TEXT.
+    const refChar = Buffer.from(kind.refCharHex, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const newBody = Buffer.concat([oldBody.slice(0, anchorEnd), refChar, oldBody.slice(anchorEnd)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Note content cluster appended at the end of the paragraph's records.
+    const fnCluster = buildNoteCluster(text, noteStyle, noteInstanceId, kind);
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x20000 (char 0x11).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x20000) >>> 0, phOff + 4);
+
+    // Splice high→low: content cluster at cluster end, then PARA_TEXT replace.
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), fnCluster, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor, text });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+export function insertFootnoteInPlace(filePath, ops) {
+  return insertNoteInPlace(filePath, ops, NOTE_KINDS.footnote);
+}
+export function insertEndnoteInPlace(filePath, ops) {
+  return insertNoteInPlace(filePath, ops, NOTE_KINDS.endnote);
+}
+
+
+// ── 쪽 번호 (page number, footer) raw-patch ────────────────────────────────
+//
+// GT-first (pagenum_native.hwp, captured from Hancom's 쪽 › 꼬리말 › 쪽 번호):
+// a page number is a footer control holding a paragraph whose only content is
+// the page-number auto-field. Structurally like a footnote, but at the
+// section's first paragraph and with note-type 0 (page number):
+//   - first paragraph: inline footer char (0x0010, ctrl id "foot") + EOP;
+//     PARA_HEADER char_count += 8, control_mask |= 0x10000.
+//   - footer cluster appended on that paragraph:
+//       CTRL_HEADER "foot"  (lvl1)
+//       LIST_HEADER         (lvl2, width = text column, height = footer margin)
+//       PARA_HEADER         (lvl2) — style = "Header" index; para_shape chosen
+//                                    to match the requested alignment
+//       PARA_TEXT           (lvl3) — auto-number ctrl (0x0012 "onta") + EOP
+//       PARA_CHAR_SHAPE     (lvl3) — "Page Number" style's char shape
+//       CTRL_HEADER "onta"  (lvl3) — note-type 0 (page number)
+//
+// Alignment note: Hancom stores alignment in the footer paragraph's
+// para_shape. To stay Section0-only (no DocInfo write), we reference an
+// EXISTING para_shape whose alignment matches `align`; if the document has
+// none, we fall back to para_shape 0 (the number then follows that shape's
+// alignment). Section0-only — no DocInfo change.
+const PAGENUM_FOOTER_CHAR_HEX = '1000746f6f6600000000000000001000'; // 0x0010 + 'foot' + 0x0010
+const PAGENUM_FOOT_CTRL_HEX    = '746f6f660000000001000000';          // CTRL_HEADER 'foot' body
+const PAGENUM_HEADER_CHAR_HEX = '10006461656800000000000000001000'; // 0x0010 + 'head' + 0x0010 (GT pn_header)
+const PAGENUM_HEAD_CTRL_HEX    = '646165680000000001000000';          // CTRL_HEADER 'head' body
+const PAGENUM_ONTA_HEX         = '6f6e7461000000000100000000000000'; // auto-number CTRL, note-type 0
+const ALIGN_BITS = { justify: 0, left: 1, right: 2, center: 3, distribute: 4 };
+
+// Find an existing para_shape (DocInfo) whose attr1 alignment bits (2..4)
+// match `align`; return its index, or 0 if none.
+function findParaShapeByAlign(buf, align) {
+  const want = ALIGN_BITS[align];
+  if (want === undefined) return 0;
+  const di = readDecodedStreamFromCfb(buf, ['DocInfo']);
+  let idx = 0;
+  for (const r of parseRecords(di)) {
+    if (r.tag !== TAG_PARA_SHAPE) continue;
+    if (((di.readUInt32LE(r.dataOff) >> 2) & 7) === want) return idx;
+    idx++;
+  }
+  return 0;
+}
+
+// PAGE_DEF footer margin (HWPUNIT) — offset 28.
+function readFooterMarginFromPageDef(records, raw) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= 32) return raw.readUInt32LE(r.dataOff + 28);
+  }
+  return 0x109c; // sensible default (~15mm)
+}
+
+// PAGE_DEF header margin (HWPUNIT) — offset 24.
+function readHeaderMarginFromPageDef(records, raw) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= 28) return raw.readUInt32LE(r.dataOff + 24);
+  }
+  return 0x109c;
+}
+
+// Return the DocInfo para_shape index whose alignment matches `align`, creating
+// one (a clone of para_shape 0 with the alignment set) if none exists. Writes
+// the modified DocInfo back to the file. Used by the page-number op so its
+// auto-number paragraph can be left/center/right regardless of what alignments
+// the document already happens to define.
+async function ensureAlignedParaShapeInFile(filePath, align) {
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRC = () => rootChain || (rootChain = walkChain(fat, entries[0].start));
+  const diEntry = findStreamEntry(entries, ['DocInfo']);
+  const inMini = diEntry.size < 4096;
+  let chain, comp;
+  if (inMini) { const rc = ensureRC(); chain = walkChain(minifat, diEntry.start); comp = readMiniChainBytes(buf, chain, rc, ssz, mssz, diEntry.size); }
+  else { chain = walkChain(fat, diEntry.start); comp = readChainBytes(buf, chain, ssz, diEntry.size); }
+  let diRaw = Buffer.from(inflateRawSync(comp));
+
+  const want = ALIGN_BITS[align];
+  const bodies = readParaShapeBodies(diRaw);
+  for (let i = 0; i < bodies.length; i++) if (((bodies[i].readUInt32LE(0) >> 2) & 7) === want) return i;
+  if (bodies.length === 0) return 0;
+
+  const newBody = buildParaShapeBody(bodies[0], { alignment: align });
+  const r = appendParaShapeToDocInfo(diRaw, newBody);
+  diRaw = r.newDi;
+
+  let newComp;
+  if (inMini) {
+    const rc = ensureRC();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, diRaw, chain);
+    buf = ext.buf; newComp = ext.compressed;
+    if (ext.promoted) { writeChainBytes(buf, ext.newRegularChain, ssz, newComp); buf.writeInt32LE(ext.newRegularChain[0], diEntry.entryFileOffset + 0x74); }
+    else { writeMiniChainBytes(buf, ext.miniChain, ext.rootChain, ssz, mssz, newComp); }
+  } else {
+    const ext = deflateAndFitWithExpansion(diRaw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; newComp = ext.compressed; writeChainBytes(buf, ext.chain, ssz, newComp);
+  }
+  buf.writeUInt32LE(newComp.length, diEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+  writeFileSync(filePath, buf);
+  return r.newPsId;
+}
+
+// Insert a page number in the footer. Each op: { align?: "left"|"center"|"right" }
+export async function insertPageNumberInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  // Pre-pass: ensure DocInfo has a para_shape for each requested alignment
+  // (appends one if missing) so the auto-number paragraph aligns reliably.
+  // This writes DocInfo, so it must run before we read the body buffer below.
+  const alignToIdx = {};
+  for (const op of ops) {
+    const align = (op.align && ALIGN_BITS[op.align] !== undefined) ? op.align : 'center';
+    if (!(align in alignToIdx)) alignToIdx[align] = await ensureAlignedParaShapeInFile(filePath, align);
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const headerStyle = resolveNoteStyle(buf, 'Header');
+  const pageNumStyle = resolveNoteStyle(buf, 'Page Number');
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const align = (op.align && ALIGN_BITS[op.align] !== undefined) ? op.align : 'center';
+    const where = op.where === 'header' ? 'header' : 'footer'; // default footer (back-compat)
+    const isHeader = where === 'header';
+    const records = parseRecords(raw);
+    const textWidth = readTextWidthFromPageDef(records, raw);
+    const margin = isHeader ? readHeaderMarginFromPageDef(records, raw) : readFooterMarginFromPageDef(records, raw);
+    const paraShape = alignToIdx[align];
+
+    // The header/footer attaches to the section's first top-level paragraph
+    // that has a level-1 PARA_TEXT.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error('page_number: no top-level body paragraph found to host the footer');
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const noteInstanceId = pickFreshInstanceId(records, raw);
+
+    // 1) Insert the header/footer char right before the paragraph's EOP.
+    const hfChar = Buffer.from(isHeader ? PAGENUM_HEADER_CHAR_HEX : PAGENUM_FOOTER_CHAR_HEX, 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length; // before EOP
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), hfChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Header/footer cluster (header listAttr 0x00, footer 0x40).
+    const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, 12), Buffer.from(isHeader ? PAGENUM_HEAD_CTRL_HEX : PAGENUM_FOOT_CTRL_HEX, 'hex')]);
+    const lh = Buffer.alloc(34);
+    lh.writeUInt32LE(1, 0);          // nParas
+    lh.writeUInt32LE(isHeader ? 0x00 : 0x40, 4); // attr
+    lh.writeUInt32LE(textWidth >>> 0, 8);
+    lh.writeUInt32LE(margin >>> 0, 12);
+    const listHeader = Buffer.concat([buildRecordHeader(TAG_LIST_HEADER, 2, 34), lh]);
+    const ph = Buffer.alloc(24);
+    ph.writeUInt32LE(((0x80000000 | 9) >>> 0), 0); // char_count 9 (autonum 8 + EOP), last-para flag
+    ph.writeUInt32LE(0x40000, 4);                  // control_mask: char 0x12 (auto-number)
+    ph.writeUInt16LE(paraShape & 0xFFFF, 8);
+    ph.writeUInt8(headerStyle.index & 0xFF, 10);
+    ph.writeUInt8(0, 11);
+    ph.writeUInt16LE(1, 12);
+    const phRec = Buffer.concat([buildRecordHeader(TAG_PARA_HEADER, 2, 24), ph]);
+    const ptBody2 = Buffer.concat([Buffer.from(NOTE_AUTONUM_HEX, 'hex'), Buffer.from(PARA_TEXT_EOP, 'utf16le')]);
+    const ptRec2 = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 3, ptBody2.length), ptBody2]);
+    const csBody = Buffer.alloc(8); csBody.writeUInt32LE(pageNumStyle.charShape >>> 0, 4);
+    const csRec = Buffer.concat([buildRecordHeader(TAG_PARA_CHAR_SHAPE, 3, 8), csBody]);
+    const onta = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 3, 16), Buffer.from(PAGENUM_ONTA_HEX, 'hex')]);
+    const footerCluster = Buffer.concat([ctrl, listHeader, phRec, ptRec2, csRec, onta]);
+
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x10000 (char 0x10).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x10000) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), footerCluster, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, where, align });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 다단 (multi-column) raw-patch ─────────────────────────────────────────
+// GT-first (claw-hancomdocs `columns --count N` on a .hwp): the section's
+// column layout lives in the "cold" (단 정의) CTRL_HEADER, a fixed 16-byte
+// record: id "dloc" + attribute(u16) + gap(u16) + 8 reserved bytes. The
+// attribute is 0x1000 (same-width flag) | (count << 2) | type(bits 0-1, 0 =
+// 일반/newspaper). GT-confirmed: 1단=0x1004 gap0, 2단=0x1008 gap2268(8mm),
+// 3단=0x100c gap1134(4mm). Every section already has a 1-단 cold control, so
+// we just patch the count + gap in place (length-preserving, Section0-only,
+// no DocInfo change). The body reflows into N columns.
+const TAG_CTRL_HEADER_COLD = 0x47;
+export async function setColumnsInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const count = [1, 2, 3].includes(op.count) ? op.count : 2;
+    const gapHu = op.spacing_mm != null ? Math.round(op.spacing_mm * 283.46) : (count === 1 ? 0 : count === 3 ? 1134 : 2268);
+    let patched = false;
+    for (const r of parseRecords(raw)) {
+      if (r.tag === TAG_CTRL_HEADER_COLD && r.size >= 8 && raw.slice(r.dataOff, r.dataOff + 4).toString('latin1') === 'dloc') {
+        raw.writeUInt16LE((0x1000 | (count << 2)) & 0xFFFF, r.dataOff + 4); // same-width | count | type 0
+        raw.writeUInt16LE(gapHu & 0xFFFF, r.dataOff + 6);                   // 단 사이 간격
+        patched = true;
+        break; // first section's column definition
+      }
+    }
+    if (!patched) throw new Error('set_columns: no column-definition (cold) control found in Section0');
+    summary.push({ section: 0, count, spacing_mm: op.spacing_mm ?? (count === 1 ? 0 : count === 3 ? 4 : 8) });
+  }
+
+  // Deflate + write back (length-preserving patch, but re-deflate to be safe).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, chain);
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart; newCompressed = ext.compressed;
+    if (ext.promoted) { chain = ext.newRegularChain; writeChainBytes(buf, chain, ssz, newCompressed); buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74); }
+    else { rootChain = ext.rootChain; chain = ext.miniChain; writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed); }
+  } else {
+    const ext = deflateAndFitWithExpansion(raw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain; newCompressed = ext.compressed; writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 머리말 / 꼬리말 텍스트 (header / footer text) raw-patch ────────────────
+//
+// Derived from the verified page-number footer/header control structure
+// (insertPageNumberInPlace) — same control + LIST_HEADER — but the content
+// paragraph holds USER TEXT instead of the page-number auto-field (no
+// auto-number control, control_mask 0). The header uses ctrl id "head"
+// (GT pagenum_header.hwp) and the footer "foot" (GT pagenum_native.hwp);
+// LIST_HEADER attr/height differ (header: attr 0, height = header margin;
+// footer: attr 0x40, height = footer margin). Section0-only — no DocInfo
+// write (resolves the existing "Header" style for the paragraph).
+const HF_KINDS = {
+  header: { ctrlId: '64616568', listAttr: 0x00, marginOff: 24 }, // 'head'
+  footer: { ctrlId: '746f6f66', listAttr: 0x40, marginOff: 28 }, // 'foot'
+};
+
+// PAGE_DEF margin (HWPUNIT) at the given offset (24 = header, 28 = footer).
+function readPageDefMargin(records, raw, off) {
+  for (const r of records) {
+    if (r.tag === TAG_PAGE_DEF && r.size >= off + 4) return raw.readUInt32LE(r.dataOff + off);
+  }
+  return 0x109c;
+}
+
+// Insert header/footer text. Each op: { where: "header"|"footer", text: string }
+export async function insertHeaderFooterTextInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const hdrStyle = resolveNoteStyle(buf, 'Header');
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const where = (op.where === 'header') ? 'header' : 'footer';
+    const kind = HF_KINDS[where];
+    const text = (typeof op.text === 'string') ? op.text : '';
+    if (!text) throw new Error(`${where}_text: a "text" string is required`);
+    const records = parseRecords(raw);
+    const textWidth = readTextWidthFromPageDef(records, raw);
+    const margin = readPageDefMargin(records, raw, kind.marginOff);
+
+    // Attach to the section's first top-level paragraph that has PARA_TEXT.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    for (const c of clusters) {
+      for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+        const r = records[i];
+        if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+      }
+      if (ptRec) break;
+    }
+    if (!ptRec) throw new Error(`${where}_text: no top-level body paragraph found`);
+
+    const paraHeaderRec = records[cluster.startIdx];
+
+    // 1) Inline header/footer char (0x0010 + ctrlId) before the paragraph's EOP.
+    const hfChar = Buffer.alloc(16);
+    hfChar.writeUInt16LE(0x10, 0);
+    Buffer.from(kind.ctrlId, 'hex').copy(hfChar, 2);
+    hfChar.writeUInt16LE(0x10, 14);
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), hfChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) Header/footer cluster with a user-text paragraph.
+    const ctrlBody = Buffer.concat([Buffer.from(kind.ctrlId, 'hex'), Buffer.from('0000000001000000', 'hex')]);
+    const ctrl = Buffer.concat([buildRecordHeader(TAG_CTRL_HEADER, 1, 12), ctrlBody]);
+    const lh = Buffer.alloc(34);
+    lh.writeUInt32LE(1, 0);
+    lh.writeUInt32LE(kind.listAttr, 4);
+    lh.writeUInt32LE(textWidth >>> 0, 8);
+    lh.writeUInt32LE(margin >>> 0, 12);
+    const listHeader = Buffer.concat([buildRecordHeader(TAG_LIST_HEADER, 2, 34), lh]);
+    const ph = Buffer.alloc(24);
+    ph.writeUInt32LE(((0x80000000 | ((text.length + 1) & 0x7FFFFFFF)) >>> 0), 0); // text + EOP, last-para
+    ph.writeUInt32LE(0, 4);                       // control_mask: plain text
+    ph.writeUInt16LE(0, 8);                       // para_shape 0 (default alignment)
+    ph.writeUInt8(hdrStyle.index & 0xFF, 10);
+    ph.writeUInt8(0, 11);
+    ph.writeUInt16LE(1, 12);
+    const phRec = Buffer.concat([buildRecordHeader(TAG_PARA_HEADER, 2, 24), ph]);
+    const ptBody2 = Buffer.from(text + PARA_TEXT_EOP, 'utf16le');
+    const ptRec2 = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 3, ptBody2.length), ptBody2]);
+    const csBody = Buffer.alloc(8); csBody.writeUInt32LE(hdrStyle.charShape >>> 0, 4);
+    const csRec = Buffer.concat([buildRecordHeader(TAG_PARA_CHAR_SHAPE, 3, 8), csBody]);
+    const hfCluster = Buffer.concat([ctrl, listHeader, phRec, ptRec2, csRec]);
+
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x10000 (char 0x10).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x10000) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), hfCluster, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, where, text });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 이미지 (image) raw-patch — Hancom-Docs compatible ─────────────────────
+//
+// GT-first (image_native.hwp from Hancom's 입력 › 그림): an image is a gso
+// "$pic" drawing object in a NEW paragraph, backed by a deflated image stream
+// in a `BinData/BIN000N.<ext>` CFB stream and a DocInfo HWPTAG_BIN_DATA def.
+// The earlier Phase-6 attempt failed Hancom Docs render (donor-template
+// cluster) and could not create a BinData folder; this op reproduces Hancom's
+// exact $pic cluster + creates the BinData storage folder when missing.
+//   3 steps (each re-writes the file):
+//     1. CFB: create the BinData storage folder if absent, add a
+//        BIN000N.<ext> stream holding deflate(image bytes).
+//     2. DocInfo: HWPTAG_BIN_DATA def (attr 0x0001 = Embedding/Default,
+//        matching the GT, NOT Phase-6's 0x0101) + ID_MAPPINGS bin-data count++.
+//     3. Section0: insert the gso "$pic" cluster (GT template) as a new
+//        paragraph; CTRL_DATA[71] = the storage id.
+const IMG_GSO_CTRL_HEX  = '206f736711230a14000000000000000070170000a60e000000000000000000000000000065969a42000000000000';
+const IMG_PIC_COMP_HEX  = '636970246369702400000000000000000000010070170000a60e000070170000a60e000000000b20000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000';
+const IMG_CTRL_DATA_HEX = '0000000000000000000000000000000000000000701700000000000070170000a60e000000000000a60e0000000000000000000070170000c40e0000000000000000000000000001000066969a020000000070170000c40e000000';
+const TAG_CTRL_DATA = 0x55;
+
+// Build the image's new-paragraph gso "$pic" cluster (6 records).
+function buildImagePicCluster(storageId, paraInstanceId, gsoInstanceId) {
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(9, 0);              // char_count 9 (last-para flag normalized later)
+  ph.writeUInt32LE(0x800, 4);         // control_mask: gso bit
+  ph.writeUInt16LE(0, 8);             // para_shape 0
+  ph.writeUInt8(0, 10); ph.writeUInt8(0, 11);
+  ph.writeUInt16LE(1, 12);            // num_char_shapes
+  ph.writeUInt16LE(0, 14); ph.writeUInt16LE(0, 16);
+  ph.writeUInt32LE(paraInstanceId >>> 0, 18);
+
+  const pt = Buffer.from('0b00206f736700000000000000000b000d00', 'hex'); // gso char + EOP
+  const cs = Buffer.alloc(8);
+
+  const ch = Buffer.from(IMG_GSO_CTRL_HEX, 'hex'); ch.writeUInt32LE(gsoInstanceId >>> 0, 36);
+  const pic = Buffer.from(IMG_PIC_COMP_HEX, 'hex');
+  const cd = Buffer.from(IMG_CTRL_DATA_HEX, 'hex'); cd.writeUInt16LE(storageId & 0xFFFF, 71);
+
+  const parts = [
+    [TAG_PARA_HEADER, 0, ph], [TAG_PARA_TEXT, 1, pt], [TAG_PARA_CHAR_SHAPE, 1, cs],
+    [TAG_CTRL_HEADER, 1, ch], [TAG_SHAPE_COMPONENT, 2, pic], [TAG_CTRL_DATA, 3, cd],
+  ];
+  const chunks = [];
+  for (const [tag, lvl, body] of parts) chunks.push(buildRecordHeader(tag, lvl, body.length), body);
+  return Buffer.concat(chunks);
+}
+
+export async function insertImageInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  // Images dropped into a table cell are centered by default (user pref): ensure
+  // a centered ParaShape exists (DocInfo write) before the per-image Section0 step.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
+
+  const summary = [];
+  for (const op of ops) {
+    if (!op.path) throw new Error('insert_image: op.path (image file) is required');
+    const imgBuf = readFileSync(op.path);
+    const ext = (op.path.split('.').pop() || 'png').toLowerCase();
+    const stored = deflateRawSync(imgBuf, { level: 9 });
+    if (stored.length >= 4096) throw new Error(`insert_image: image too large for mini-stream (${stored.length} deflated bytes)`);
+
+    // ── Step 1: CFB — ensure BinData folder, add the image stream ──────────
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    if (!mssz) mssz = MSSZ_DEFAULT_IMG;
+    let fat = readFat(buf, fatAddrs, ssz);
+    let dir = readDirectory(buf, fat, ssz, dirStart);
+    let rootChain = walkChain(fat, dir.entries[0].start);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+
+    let binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    if (binDataIdx < 0) {
+      ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+      dir = readDirectory(buf, fat, ssz, dirStart);
+      const folderSlot = findUnusedDirSlot(dir.entries);
+      if (folderSlot < 0) throw new Error('insert_image: no free directory slot for the BinData folder');
+      writeDirEntry(buf, dir.entries[folderSlot], 'BinData', 1, 0, 0); // storage: start 0, size 0
+      insertEntryIntoTree(buf, dir.entries, 0, folderSlot);            // link under Root Entry
+      binDataIdx = folderSlot;
+    }
+
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    rootChain = walkChain(fat, dir.entries[0].start);
+    binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    const newName = pickFreeBinDataName(dir.entries, ext);
+    ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    const streamSlot = findUnusedDirSlot(dir.entries);
+    if (streamSlot < 0) throw new Error('insert_image: no free directory slot for the image stream');
+    const alloc = allocMiniChain({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain, rootEntry: dir.entries[0] }, stored.length);
+    buf = alloc.buf; fat = alloc.fat; minifat = alloc.minifat; minifatStart = alloc.minifatStart; rootChain = alloc.rootChain;
+    writeMiniChainBytes(buf, alloc.chain, rootChain, ssz, mssz, stored);
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binDataIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    writeDirEntry(buf, dir.entries[streamSlot], newName, 2, alloc.chain[0], stored.length, 0);
+    insertEntryIntoTree(buf, dir.entries, binDataIdx, streamSlot);
+    const storageId = parseInt(newName.match(/BIN(\d{4})\./)[1], 10);
+    writeFileSync(filePath, buf);
+
+    // ── Step 2: DocInfo BIN_DATA def (attr 0x0001) + ID_MAPPINGS count++ ───
+    await addBinDataDefToDocInfo(filePath, storageId, ext, 0x0001);
+
+    // ── Step 3: Section0 — insert the gso "$pic" cluster as a new paragraph ─
+    {
+      let b2 = readFileSync(filePath);
+      let h = parseCfbHeader(b2);
+      let f2 = readFat(b2, h.fatAddrs, h.ssz);
+      const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+      let mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+      const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+      const secInMini = secEntry.size < 4096;
+      let rc2 = null; const ensureRC = () => rc2 || (rc2 = walkChain(f2, entries[0].start));
+      let sChain, sComp;
+      if (secInMini) { const rc = ensureRC(); sChain = walkChain(mf2, secEntry.start); sComp = readMiniChainBytes(b2, sChain, rc, h.ssz, h.mssz, secEntry.size); }
+      else { sChain = walkChain(f2, secEntry.start); sComp = readChainBytes(b2, sChain, h.ssz, secEntry.size); }
+      let raw = Buffer.from(inflateRawSync(sComp));
+
+      const records = parseRecords(raw);
+      const paraInst = pickFreshInstanceId(records, raw);
+      const cluster = buildImagePicCluster(storageId, paraInst, (paraInst + 0x100) >>> 0);
+      // size — aspect preserved from the image's NATIVE pixel ratio (give one
+      // axis → the other follows; give both → explicit squeeze).
+      const px = readImagePixelSize(imgBuf);
+      applyGsoSize(cluster, resolveAspectSize(op, px && px.w > 0 && px.h > 0 ? px.w / px.h : gsoCtrlRatio(cluster)));
+      // Placement: inline (글자처럼, default — back-compat) or a floating wrap
+      // (front/behind/square/topbottom) + optional pos_x_mm/pos_y_mm. Lets an image
+      // float "앞으로" at an absolute position (seal/도장 placement) — same gso
+      // CTRL wrap+offset path that insert_shape/set_object_property use. Default
+      // resolves to inline, so existing insert_image stays byte-identical.
+      applyGsoPlacement(cluster, op, resolveWrapMode(op));
+      if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+        // ── Insert into a table CELL — the image becomes a new (treat-as-char)
+        // paragraph inside the cell. The body-built gso cluster is dropped two
+        // levels deeper (cell paragraphs are level 2) and spliced at the cell's
+        // end; the cell's paragraph count is bumped and its last-para flag fixed.
+        const para = op.cell.para ?? 0, control = op.cell.control ?? 0;
+        const target = tableCellRecords(records, raw, para, control)
+          .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+        if (!target) throw new Error(`insert_image: cell (row=${op.cell.row}, col=${op.cell.col}) not found in table at para ${para} control ${control}`);
+        const cellCluster = relevelCluster(cluster, 2);
+        cellCluster.writeUInt16LE(centerPsId & 0xFFFF, 12); // PARA_HEADER body off8 = para_shape_id (centered)
+        setGsoOutMarginTopBottom(cellCluster, CELL_OBJ_VMARGIN_HU); // top/bottom breathing room
+        raw = Buffer.concat([raw.slice(0, target.endByte), cellCluster, raw.slice(target.endByte)]);
+        const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
+          .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+        const lhDataOff = t2.startByte + 4; // LIST_HEADER header = 4 bytes (body < 0xFFF)
+        raw.writeUInt16LE((raw.readUInt16LE(lhDataOff) + 1) & 0xFFFF, lhDataOff); // nParagraphs++
+        normalizeCellLastParaFlag(raw, t2.startByte, t2.endByte, 2);
+      } else {
+        const wrapMode = resolveWrapMode(op);
+        const clusters = findClusterBoundaries(records);
+        // FLOATING image with an anchor → attach the gso to the anchor paragraph itself
+        // (like insert_shape) instead of opening a NEW paragraph after it. The gso's PARA
+        // frame origin is then the anchor's OWN line, so pos_x/pos_y place the image on
+        // that line; a new paragraph below sits under the anchor and the PARA frame clamps
+        // the image down (can't lift above its para top). Inline keeps the new-paragraph
+        // path (byte-identical, back-compat).
+        let attached = false;
+        if (wrapMode !== 'inline' && op.anchor && typeof op.anchor === 'string') {
+          const ab = Buffer.from(op.anchor, 'utf16le');
+          // Find the anchor PARA_TEXT at ANY depth — body (level 1) OR a table cell
+          // (level 3). The gso attaches to that paragraph wherever it lives.
+          let ptIdx = -1;
+          for (let i = 0; i < records.length; i++) {
+            const r = records[i];
+            if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { ptIdx = i; break; }
+          }
+          if (ptIdx !== -1) {
+            const ptRec = records[ptIdx];
+            const phLevel = ptRec.level - 1;        // PARA_HEADER is one level above its text (body 0 / cell 2)
+            const delta = ptRec.level - 1;          // shift the body-built gso part down into the cell's depth (+2 for cells)
+            let phIdx = -1;                          // anchor PARA_HEADER = nearest preceding header at phLevel
+            for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_PARA_HEADER && records[i].level === phLevel) { phIdx = i; break; } }
+            let endIdx = records.length;            // paragraph end = next record at level <= phLevel (next para / cell / table edge)
+            for (let i = ptIdx + 1; i < records.length; i++) { if (records[i].level <= phLevel) { endIdx = i; break; } }
+            if (phIdx !== -1) {
+              const cr = parseRecords(cluster);                       // the full-para image cluster
+              const ctrlR = cr.find((r) => r.tag === TAG_CTRL_HEADER);
+              let gsoPart = Buffer.from(cluster.slice(ctrlR.headOff)); // CTRL_HEADER + SHAPE_COMPONENT + CTRL_DATA (size/wrap/pos already applied)
+              if (delta !== 0) gsoPart = relevelCluster(gsoPart, delta); // re-level into the cell (CTRL 1→3, COMP/DATA 2→4)
+              const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex'); // inline gso anchor (8 wchars), before EOP
+              const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+              const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+              const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, ptRec.level, oldBody.length + gsoChar.length), oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
+              const phOff = records[phIdx].dataOff;                   // anchor PARA_HEADER: char_count += 8, control_mask |= 0x800
+              const curCount = raw.readUInt32LE(phOff);
+              raw.writeUInt32LE((((curCount & 0x80000000) >>> 0) | ((curCount & 0x7FFFFFFF) + 8)) >>> 0, phOff);
+              raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
+              const paraEndOff = endIdx < records.length ? records[endIdx].headOff : raw.length;
+              raw = Buffer.concat([raw.slice(0, paraEndOff), gsoPart, raw.slice(paraEndOff)]); // gso at para end (after PARA_TEXT → ptRec offsets stay valid)
+              raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+              attached = true;
+            }
+          }
+        }
+        if (!attached) {
+          // ── Inline (or floating w/ no anchor match): open a new paragraph. ──
+          let insertAt = raw.length;
+          if (op.anchor && typeof op.anchor === 'string') {
+            const ab = Buffer.from(op.anchor, 'utf16le');
+            for (const c of clusters) {
+              let hit = false;
+              for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } }
+              if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; }
+            }
+          } else {
+            const t = findLastSimpleBodyParagraph(records);
+            insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+          }
+          raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+          normalizeLastParaFlag(raw);
+        }
+      }
+
+      let newComp;
+      if (secInMini) {
+        const rc = ensureRC();
+        const e = deflateMiniChainWithExpansion({ buf: b2, ssz: h.ssz, mssz: h.mssz, fat: f2, fatAddrs: h.fatAddrs, minifat: mf2, minifatStart: h.minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, sChain);
+        b2 = e.buf; f2 = e.fat; mf2 = e.minifat; h.minifatStart = e.minifatStart; newComp = e.compressed;
+        if (e.promoted) { sChain = e.newRegularChain; writeChainBytes(b2, sChain, h.ssz, newComp); b2.writeInt32LE(sChain[0], secEntry.entryFileOffset + 0x74); }
+        else { rc2 = e.rootChain; sChain = e.miniChain; writeMiniChainBytes(b2, sChain, rc2, h.ssz, h.mssz, newComp); }
+      } else {
+        const e = deflateAndFitWithExpansion(raw, sChain.length * h.ssz, h.ssz, f2, h.fatAddrs, sChain, b2, false);
+        b2 = e.buf; f2 = e.fat; sChain = e.chain; newComp = e.compressed; writeChainBytes(b2, sChain, h.ssz, newComp);
+      }
+      b2.writeUInt32LE(newComp.length, secEntry.entryFileOffset + 0x78);
+      b2.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      writeFileSync(filePath, b2);
+    }
+
+    summary.push({ section: 0, image: op.path, storage_id: storageId, stream: `BinData/${newName}` });
+  }
+
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── place_seal: font-metric seal/signature placement ──────────────────────
+// HWP PARA_TEXT mixes glyphs with inline control chars. A control char occupies
+// either 1 wchar ("char" controls: 0,10,13,24-31) or 8 wchars (inline/extended
+// controls: everything else < 0x20 — the char + 6 param wchars + a closing copy).
+// We need both to walk to the anchor's byte offset AND to add zero width for them.
+function sealCtrlWcharLen(code) {
+  if (code >= 0x20) return 1;
+  if (code === 0 || code === 10 || code === 13 || (code >= 24 && code <= 31)) return 1;
+  return 8;
+}
+// Visual advance of one code unit, in ems. CJK/Hangul/fullwidth = 1 em; ASCII and
+// halfwidth (incl. space) = 0.5 em; control chars = 0. (handoff §2 metric.)
+function sealGlyphEm(code) {
+  if (code < 0x20) return 0;
+  if (code <= 0x7e) return 0.5;   // ASCII incl. space ≈ half-width
+  if (code >= 0xff61 && code <= 0xffdc) return 0.5; // halfwidth forms
+  return 1.0;
+}
+
+// A center/right-aligned paragraph shifts its whole text block away from the left
+// edge, which a left-anchored startX walk doesn't see — on a center-aligned form
+// cell that makes the seal drift symmetrically off the marker. Read the anchor
+// paragraph's alignment (PARA_SHAPE) and, for center/right, return the block shift
+// (mm) to add to the seal's x: center → (availW − textW)/2, right → availW − textW.
+// availW = the cell's content width (forms put signature lines in cells) or a body
+// text-area default. textW = font-metric width of the whole paragraph.
+function sealAlignShift(buf, records, ptIdx, body, em, textAreaMm) {
+  const ptRec = records[ptIdx];
+  const phLevel = ptRec.level - 1;
+  let phIdx = -1;
+  for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_PARA_HEADER && records[i].level === phLevel) { phIdx = i; break; } }
+  if (phIdx === -1) return 0;
+  const raw = readDecodedStreamFromCfb(buf, ['BodyText', 'Section0']);
+  const psId = raw.readUInt16LE(records[phIdx].dataOff + 8); // PARA_HEADER body off8 = para_shape_id
+  let docInfo;
+  try { docInfo = readDecodedStreamFromCfb(buf, ['DocInfo']); } catch { return 0; }
+  const di = parseRecords(docInfo);
+  const shapes = di.filter((r) => r.tag === 0x19); // HWPTAG_PARA_SHAPE
+  if (psId >= shapes.length) return 0;
+  const align = (docInfo.readUInt32LE(shapes[psId].dataOff) >> 2) & 0x7; // 0 just,1 left,2 right,3 center
+  if (align !== 2 && align !== 3) return 0;
+  // available width: cell content width if the anchor lives in a table cell, else body text area
+  let availMm = textAreaMm;
+  if (ptRec.level >= 3) {
+    let lh = -1;
+    for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_LIST_HEADER && records[i].level === 2) { lh = i; break; } }
+    if (lh !== -1) {
+      const d = records[lh].dataOff;
+      const w = raw.readUInt32LE(d + 16), mL = raw.readUInt16LE(d + 24), mR = raw.readUInt16LE(d + 26);
+      availMm = (w - mL - mR) / HWPUNIT_PER_MM;
+    }
+  }
+  const textW = sealMeasureWidthMM(body, body.length, em);
+  return align === 3 ? (availMm - textW) / 2 : (availMm - textW);
+}
+// Sum the glyph advance (mm) of the PARA_TEXT body up to `uptoByteOff`, skipping
+// inline-control runs by their wchar length so the offset walk stays aligned.
+function sealMeasureWidthMM(body, uptoByteOff, em_mm) {
+  let off = 0, w = 0;
+  while (off < uptoByteOff && off + 2 <= body.length) {
+    const code = body.readUInt16LE(off);
+    if (code >= 0x20) w += sealGlyphEm(code) * em_mm;
+    off += sealCtrlWcharLen(code) * 2;
+  }
+  return w;
+}
+
+// Place a seal/signature PNG floating ("front") onto an anchor phrase, positioned
+// by FONT METRICS — no render needed to find the spot (render is verify/calibrate
+// only, handoff §2). overlap → seal centred on the phrase; right → seal just past
+// the phrase. Auto-size = line × 1.6 clamped [7,18]mm. Frame: 'para' anchors to the
+// line (cells have headroom above → true vertical centre, rule D; a free body line
+// near the page top clamps the seal ~2.6mm low — rule C — so pass frame:'page' for
+// those, with dy_mm to fine-tune). Delegates to insertImageInPlace's GT-verified
+// floating-attach path, so the produced gso is byte-equivalent to insert_image.
+export async function placeSealInPlace(filePath, ops) {
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('place_seal: anchor (text) required');
+    const source = op.source || op.path;
+    if (!source) throw new Error('place_seal: source (seal PNG path) required');
+    if (!existsSync(source)) throw new Error(`place_seal: source not found: ${source}`);
+
+    const buf = readFileSync(filePath);
+    const raw = readDecodedStreamFromCfb(buf, ['BodyText', 'Section0']);
+    const records = parseRecords(raw);
+    const ab = Buffer.from(op.anchor, 'utf16le');
+    let ptRec = null, ptIdx = -1, anchorByteInBody = -1;
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
+      if (r.tag !== TAG_PARA_TEXT || r.size <= 0) continue;
+      const idx = raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab);
+      if (idx !== -1) { ptRec = r; ptIdx = i; anchorByteInBody = idx; break; }
+    }
+    if (!ptRec) throw new Error(`place_seal: anchor "${op.anchor}" not found in body text`);
+    const body = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+
+    const fontPt = op.font_pt || 10;
+    const em = (fontPt * 25.4) / 72;          // 1 em in mm at this point size
+    const lineH = em;                          // body line ≈ 1 em tall
+    const startX = sealMeasureWidthMM(body, anchorByteInBody, em);
+    let aw = 0;
+    for (const ch of op.anchor) aw += sealGlyphEm(ch.codePointAt(0)) * em;
+
+    let size = op.size_mm != null ? op.size_mm : Math.max(7, Math.min(18, lineH * 1.6));
+    // mode auto: sit beside the phrase when there's ≥ seal+2mm of room, else overlap.
+    const TEXT_AREA_W = op.text_area_mm || 150; // typical A4 body width
+    let mode = String(op.mode || 'auto').toLowerCase();
+    if (mode === 'auto') mode = (TEXT_AREA_W - (startX + aw) >= size + 2) ? 'right' : 'overlap';
+    if (mode !== 'overlap' && mode !== 'right') throw new Error('place_seal: mode must be overlap / right / auto');
+
+    let posX = mode === 'right' ? startX + aw + 2 : startX + aw / 2 - size / 2;
+    // Center/right-aligned paragraphs (common in form cells) shift the whole text
+    // block — add that shift so the seal tracks the on-screen marker, not the
+    // left-anchored estimate. (No-op for left/justify; agent can still nudge dx.)
+    const alignShift = sealAlignShift(buf, records, ptIdx, body, em, TEXT_AREA_W);
+    posX += alignShift + (op.dx_mm || 0);
+    const frame = String(op.frame || 'para').toLowerCase();
+    // Centre the seal on the line: lift it by half the overhang. PARA clamps this to
+    // 0 on a free top line (→ top-aligned, GT-equivalent); cells & PAGE frame honour it.
+    let posY = -(size - lineH) / 2 + (op.dy_mm || 0);
+
+    const imgOp = {
+      type: 'insert_image', path: source, anchor: op.anchor, wrap: 'front', frame,
+      pos_x_mm: posX, pos_y_mm: posY, width_mm: size, height_mm: size,
+    };
+    const r = await insertImageInPlace(filePath, [imgOp]);
+    summary.push({
+      anchor: op.anchor, mode, frame,
+      pos_x_mm: +posX.toFixed(2), pos_y_mm: +posY.toFixed(2), size_mm: +size.toFixed(2),
+      ...(r[0] || {}),
+    });
+  }
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── chart data editing (rows/cols/values via OOXMLChartContents) ──────────
+// Hancom Docs renders a chart from the OOXMLChartContents XML inside the OLE
+// (verified by capture: editing only that XML's category label changed the
+// rendered chart, while the legacy VtChart "Contents" stream stayed stale).
+// So we edit that XML to set category count (rows), series count (cols),
+// labels, and values, then repack the inner CFB and re-deflate the OLE.
+// The inner OLE is a minimal v3 CFB (512-B sectors, single FAT sector, no
+// mini stream — both real streams are >4 KB regular streams).
+const _chXmlEsc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const _chStrCache = (labels) => `<c:ptCount val="${labels.length}"/>` + labels.map((l, i) => `<c:pt idx="${i}"><c:v>${_chXmlEsc(l)}</c:v></c:pt>`).join('');
+const _chNumCache = (vals) => `<c:formatCode>General</c:formatCode><c:ptCount val="${vals.length}"/>` + vals.map((v, i) => `<c:pt idx="${i}"><c:v>${v}</c:v></c:pt>`).join('');
+function _chReplaceBlock(s, openTag, closeTag, fromIdx, newInner) {
+  const a = s.indexOf(openTag, fromIdx); if (a < 0) return { s, end: fromIdx };
+  const b = s.indexOf(closeTag, a); if (b < 0) return { s, end: fromIdx };
+  return { s: s.slice(0, a + openTag.length) + newInner + s.slice(b), end: a + openTag.length + newInner.length + closeTag.length };
+}
+function _chEditSer(ser, idx, name, categories, values) {
+  let out = ser.replace(/<c:idx val="\d+"\/>/, `<c:idx val="${idx}"/>`).replace(/<c:order val="\d+"\/>/, `<c:order val="${idx}"/>`);
+  let r = _chReplaceBlock(out, '<c:strCache>', '</c:strCache>', 0, _chStrCache([name])); out = r.s;       // series name
+  r = _chReplaceBlock(out, '<c:strCache>', '</c:strCache>', r.end, _chStrCache(categories)); out = r.s;   // categories (rows)
+  r = _chReplaceBlock(out, '<c:numCache>', '</c:numCache>', 0, _chNumCache(values)); out = r.s;           // values
+  return out;
+}
+function _chEditXml(xml, model) {
+  const first = xml.indexOf('<c:ser>'); const lastClose = xml.lastIndexOf('</c:ser>');
+  if (first < 0 || lastClose < 0) throw new Error('chart data edit: no <c:ser> blocks (unsupported chart structure)');
+  if (xml.indexOf('<c:cat>') < 0 || xml.indexOf('<c:val>') < 0) throw new Error('chart data edit: this chart type has no category/value axis (e.g. scatter/bubble) — data editing not supported');
+  const serTpl = xml.slice(first, xml.indexOf('</c:ser>') + 8);
+  const sers = model.series.map((s, i) => _chEditSer(serTpl, i, s.name, model.categories, s.values));
+  return xml.slice(0, first) + sers.join('') + xml.slice(lastClose + 8);
+}
+// minimal inner-CFB primitives (simple v3 CFB only)
+const _icHdr = (cfb) => { const ssz = 1 << cfb.readUInt16LE(30); const mssz = 1 << cfb.readUInt16LE(32); const nFat = cfb.readUInt32LE(44); const dirStart = cfb.readUInt32LE(48); const miniCutoff = cfb.readUInt32LE(56); const minifatStart = cfb.readUInt32LE(60); const difat = []; for (let i = 0; i < 109; i++) { const v = cfb.readUInt32LE(76 + i * 4); if (v <= 0xFFFFFFFA) difat.push(v); } return { ssz, mssz, nFat, dirStart, miniCutoff, minifatStart, difat }; };
+const _icFat = (cfb, difat, ssz) => { const fat = []; for (const fs of difat) { const off = 512 + fs * ssz; for (let i = 0; i < ssz / 4; i++) fat.push(cfb.readUInt32LE(off + i * 4)); } return fat; };
+const _icChain = (fat, start) => { const c = []; let s = start; while (s <= 0xFFFFFFFA && s < fat.length) { c.push(s); s = fat[s]; if (c.length > 100000) break; } return c; };
+const _icSecOff = (idx, ssz) => 512 + idx * ssz;
+function _icFindEntry(cfb, hdr, fat, name) {
+  for (const sec of _icChain(fat, hdr.dirStart)) for (let e = 0; e < hdr.ssz / 128; e++) {
+    const off = _icSecOff(sec, hdr.ssz) + e * 128; const nameLen = cfb.readUInt16LE(off + 64); if (nameLen <= 0) continue;
+    if (cfb.slice(off, off + nameLen - 2).toString('utf16le') === name) return off;
+  }
+  return -1;
+}
+// Mini-stream support. Inner CFBs classify any stream < miniCutoff (4096) as a
+// mini-stream: its bytes live in 64-byte mini-sectors packed inside the Root Entry's
+// regular chain, indexed by the mini-FAT (not the regular FAT). Pie/doughnut chart
+// templates store OOXMLChartContents (~3.4 KB) natively here, so reading them needs
+// this path (the regular reader would walk the wrong FAT and return garbage).
+const _icMiniFat = (cfb, hdr, fat) => {
+  const mf = []; if (hdr.minifatStart > 0xFFFFFFFA) return mf;
+  for (const sec of _icChain(fat, hdr.minifatStart)) { const off = _icSecOff(sec, hdr.ssz); for (let i = 0; i < hdr.ssz / 4; i++) mf.push(cfb.readUInt32LE(off + i * 4)); }
+  return mf;
+};
+const _icReadRootStream = (cfb, hdr, fat) => {
+  // Root Entry = first dir entry (dirStart sector, offset 0); its regular chain is the mini-stream container.
+  const rootOff = _icSecOff(hdr.dirStart, hdr.ssz);
+  const chain = _icChain(fat, cfb.readUInt32LE(rootOff + 116)); const rsize = cfb.readUInt32LE(rootOff + 120);
+  const out = Buffer.alloc(chain.length * hdr.ssz); let p = 0;
+  for (const sec of chain) { const off = _icSecOff(sec, hdr.ssz); cfb.copy(out, p, off, off + hdr.ssz); p += hdr.ssz; }
+  return rsize > 0 && rsize < out.length ? out.slice(0, rsize) : out;
+};
+function _icReadMini(cfb, hdr, fat, entryOff) {
+  const size = cfb.readUInt32LE(entryOff + 120); const miniFat = _icMiniFat(cfb, hdr, fat); const root = _icReadRootStream(cfb, hdr, fat);
+  const out = Buffer.alloc(size); let p = 0; let s = cfb.readUInt32LE(entryOff + 116);
+  while (s <= 0xFFFFFFFA && p < size) { const off = s * hdr.mssz; const n = Math.min(hdr.mssz, size - p); root.copy(out, p, off, off + n); p += n; s = miniFat[s]; if (s === undefined) break; }
+  return out;
+}
+function _icReadStream(cfb, hdr, fat, entryOff) {
+  const size = cfb.readUInt32LE(entryOff + 120);
+  if (size > 0 && size < hdr.miniCutoff) return _icReadMini(cfb, hdr, fat, entryOff);
+  const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116));
+  const out = Buffer.alloc(size); let p = 0;
+  for (const sec of chain) { const off = _icSecOff(sec, hdr.ssz); const n = Math.min(hdr.ssz, size - p); cfb.copy(out, p, off, off + n); p += n; if (p >= size) break; }
+  return out;
+}
+function _icWriteOoxml(cfb, newXml) {
+  const hdr = _icHdr(cfb); const ssz = hdr.ssz; let fat = _icFat(cfb, hdr.difat, ssz);
+  const entryOff = _icFindEntry(cfb, hdr, fat, 'OOXMLChartContents'); if (entryOff < 0) throw new Error('chart data edit: OOXMLChartContents not found');
+  const data = Buffer.from(newXml, 'utf8');
+  const oldSize = cfb.readUInt32LE(entryOff + 120);
+  const wasMini = oldSize > 0 && oldSize < hdr.miniCutoff;
+  if (!wasMini) {
+    const chain = _icChain(fat, cfb.readUInt32LE(entryOff + 116)); const capacity = chain.length * ssz;
+    if (data.length <= capacity) {
+      let p = 0; for (const sec of chain) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(cfb, off, p, p + n); if (n < ssz) cfb.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+      cfb.writeUInt32LE(data.length, entryOff + 120); return cfb;
+    }
+    if (hdr.nFat !== 1 || hdr.difat.length !== 1) throw new Error('chart data edit: multi-FAT OLE not supported');
+    const needSectors = Math.ceil(data.length / ssz); const addSectors = needSectors - chain.length; let buf = cfb; const added = [];
+    for (let i = 0; i < addSectors; i++) { const idx = (buf.length - 512) / ssz; const tmp = Buffer.alloc(buf.length + ssz); buf.copy(tmp); buf = tmp; added.push(idx); }
+    while (fat.length < (buf.length - 512) / ssz) fat.push(0xFFFFFFFF);
+    const full = chain.concat(added); for (let i = 0; i < full.length - 1; i++) fat[full[i]] = full[i + 1]; fat[full[full.length - 1]] = 0xFFFFFFFE;
+    const maxEntries = ssz / 4; if (fat.length > maxEntries) throw new Error('chart data edit: OLE exceeded single-FAT capacity (too many rows/cols)');
+    const fatOff = _icSecOff(hdr.difat[0], ssz); for (let i = 0; i < maxEntries; i++) buf.writeUInt32LE((i < fat.length ? fat[i] : 0xFFFFFFFF) >>> 0, fatOff + i * 4);
+    let p = 0; for (const sec of full) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(buf, off, p, p + n); if (n < ssz) buf.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+    buf.writeUInt32LE(data.length, entryOff + 120); return buf;
+  }
+  // The entry was a MINI stream (pie/doughnut templates store OOXMLChartContents
+  // natively at ~3.4 KB, below the 4096 cutoff). The edited+padded XML is regular-sized
+  // (buildChartOleWithData pads to >= MIN_OOXML), so MOVE the entry out of the mini-stream
+  // into a fresh regular chain: allocate sectors at the tail, repoint the dir entry, and
+  // set a regular size. The old mini-sectors are left orphaned in the mini-stream container
+  // (harmless — nothing references them once the entry points elsewhere).
+  if (hdr.nFat !== 1 || hdr.difat.length !== 1) throw new Error('chart data edit: multi-FAT OLE not supported');
+  if (data.length < hdr.miniCutoff) throw new Error('chart data edit: mini-stream entry under cutoff (expected padded >= 4096)');
+  const needSectors = Math.ceil(data.length / ssz); let buf = cfb; const newChain = [];
+  for (let i = 0; i < needSectors; i++) { const idx = (buf.length - 512) / ssz; const tmp = Buffer.alloc(buf.length + ssz); buf.copy(tmp); buf = tmp; newChain.push(idx); }
+  while (fat.length < (buf.length - 512) / ssz) fat.push(0xFFFFFFFF);
+  for (let i = 0; i < newChain.length - 1; i++) fat[newChain[i]] = newChain[i + 1]; fat[newChain[newChain.length - 1]] = 0xFFFFFFFE;
+  const maxEntries = ssz / 4; if (fat.length > maxEntries) throw new Error('chart data edit: OLE exceeded single-FAT capacity (too many rows/cols)');
+  const fatOff = _icSecOff(hdr.difat[0], ssz); for (let i = 0; i < maxEntries; i++) buf.writeUInt32LE((i < fat.length ? fat[i] : 0xFFFFFFFF) >>> 0, fatOff + i * 4);
+  let p = 0; for (const sec of newChain) { const off = _icSecOff(sec, ssz); const n = Math.min(ssz, data.length - p); if (n > 0) data.copy(buf, off, p, p + n); if (n < ssz) buf.fill(0, off + Math.max(0, n), off + ssz); p += n; }
+  buf.writeUInt32LE(newChain[0], entryOff + 116);  // dir entry → fresh regular chain
+  buf.writeUInt32LE(data.length, entryOff + 120);   // regular size (>= cutoff)
+  return buf;
+}
+// ── chart series / point colour (theme matching) ─────────────────────────
+// Inject colour into the OOXMLChartContents, mirroring the HWPX track's
+// buildChartSpace colour model so .hwp and .hwpx charts match a document theme
+// the same way. Hancom stores the colour differently per chart family (verified,
+// GT in handoff/shared/gt/chart-*-schemeclr.hwpx):
+//   - fill families (bar/area/scatter/bubble): bare <a:solidFill> in <c:spPr>
+//   - stroke families (line/radar): <a:solidFill> inside <a:ln> (a bare fill
+//     leaves the stroke colour unchanged)
+//   - pie/doughnut: one series, colour each slice via <c:dPt>
+// accent1-6 → <a:schemeClr> (Hancom's built-in chart palette); #RRGGBB →
+// <a:srgbClr> (literal — use this to MATCH a document theme colour).
+function _chColorFill(c) {
+  const s = String(c == null ? '' : c).trim();
+  if (/^accent[1-6]$/i.test(s)) return `<a:solidFill><a:schemeClr val="${s.toLowerCase()}"/></a:solidFill>`;
+  const hex = s.replace(/^#/, '').toUpperCase();
+  if (/^[0-9A-F]{6}$/.test(hex)) return `<a:solidFill><a:srgbClr val="${hex}"/></a:solidFill>`;
+  return null; // unrecognised → leave the template colour
+}
+function _chApplyColors(xml, op) {
+  const colors = Array.isArray(op.colors) && op.colors.length ? op.colors.map(String) : null;
+  const single = (op.color != null) ? String(op.color) : null;
+  const pointColors = Array.isArray(op.point_colors) && op.point_colors.length ? op.point_colors.map(String) : null;
+  if (!colors && !single && !pointColors) return xml;
+  const famM = xml.match(/<c:(\w+)Chart>/);           // bar, line, pie, bar3D, area3D, …
+  const famRaw = famM ? famM[1].toLowerCase() : 'bar';
+  const isStroke = /^(line|radar)/.test(famRaw);      // colour goes in <a:ln>, not a bare fill
+  const isPie = /^(pie|doughnut|ofpie)/.test(famRaw); // one series, colour each slice via <c:dPt>
+  // The series-level spPr — empty self-closing (bar/area templates), a populated
+  // one (rare), or ABSENT (line templates: tx → marker → cat, no spPr). When
+  // absent we INSERT one right after </c:tx> (its schema position, before marker).
+  const SPPR = /<c:spPr\/>|<c:spPr>[\s\S]*?<\/c:spPr>/;
+  const insertAfterTx = (ser, frag) => {
+    const i = ser.indexOf('</c:tx>');
+    if (i >= 0) return ser.slice(0, i + 7) + frag + ser.slice(i + 7);
+    return ser.replace(/(<c:order val="\d+"\/>)/, (m) => m + frag);
+  };
+  const putSpPr = (ser, spPrXml) => SPPR.test(ser) ? ser.replace(SPPR, spPrXml) : insertAfterTx(ser, spPrXml);
+  // Colour a line/radar series' point marker to match its line. The template marker
+  // is <c:marker><c:symbol/><c:size/></c:marker> with no spPr (→ default accent); add
+  // a spPr (fill + outline) right before </c:marker>, only if it has none yet. `fill`
+  // is an <a:solidFill> fragment (same one used for the line).
+  const colorMarker = (s, fill) => {
+    const i = s.indexOf('<c:marker>'); if (i < 0) return s;
+    const j = s.indexOf('</c:marker>', i); if (j < 0) return s;
+    if (s.slice(i, j).includes('<c:spPr>')) return s;
+    return s.slice(0, j) + `<c:spPr>${fill}<a:ln>${fill}</a:ln></c:spPr>` + s.slice(j);
+  };
+  let out = '', cur = 0, si = 0;
+  for (;;) {
+    const a = xml.indexOf('<c:ser>', cur);
+    if (a < 0) { out += xml.slice(cur); break; }
+    const b = xml.indexOf('</c:ser>', a) + 8;
+    out += xml.slice(cur, a);
+    let ser = xml.slice(a, b);
+    // Build <c:dPt> per-point colour blocks and splice them in at their schema
+    // position — right before <c:cat> (dPt precedes cat/val in a <c:ser>).
+    const mkDpts = (arr) => arr.map((c, i) => { const f = _chColorFill(c); return f ? `<c:dPt><c:idx val="${i}"/><c:bubble3D val="0"/><c:spPr>${f}</c:spPr></c:dPt>` : ''; }).join('');
+    const insertDpt = (s, dpts) => { const ci = s.indexOf('<c:cat>'); const vi = s.indexOf('<c:val>'); const at = ci >= 0 ? ci : (vi >= 0 ? vi : -1); return at >= 0 ? s.slice(0, at) + dpts + s.slice(at) : (SPPR.test(s) ? s.replace(SPPR, (m) => m + dpts) : insertAfterTx(s, dpts)); };
+    if (isPie) {
+      // Pie/doughnut: one series, one colour per slice (point_colors > colors).
+      // Pie/doughnut templates already carry one <c:dPt> per slice (accent1-4);
+      // strip those so our colours don't collide with the template's at the same
+      // <c:idx> (duplicate dPt for one index renders ambiguously). Then splice ours
+      // in at the schema position (before <c:cat>).
+      const dpts = mkDpts(pointColors || colors || (single ? [single] : []));
+      if (dpts) { ser = ser.replace(/<c:dPt>[\s\S]*?<\/c:dPt>/g, ''); ser = insertDpt(ser, dpts); }
+    } else if (pointColors) {
+      // Per-bar / per-point gradient on the FIRST series (single-series bar/area →
+      // theme gradient, like the HWPX reference). Each data point gets its own <c:dPt>.
+      if (si === 0) { const dpts = mkDpts(pointColors); if (dpts) ser = insertDpt(ser, dpts); }
+    } else {
+      const col = colors ? colors[si % colors.length] : single;
+      const f = _chColorFill(col);
+      if (f) {
+        const spPr = isStroke
+          ? `<c:spPr><a:ln w="28575" cap="flat" cmpd="sng" algn="ctr">${f}<a:prstDash val="solid"/><a:round/></a:ln></c:spPr>`
+          : `<c:spPr>${f}</c:spPr>`;
+        ser = putSpPr(ser, spPr);
+        // line/radar: our colour only sets the LINE (<a:ln>); the marker keeps its
+        // template default accent (so a purple line ends up with an orange marker).
+        // Give the marker the same fill + outline so it tracks the line colour.
+        if (isStroke) ser = colorMarker(ser, f);
+      }
+    }
+    out += ser; cur = b; si++;
+  }
+  return out;
+}
+// Line/radar charts: the HWPX track renders these with visible circle markers
+// (its buildChartSpace emits <c:symbol val="circle"/> + a chart-level <c:marker
+// val="1"/> for line). The .hwp templates ship markers off (<c:symbol val="none"/>),
+// so when we're already editing the OLE we turn them on to keep .hwp and .hwpx
+// visually identical. Line: flip the per-series symbols AND add the chart-level
+// marker (CT_LineChart, position: after the sers, before <c:axId>). Radar
+// (CT_RadarChart has no chart-level marker element): flip the symbols only. Opt
+// out with op.markers === false. No-op for any other family.
+function _chApplyMarkers(xml) {
+  const fam = (xml.match(/<c:(line|radar)Chart>/) || [])[1];
+  if (!fam) return xml;
+  let out = xml.replace(/<c:symbol val="none"\/>/g, '<c:symbol val="circle"/>');
+  if (fam === 'line' && !/<c:marker val="1"\/>/.test(out)) {
+    const i = out.indexOf('<c:axId');
+    if (i >= 0) out = out.slice(0, i) + '<c:marker val="1"/>' + out.slice(i);
+  }
+  return out;
+}
+function buildChartOleWithData(baseOleBytes, model, op) {
+  const inner = Buffer.from(inflateRawSync(baseOleBytes));
+  let cfb = Buffer.from(inner.slice(4));
+  const hdr = _icHdr(cfb); const fat = _icFat(cfb, hdr.difat, hdr.ssz);
+  const xEntry = _icFindEntry(cfb, hdr, fat, 'OOXMLChartContents'); if (xEntry < 0) throw new Error('chart data edit: OLE has no OOXMLChartContents');
+  let newXml = _icReadStream(cfb, hdr, fat, xEntry).toString('utf8');
+  if (model) newXml = _chEditXml(newXml, model);
+  if (op) newXml = _chApplyColors(newXml, op);
+  if (!op || op.markers !== false) newXml = _chApplyMarkers(newXml);
+  // Keep OOXMLChartContents a REGULAR inner-CFB stream (>= the 4096-byte mini-stream
+  // cutoff). Editing a 3-series template down to a single short-labelled series can
+  // shrink it just under 4096 (e.g. categories "Q1"/"a" → ~4085 B); the CFB then
+  // classifies it as a mini-stream while _icWriteOoxml still writes it into the
+  // regular FAT, and Hancom renders the whole chart OLE BLANK. Pad with an ignored
+  // XML comment so the byte length stays comfortably above the cutoff and the stream
+  // stays regular. (GT: render flips exactly at 4096 — 4095 B blank, 4097 B renders.)
+  const MIN_OOXML = 4160;
+  let xb = Buffer.byteLength(newXml, 'utf8');
+  if (xb < MIN_OOXML && newXml.indexOf('</c:chartSpace>') !== -1) {
+    const pad = '<!--' + ' '.repeat(Math.max(1, MIN_OOXML - xb - 7)) + '-->';
+    newXml = newXml.replace('</c:chartSpace>', pad + '</c:chartSpace>');
+  }
+  cfb = _icWriteOoxml(cfb, newXml);
+  const newInner = Buffer.alloc(4 + cfb.length); newInner.writeUInt32LE(cfb.length, 0); cfb.copy(newInner, 4);
+  return deflateRawSync(newInner); // caller (insertChartInPlace) routes < 4096 B to the mini-stream
+}
+// Set/clear the gso "treat-as-character" bit (attribute bit 0) on the chart
+// cluster's CTRL_HEADER. As a floating object the chart reserves no line height,
+// so following paragraphs wrap into a cramped column beside it (the overlap the
+// user reported); as a like-char object it sits on its own line and text flows
+// cleanly above and below it. We default to like-char for that reason.
+function setGsoLikeChar(cluster, likeChar) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      const attrOff = p + 4; const attr = cluster.readUInt32LE(attrOff);
+      cluster.writeUInt32LE((likeChar ? (attr | 1) : (attr & ~1)) >>> 0, attrOff);
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Multi-chart-per-doc identity patch (GT: a Hancom 한컴독스 doc with two charts diffed
+// against the one-chart version). For each chart beyond the first, Hancom changes
+// exactly TWO bytes in the gso cluster: the gso CTRL_HEADER (tag 0x47, ' osg')
+// CommonObjAttr zOrder (INT32 @ body+24) and the SHAPE_COMPONENT_OLE (tag 0x54)
+// binDataID (u16 @ body+12). binDataID == the BIN_DATA storage ordinal N
+// (BIN000N.OLE); zOrder is prev+1 (0 for the first object). CommonObjAttr layout:
+// attr@4, yOff@8, xOff@12, w@16, h@20, zOrder@24, outerMargin@28..35, instanceId@36.
+// Hancom leaves instanceId@36 = 0 on BOTH charts (it needn't be unique when there's
+// no caption), and the PARA_HEADER instance_id likewise stays 0 — so only zOrder +
+// binDataID need patching on the template clusterHex; everything else is identical.
+function setChartClusterIds(cluster, binDataId, zOrder) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      if (sz >= 28) cluster.writeInt32LE(zOrder | 0, p + 24);           // CommonObjAttr zOrder
+    } else if (tag === 0x54) {                                          // SHAPE_COMPONENT_OLE
+      if (sz >= 14) cluster.writeUInt16LE(binDataId & 0xFFFF, p + 12);  // binDataID = storage ordinal
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Next gso zOrder = (max existing gso CTRL_HEADER zOrder @ body+24) + 1, or 0 when the
+// section has no drawing objects yet. Scans the inflated Section0 bytes so the new
+// chart stacks above every gso object already in the doc (charts, images, shapes),
+// matching how Hancom assigns zOrder sequentially per insertion.
+function nextGsoZOrder(raw) {
+  let p = 0, max = -1;
+  while (p + 4 <= raw.length) {
+    const h = raw.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = raw.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && raw.slice(p, p + 4).toString('latin1') === ' osg' && sz >= 28) {
+      max = Math.max(max, raw.readInt32LE(p + 24));
+    }
+    p += sz;
+  }
+  return max + 1;
+}
+
+// ── 개체 배치 (object placement / wrap) — unified across insert_* ops ─────────
+// One placement vocabulary shared with the HWPX track + set_object_property:
+//   wrap = inline (글자처럼, DEFAULT) | topbottom (자리차지) | square (어울림)
+//        | behind (글 뒤) | front (글 앞)
+// inline keeps the object on its own line/flow (object reserves height → text
+// flows above/below cleanly, never drifts to a later page); the floating modes
+// use the GT-verified TABLE_WRAP bit field (same as set_object_property.wrap).
+function resolveWrapMode(op) {
+  if (op.wrap != null) {
+    const w = String(op.wrap).toLowerCase();
+    if (!(w in TABLE_WRAP)) {
+      throw new Error('wrap must be inline / topbottom / square / behind / front');
+    }
+    return w;
+  }
+  // Back-compat: the old `float:true` / `like_char:false` meant "the floating
+  // original" (text wraps beside it) = square.
+  if (op.float === true || op.like_char === false) return 'square';
+  return 'inline';
+}
+
+// Apply wrap + optional floating position (x/y, mm from page) + outer margins
+// to the gso CTRL_HEADER inside an assembled cluster. Reuses the exact byte
+// offsets and TABLE_WRAP encoding that set_object_property (GT-verified across
+// all 5 modes) writes, so insert+wrap is byte-equivalent to insert then
+// set_object_property — no separate Tier-2 proof needed per mode.
+function applyGsoPlacement(cluster, op, mode) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      const d = p; // CTRL_HEADER data start (' osg' id at d, attribute at d+4)
+      let attr = cluster.readUInt32LE(d + 4);
+      attr = ((attr & ~TABLE_WRAP_MASK) | TABLE_WRAP[mode]) >>> 0;
+      // Position-reference frame (the "개체 위치 기준" enum). GT-confirmed from the
+      // gso common-attribute bit field (vert=bits3-4, horz=bits8-9): a PARA-relative
+      // gso decodes vert=2/horz=3, matching the HWPX `vertRelTo="PARA"/horzRelTo="PARA"`
+      // ground-truth — so the standard enum holds (vert {0:paper,1:page,2:para};
+      // horz {0:paper,1:page,2:column,3:para}). The default template is PARA, which
+      // clamps the object to its anchor-paragraph top (rule C) → can't vertically
+      // centre a tall seal on a one-line body run. `frame:"page"`/`"paper"` lifts that
+      // clamp so pos_y can place the object's centre on the text line. X origin is the
+      // same left-margin line for para/page, so switching keeps pos_x meaning.
+      if (op.frame != null) {
+        const f = String(op.frame).toLowerCase();
+        const VERT = { paper: 0, page: 1, para: 2 };
+        const HORZ = { paper: 0, page: 1, column: 2, para: 3 };
+        if (!(f in VERT)) throw new Error('frame must be para / page / paper');
+        attr = ((attr & ~0x18 & ~0x300) | (VERT[f] << 3) | ((HORZ[f] ?? 3) << 8)) >>> 0;
+      }
+      cluster.writeUInt32LE(attr, d + 4);
+      // Floating position (frame-relative; default paper/para per `op.frame`).
+      // Meaningful for square/behind/front;
+      // inline ignores it. Only written when the caller supplies it.
+      if (op.pos_x_mm != null && d + GSO_POS_X_OFF + 4 <= cluster.length) {
+        cluster.writeUInt32LE(Math.round(op.pos_x_mm * HWPUNIT_PER_MM) >>> 0, d + GSO_POS_X_OFF);
+      }
+      if (op.pos_y_mm != null && d + GSO_POS_Y_OFF + 4 <= cluster.length) {
+        cluster.writeUInt32LE(Math.round(op.pos_y_mm * HWPUNIT_PER_MM) >>> 0, d + GSO_POS_Y_OFF);
+      }
+      if ((op.margin_mm != null || Array.isArray(op.margins)) && d + GSO_OUTMARGIN_OFF + 8 <= cluster.length) {
+        const m = Array.isArray(op.margins)
+          ? op.margins
+          : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
+        for (let i = 0; i < 4; i++) {
+          cluster.writeUInt16LE(Math.round(m[i] * HWPUNIT_PER_MM) & 0xFFFF, d + GSO_OUTMARGIN_OFF + i * 2);
+        }
+      }
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Per-shape-record byte offsets of the W / H coordinates, keyed by the shape
+// record tag. Hancom draws each shape from its record geometry (literal local
+// coords), so resizing means rewriting these too — not just the CTRL/COMP
+// bounding box. GT-decoded from the templates (15000×6750 = 53×24 mm markers):
+//   rect (0x4f): 4 corners — W at the two right-edge x's, H at the two bottom y's
+//   ellipse (0x50): bounding box right/bottom
+//   line (0x4e): the endpoint vector (dx, dy)
+//   arc (0x51): bounding box
+// Each entry [byteOffset, factor]: write round(axisLen × factor). Most are ×1
+// (a literal corner/endpoint coordinate); the ellipse stores center + axis
+// endpoints, so its center/axis-x's are half the width, etc.
+const SHAPE_REC_SIZE = {
+  0x4f: { w: [[9, 1], [17, 1]], h: [[21, 1], [29, 1]] },          // RECTANGLE — 4 corners (verified)
+  0x4e: { w: [[8, 1]], h: [[12, 1]] },                            // LINE — endpoint vector (verified)
+  0x50: { w: [[4, 0.5], [12, 1], [20, 0.5]], h: [[8, 0.5], [16, 0.5]] }, // ELLIPSE — center(W/2,H/2)+axis(W,H/2) endpoints
+  // arc (0x51) is center+axis+sweep-angle (W@17 H@13, irregular) — resizing W/H
+  // alone won't preserve the curve; kept guarded (see resize guard below).
+};
+
+// Set the gso object's size (width/height, mm → HWPUNIT). Writes every place the
+// size lives so they stay consistent: CTRL_HEADER bounding (W@16 H@20),
+// SHAPE_COMPONENT curWidth/curHeight pairs (@20/24 + @28/32), and the shape
+// RECORD's local geometry (per SHAPE_REC_SIZE — Hancom draws from these). Only
+// the axes the caller supplies are touched. Unknown record tags get CTRL+COMP
+// only (bounding resizes; geometry may not — caller should verify).
+function applyGsoSize(cluster, op) {
+  if (op.width_mm == null && op.height_mm == null) return cluster;
+  const W = op.width_mm != null ? Math.round(op.width_mm * HWPUNIT_PER_MM) : null;
+  const H = op.height_mm != null ? Math.round(op.height_mm * HWPUNIT_PER_MM) : null;
+  const put = (off, v) => { if (v != null && off + 4 <= cluster.length) cluster.writeUInt32LE(v >>> 0, off); };
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    const d = p;
+    if (tag === 0x47 && cluster.slice(d, d + 4).toString('latin1') === ' osg') {
+      put(d + 16, W); put(d + 20, H);
+    } else if (tag === 0x4C) { // SHAPE_COMPONENT: curWidth/curHeight pairs
+      put(d + 20, W); put(d + 28, W); put(d + 24, H); put(d + 32, H);
+    } else if (SHAPE_REC_SIZE[tag]) {
+      const m = SHAPE_REC_SIZE[tag];
+      if (W != null) for (const [o, f] of m.w) put(d + o, Math.round(W * f));
+      if (H != null) for (const [o, f] of m.h) put(d + o, Math.round(H * f));
+    }
+    p += sz;
+  }
+  return cluster;
+}
+
+// Aspect-ratio resolution for object size. The default is to PRESERVE aspect:
+// when the caller gives only one axis, the other is derived from `refRatio`
+// (= refWidth / refHeight — native pixels for an image, the template's default
+// extent for shapes/charts) so the object never distorts. Giving BOTH axes is
+// the explicit override — the agent deliberately squeezing an object to fit a
+// fixed slot without breaking the form. Returns a {width_mm, height_mm} object
+// to hand straight to applyGsoSize (either field may stay null = use default).
+function resolveAspectSize(op, refRatio) {
+  const w = op.width_mm, h = op.height_mm;
+  if (w != null && h != null) return { width_mm: w, height_mm: h };          // explicit override
+  if (w != null && h == null && refRatio) return { width_mm: w, height_mm: w / refRatio };
+  if (h != null && w == null && refRatio) return { width_mm: h * refRatio, height_mm: h };
+  return { width_mm: w, height_mm: h };
+}
+
+// refRatio (W/H) from a cluster's gso CTRL_HEADER default extent (W@16, H@20).
+function gsoCtrlRatio(cluster) {
+  let p = 0;
+  while (p + 4 <= cluster.length) {
+    const h = cluster.readUInt32LE(p); p += 4;
+    const tag = h & 0x3FF; let sz = (h >> 20) & 0xFFF;
+    if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
+    if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
+      const w = cluster.readUInt32LE(p + 16), hh = cluster.readUInt32LE(p + 20);
+      if (w > 0 && hh > 0) return w / hh;
+    }
+    p += sz;
+  }
+  return null;
+}
+
+// Native pixel WxH of a PNG or JPEG buffer (for image aspect preservation).
+function readImagePixelSize(buf) {
+  if (buf.length >= 24 && buf.readUInt32BE(0) === 0x89504e47) { // PNG: IHDR W@16 H@20 (BE)
+    return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+  }
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8) { // JPEG: scan SOF markers
+    let p = 2;
+    while (p + 9 < buf.length) {
+      if (buf[p] !== 0xff) { p++; continue; }
+      const m = buf[p + 1];
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        return { h: buf.readUInt16BE(p + 5), w: buf.readUInt16BE(p + 7) };
+      }
+      if (p + 4 > buf.length) break;
+      p += 2 + buf.readUInt16BE(p + 2);
+    }
+  }
+  return null;
+}
+
+// Build a {categories, series:[{name,values}]} model from op params, or null if
+// the op carries no data overrides (then the template's default chart is used).
+
+// Build a {categories, series:[{name,values}]} model from op params, or null if
+// the op carries no data overrides (then the template's default chart is used).
+function buildChartDataModel(op) {
+  const hasData = Array.isArray(op.categories) || Array.isArray(op.series) || Array.isArray(op.data) || Number.isInteger(op.rows) || Number.isInteger(op.cols);
+  if (!hasData) return null;
+  let categories = Array.isArray(op.categories) ? op.categories.map(String) : null;
+  const rows = Number.isInteger(op.rows) ? op.rows : (categories ? categories.length : 4);
+  if (!categories) categories = Array.from({ length: rows }, (_, i) => `항목 ${i + 1}`);
+  else if (categories.length !== rows) categories = categories.slice(0, rows).concat(Array.from({ length: Math.max(0, rows - categories.length) }, (_, i) => `항목 ${categories.length + i + 1}`));
+  let series = null;
+  if (Array.isArray(op.series)) series = op.series.map((s, i) => ({ name: String(s && s.name != null ? s.name : `계열 ${i + 1}`), values: (s && Array.isArray(s.values) ? s.values : []).map(Number) }));
+  else if (Array.isArray(op.data)) series = op.data.map((vals, i) => ({ name: `계열 ${i + 1}`, values: (Array.isArray(vals) ? vals : []).map(Number) }));
+  const cols = Number.isInteger(op.cols) ? op.cols : (series ? series.length : 3);
+  if (!series) series = Array.from({ length: cols }, (_, c) => ({ name: `계열 ${c + 1}`, values: [] }));
+  else if (series.length !== cols) series = series.slice(0, cols).concat(Array.from({ length: Math.max(0, cols - series.length) }, (_, c) => ({ name: `계열 ${series.length + c + 1}`, values: [] })));
+  series = series.map((s, c) => { const v = s.values.slice(0, rows); while (v.length < rows) v.push(((v.length + c) % 5) + 1); return { name: s.name, values: v }; });
+  return { categories, series };
+}
+
+// ── 차트 (chart) raw-patch — Hancom-Docs compatible ───────────────────────
+//
+// GT-first (each type GT'd from Hancom's 입력 › 차트 into a clean doc): a chart
+// is ONE "ole$" gso object in a new paragraph, backed by a deflated OLE in
+// BinData/BIN0001.OLE (regular-FAT, >4 KB). Hancom re-renders the chart from
+// that OLE — no cached PNG needed. The gso cluster is type-INDEPENDENT (shared
+// across all 20 types); only the OLE differs, so each chart-<N>.json template
+// pairs the one shared cluster with its type's verbatim OLE. DocInfo gets one
+// BIN_DATA def (attr 0x0002 = OLE storage, ext "OLE"); ID_MAPPINGS += 1.
+//
+// Optional data params (rows/cols/categories/series/data) edit the chart's
+// OOXMLChartContents to change the grid; otherwise the default chart is used.
+// Insertion targets a doc whose BinData starts empty (the common case).
+export async function insertChartInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  // Charts dropped into a table cell are centered by default (user pref): ensure a
+  // centered ParaShape exists (DocInfo write) before the per-chart Section0 step.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
+  const summary = [];
+  for (const op of ops) {
+    const type = Number.isInteger(op.chart_type) && op.chart_type >= 0 && op.chart_type <= 19 ? op.chart_type : 0;
+    const tplName = (typeof op.template_override === 'string' && /^[A-Za-z0-9_-]+$/.test(op.template_override)) ? op.template_override : `chart-${type}`;
+    const tplPath = `${__dirname}/references/chart-templates/${tplName}.json`;
+    if (!existsSync(tplPath)) throw new Error(`insert_chart: no template for type ${type} (${tplPath})`);
+    const tpl = JSON.parse(readFileSync(tplPath, 'utf8'));
+    let oleBytes = Buffer.from(tpl.oleB64, 'base64');
+
+    // Optional rows/cols/data editing — edit the OOXMLChartContents in the OLE.
+    const dataModel = buildChartDataModel(op);
+    const hasColor = (Array.isArray(op.colors) && op.colors.length > 0) || op.color != null || (Array.isArray(op.point_colors) && op.point_colors.length > 0);
+    if (dataModel || hasColor) oleBytes = buildChartOleWithData(oleBytes, dataModel, op);
+
+    // A sub-4096 OLE goes in the mini-stream (below). Re-deflate it at max
+    // compression first: a mini-stream that exactly fills a 128-entry mini-FAT
+    // sector makes Hancom drop the object (3-D pies, the largest small OLEs,
+    // hit this). Maximal compression keeps the mini footprint well under 128.
+    if (oleBytes.length < 4096) oleBytes = deflateRawSync(Buffer.from(inflateRawSync(oleBytes)), { level: 9 });
+
+    // ── Step 1: CFB — ensure BinData folder + add the BIN000N.OLE stream ───
+    // A clean doc → BIN0001.OLE; a doc that already holds chart/image BinData →
+    // the next free BIN000N.OLE (so a second chart no longer collides). CFB routes
+    // a stream by size: < 4096 B → mini-stream, else regular FAT. Hancom is strict
+    // about this (a small OLE forced into the regular FAT renders as a broken-object
+    // placeholder), so match the cutoff exactly — bigger bar/line charts go regular,
+    // smaller pie/doughnut go mini. GT (handoff gt 2-chart) confirms the multi-chart
+    // shape: append BIN000N + a 2nd BIN_DATA def (storage id N) + ID_MAPPINGS++.
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    if (!mssz) mssz = MSSZ_DEFAULT_IMG;
+    let fat = readFat(buf, fatAddrs, ssz);
+    let dir = readDirectory(buf, fat, ssz, dirStart);
+    let rootChain = walkChain(fat, dir.entries[0].start);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+
+    let binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    if (binIdx < 0) {
+      ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+      dir = readDirectory(buf, fat, ssz, dirStart);
+      const folderSlot = findUnusedDirSlot(dir.entries);
+      if (folderSlot < 0) throw new Error('insert_chart: no free directory slot for the BinData folder');
+      writeDirEntry(buf, dir.entries[folderSlot], 'BinData', 1, 0, 0);
+      insertEntryIntoTree(buf, dir.entries, 0, folderSlot);
+    }
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    rootChain = walkChain(fat, dir.entries[0].start);
+    const newName = pickFreeBinDataName(dir.entries, 'OLE');     // BIN000N.OLE (N = next free ordinal)
+    const storageId = parseInt(newName.match(/BIN(\d{4})\./)[1], 10);
+    ({ buf, fat } = ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart));
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    const oleSlot = findUnusedDirSlot(dir.entries);
+    if (oleSlot < 0) throw new Error('insert_chart: no free directory slot for the OLE stream');
+
+    let oleStartSec;
+    if (oleBytes.length < 4096) {
+      const alloc = allocMiniChain({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain, rootEntry: dir.entries[0] }, oleBytes.length);
+      buf = alloc.buf; fat = alloc.fat; minifat = alloc.minifat; minifatStart = alloc.minifatStart; rootChain = alloc.rootChain;
+      writeMiniChainBytes(buf, alloc.chain, rootChain, ssz, mssz, oleBytes);
+      oleStartSec = alloc.chain[0];
+    } else {
+      const oa = allocRegularChain(buf, ssz, fat, fatAddrs, oleBytes.length);
+      buf = oa.buf; fat = oa.fat;
+      writeChainBytes(buf, oa.chain, ssz, oleBytes);
+      oleStartSec = oa.chain[0];
+    }
+    dir = readDirectory(buf, fat, ssz, dirStart);
+    binIdx = dir.entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+    writeDirEntry(buf, dir.entries[oleSlot], newName, 2, oleStartSec, oleBytes.length, 0);
+    insertEntryIntoTree(buf, dir.entries, binIdx, oleSlot);
+    writeFileSync(filePath, buf);
+
+    // ── Step 2: DocInfo — BIN_DATA def (attr 0x0002 = OLE storage), storage id N ──
+    await addBinDataDefToDocInfo(filePath, storageId, 'OLE', 0x0002);
+
+    // ── Step 3: Section0 — insert the chart cluster (one ole$ paragraph) ───
+    {
+      let b2 = readFileSync(filePath);
+      let h = parseCfbHeader(b2);
+      let f2 = readFat(b2, h.fatAddrs, h.ssz);
+      const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+      let mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+      const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+      const secInMini = secEntry.size < 4096;
+      let rc2 = null; const ensureRC = () => rc2 || (rc2 = walkChain(f2, entries[0].start));
+      let sChain, sComp;
+      if (secInMini) { const rc = ensureRC(); sChain = walkChain(mf2, secEntry.start); sComp = readMiniChainBytes(b2, sChain, rc, h.ssz, h.mssz, secEntry.size); }
+      else { sChain = walkChain(f2, secEntry.start); sComp = readChainBytes(b2, sChain, h.ssz, secEntry.size); }
+      let raw = Buffer.from(inflateRawSync(sComp));
+
+      const records = parseRecords(raw);
+      const cluster = Buffer.from(tpl.clusterHex, 'hex');
+      // Stamp this chart's identity into the template cluster: binDataID = its storage
+      // ordinal N, zOrder = one past the section's current max gso zOrder. For the first
+      // chart these are 1 and 0 — the template's own values, so a no-op (byte-identical
+      // to the prior single-chart output). For a 2nd+ chart they make it reference
+      // BIN000N and stack above the existing object. (GT: handoff gt 2-chart.)
+      setChartClusterIds(cluster, storageId, nextGsoZOrder(raw));
+      // Default to like-char so the chart reserves its height and surrounding
+      // text flows above/below it (set op.float:true for the floating original).
+      if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+        // ── Drop the chart INSIDE a table cell (centered, like-char). ──
+        setGsoLikeChar(cluster, true);
+        raw = spliceGsoIntoCell(raw, cluster, op.cell.para ?? 0, op.cell.control ?? 0, op.cell.row, op.cell.col, centerPsId);
+      } else {
+        applyGsoPlacement(cluster, op, resolveWrapMode(op));
+        applyGsoSize(cluster, resolveAspectSize(op, gsoCtrlRatio(cluster))); // size, aspect-preserved (chart scales to frame)
+        let insertAt = raw.length;
+        const clusters = findClusterBoundaries(records);
+        if (op.anchor && typeof op.anchor === 'string') {
+          const ab = Buffer.from(op.anchor, 'utf16le');
+          for (const c of clusters) { let hit = false; for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } } if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; } }
+        } else {
+          const t = findLastSimpleBodyParagraph(records);
+          insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+        }
+        // The chart goes at the requested position (end when no anchor) — even the
+        // document's terminal paragraph renders fine now that inline charts carry
+        // the correct like-char attribute (TABLE_WRAP.inline = 0x1, matching Hancom's
+        // own floating→글자처럼 output and insert_image). The earlier 0x200001 bit-21
+        // was what made a terminal OLE chart render blank; no trailing-paragraph
+        // workaround is needed.
+        raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+        normalizeLastParaFlag(raw);
+      }
+
+      let newComp;
+      if (secInMini) {
+        const rc = ensureRC();
+        const e = deflateMiniChainWithExpansion({ buf: b2, ssz: h.ssz, mssz: h.mssz, fat: f2, fatAddrs: h.fatAddrs, minifat: mf2, minifatStart: h.minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, sChain);
+        b2 = e.buf; f2 = e.fat; mf2 = e.minifat; h.minifatStart = e.minifatStart; newComp = e.compressed;
+        if (e.promoted) { sChain = e.newRegularChain; writeChainBytes(b2, sChain, h.ssz, newComp); b2.writeInt32LE(sChain[0], secEntry.entryFileOffset + 0x74); }
+        else { rc2 = e.rootChain; sChain = e.miniChain; writeMiniChainBytes(b2, sChain, rc2, h.ssz, h.mssz, newComp); }
+      } else {
+        const e = deflateAndFitWithExpansion(raw, sChain.length * h.ssz, h.ssz, f2, h.fatAddrs, sChain, b2, false);
+        b2 = e.buf; f2 = e.fat; sChain = e.chain; newComp = e.compressed; writeChainBytes(b2, sChain, h.ssz, newComp);
+      }
+      b2.writeUInt32LE(newComp.length, secEntry.entryFileOffset + 0x78);
+      b2.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      writeFileSync(filePath, b2);
+    }
+
+    summary.push({ section: 0, chart_type: type, ole: `BinData/${newName}` });
+  }
+
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+// ── delete a floating object (image / chart / shape) — raw-patch ──────────
+// Removes the targeted gso object completely. For BinData-backed objects
+// (images/charts) it then shifts every higher storage id down by 1 so the
+// BIN_DATA defs / stream pointers / gso binDataIDs stay contiguous: Hancom Docs
+// resolves a binDataID by position, so leaving a gap renders the higher objects
+// as broken-image placeholders (GT: claw-hancomdocs delete renumbers; the gap
+// case is render-confirmed broken, the renumbered case render-confirmed clean).
+// CFB streams are NOT renamed or removed (no red-black-tree surgery): the
+// dir-entry chain pointers among BIN000{S..N} are rotated so each name serves the
+// next object's bytes, the deleted object's bytes are zeroed, and BIN000N is left
+// as a harmless orphan (no def references it). op.index = 0-based gso ordinal in
+// document order (find_objects / extract order). To delete several, sort indices
+// descending — each delete re-reads the file and shifts lower indices.
+const PIC_BINID_OFF = 71;   // HWPTAG_SHAPE_COMPONENT_PICTURE (0x55) binItem id (u16)
+const OLE_BINID_OFF = 12;   // HWPTAG_SHAPE_COMPONENT_OLE (0x54) binData id (u16)
+function gsoBinIdOffset(raw, recs, gsoRecIdx) {
+  const lvl = recs[gsoRecIdx].level;
+  for (let j = gsoRecIdx + 1; j < recs.length && recs[j].level > lvl; j++) {
+    const r = recs[j];
+    if (r.tag === 0x55 && r.size >= PIC_BINID_OFF + 2) return r.dataOff + PIC_BINID_OFF;
+    if (r.tag === 0x54 && r.size >= OLE_BINID_OFF + 2) return r.dataOff + OLE_BINID_OFF;
+  }
+  return -1; // shape / non-BinData object
+}
+const _isGso = (buf, r) => r.tag === TAG_CTRL_HEADER && buf.slice(r.dataOff, r.dataOff + 4).toString('latin1') === ' osg';
+// read+inflate, mutate, deflate+write one CFB stream in place (mini or regular)
+function _rewriteStream(filePath, pathParts, mutate) {
+  let b2 = readFileSync(filePath);
+  const h = parseCfbHeader(b2);
+  let f2 = readFat(b2, h.fatAddrs, h.ssz);
+  const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+  let mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+  const ent = findStreamEntry(entries, pathParts);
+  const inMini = ent.size < 4096;
+  const rc = walkChain(f2, entries[0].start);
+  let chain = inMini ? walkChain(mf2, ent.start) : walkChain(f2, ent.start);
+  const comp = inMini ? readMiniChainBytes(b2, chain, rc, h.ssz, h.mssz, ent.size) : readChainBytes(b2, chain, h.ssz, ent.size);
+  const out = mutate(Buffer.from(inflateRawSync(comp)));
+  let newComp;
+  if (inMini) {
+    const e = deflateMiniChainWithExpansion({ buf: b2, ssz: h.ssz, mssz: h.mssz, fat: f2, fatAddrs: h.fatAddrs, minifat: mf2, minifatStart: h.minifatStart, rootChain: rc, rootEntry: entries[0] }, out, chain);
+    b2 = e.buf; newComp = e.compressed;
+    if (e.promoted) { writeChainBytes(b2, e.newRegularChain, h.ssz, newComp); b2.writeInt32LE(e.newRegularChain[0], ent.entryFileOffset + 0x74); }
+    else writeMiniChainBytes(b2, e.miniChain, e.rootChain, h.ssz, h.mssz, newComp);
+  } else {
+    const e = deflateAndFitWithExpansion(out, chain.length * h.ssz, h.ssz, f2, h.fatAddrs, chain, b2, false);
+    b2 = e.buf; newComp = e.compressed; writeChainBytes(b2, e.chain, h.ssz, newComp);
+  }
+  b2.writeUInt32LE(newComp.length, ent.entryFileOffset + 0x78);
+  b2.writeUInt32LE(0, ent.entryFileOffset + 0x7C);
+  writeFileSync(filePath, b2);
+}
+
+export async function deleteObjectInPlace(filePath, ops) {
+  const summary = [];
+  for (const op of ops) {
+    const targetIndex = Number.isInteger(op.index) ? op.index : 0;
+    let delId = null;
+
+    // ── Step 1: Section0 — drop gso #targetIndex's paragraph, shift higher gso ids ──
+    _rewriteStream(filePath, ['BodyText', 'Section0'], (raw) => {
+      const recs = parseRecords(raw);
+      let seen = -1, gi = -1;
+      for (let i = 0; i < recs.length; i++) if (_isGso(raw, recs[i])) { seen++; if (seen === targetIndex) { gi = i; break; } }
+      if (gi < 0) throw new Error(`delete_object: object index ${targetIndex} not found (${seen + 1} object(s))`);
+      const bidOff = gsoBinIdOffset(raw, recs, gi);
+      delId = bidOff >= 0 ? raw.readUInt16LE(bidOff) : null;
+      let a = gi; while (a > 0 && !(recs[a].tag === TAG_PARA_HEADER && recs[a].level === 0)) a--;
+      let b = a + 1; while (b < recs.length && !(recs[b].tag === TAG_PARA_HEADER && recs[b].level === 0)) b++;
+      // Replace the object's paragraph with an EMPTY paragraph in place — don't drop it.
+      // GT: Hancom deleting an object empties that paragraph (a blank line stays where
+      // the object was). This also matches Hancom for a MIDDLE object and is REQUIRED for
+      // the section's LAST object (else the section ends on a gso cluster → cannot_open),
+      // so one uniform rule keeps us GT-faithful in every position and internally
+      // consistent. Built from the deleted para's own PARA_HEADER + CHAR_SHAPE so the
+      // para_shape/char_shape ids stay valid; PARA_TEXT (inline anchor) + the gso cluster
+      // are dropped and the header rewritten to Hancom's empty-paragraph byte-shape
+      // (PARA_HEADER + CHAR_SHAPE, no PARA_TEXT/LINE_SEG; nchars per the rule below).
+      const phRec = recs[a];
+      const ph = Buffer.from(raw.slice(phRec.headOff, phRec.dataOff + phRec.size));
+      const phDataOff = phRec.dataOff - phRec.headOff;
+      // nchars: 1 char (the paragraph break). The high bit 0x80000000 marks the section's
+      // LAST paragraph — GT shows EXACTLY one para per section carries it (the terminator).
+      // If our empty para is now the last paragraph it MUST set it (else Hancom can't find
+      // the section end → cannot_open); if it's a MIDDLE para it must NOT (the high bit
+      // makes Hancom read a ~2-billion char count and stop rendering every following para).
+      const isLastPara = b >= recs.length;
+      ph.writeUInt32LE(isLastPara ? 0x80000001 : 1, phDataOff);
+      ph.writeUInt32LE(0, phDataOff + 4);          // control_mask: no controls remain
+      ph.writeUInt16LE(0, phDataOff + 16);         // line-seg count → 0: we keep no LINE_SEG (Hancom recomputes layout). GT confirms 0.
+      let csRec = null;
+      for (let k = a + 1; k < recs.length && !(recs[k].tag === TAG_PARA_HEADER && recs[k].level === 0); k++) {
+        if (recs[k].tag === TAG_PARA_CHAR_SHAPE) { csRec = recs[k]; break; }
+      }
+      const cs = csRec ? raw.slice(csRec.headOff, csRec.dataOff + csRec.size) : Buffer.alloc(0);
+      const emptyPara = Buffer.concat([ph, cs]);
+      let out = Buffer.concat([raw.slice(0, recs[a].headOff), emptyPara, raw.slice(b < recs.length ? recs[b].headOff : raw.length)]);
+      if (delId != null) {
+        const r2 = parseRecords(out);
+        for (let i = 0; i < r2.length; i++) if (_isGso(out, r2[i])) { const o = gsoBinIdOffset(out, r2, i); if (o >= 0) { const v = out.readUInt16LE(o); if (v > delId) out.writeUInt16LE(v - 1, o); } }
+      }
+      return out;
+    });
+
+    if (delId == null) { summary.push({ deleted_object: targetIndex, binData: null }); continue; }
+
+    // ── Step 2: DocInfo — remove BIN_DATA def delId, decrement higher ids + count ──
+    _rewriteStream(filePath, ['DocInfo'], (di) => {
+      for (const r of parseRecords(di)) if (r.tag === TAG_BIN_DATA_DEF && di.readUInt16LE(r.dataOff + 2) === delId) { di = Buffer.concat([di.slice(0, r.headOff), di.slice(r.headOff + (r.ext ? 8 : 4) + r.size)]); break; }
+      for (const r of parseRecords(di)) {
+        if (r.tag === TAG_BIN_DATA_DEF) { const sid = di.readUInt16LE(r.dataOff + 2); if (sid > delId) di.writeUInt16LE(sid - 1, r.dataOff + 2); }
+        if (r.tag === TAG_ID_MAPPINGS) di.writeUInt32LE((di.readUInt32LE(r.dataOff) - 1) >>> 0, r.dataOff);
+      }
+      return di;
+    });
+
+    // ── Step 3: CFB — remove BIN000{delId} + renumber survivors to a contiguous
+    // BIN0001..BIN000(N-1), then rebuild the BinData child tree ──────────────────
+    // We RENAME each higher survivor's slot (k → k-1), keeping its own (start, size,
+    // ext) in place, rather than ROTATING (start,size) pointers between slots. A
+    // rotation makes Hancom reject the file whenever a renumber crosses the mini↔
+    // regular storage boundary (e.g. a chart's >4 KB regular stream and an image's
+    // <4 KB mini stream trading slots): sheetjs CFB.read tolerates the slot whose
+    // size no longer matches its sector class, but Hancom does not. Renaming leaves
+    // every stream in its own slot so its storage class never moves — and it mirrors
+    // Hancom's own delete, which renames image3→image2 and keeps N-1 entries.
+    {
+      let b2 = readFileSync(filePath);
+      const h = parseCfbHeader(b2);
+      const f2 = readFat(b2, h.fatAddrs, h.ssz);
+      const { entries } = readDirectory(b2, f2, h.ssz, h.dirStart);
+      const mf2 = readMinifat(b2, f2, h.ssz, h.minifatStart);
+      const rc = entries[0].start >= 0 ? walkChain(f2, entries[0].start) : [];
+      const slotOfBin = {}; let N = 0;
+      entries.forEach((e, idx) => { const m = e.type === 2 && /^BIN(\d{4})\./.exec(e.name); if (m) { const n = parseInt(m[1], 10); slotOfBin[n] = idx; if (n > N) N = n; } });
+      if (slotOfBin[delId] != null) {
+        const dEnt = entries[slotOfBin[delId]];
+        // 1. zero + free the deleted stream's own chain (prevents content extraction).
+        const dStart = b2.readInt32LE(dEnt.entryFileOffset + 0x74);
+        const dSize = b2.readUInt32LE(dEnt.entryFileOffset + 0x78);
+        const dMini = dSize > 0 && dSize < 4096;
+        const dChain = dStart >= 0 ? (dMini ? walkChain(mf2, dStart) : walkChain(f2, dStart)) : [];
+        for (const s of dChain) { if (dMini) { const bo = s * h.mssz; const o = (512 + rc[Math.floor(bo / h.ssz)] * h.ssz) + (bo % h.ssz); b2.fill(0, o, o + h.mssz); } else b2.fill(0, 512 + s * h.ssz, 512 + s * h.ssz + h.ssz); }
+        for (const s of dChain) { if (dMini) writeMinifatEntry(b2, h.ssz, h.mssz, f2, h.minifatStart, s, FREESECT); else writeFatEntry(b2, h.ssz, h.fatAddrs, s, FREESECT); }
+        // 2. free the deleted directory slot (zero it, NOSTREAM the pointers, type 0).
+        { const off = dEnt.entryFileOffset; b2.fill(0, off, off + 128); b2.writeInt32LE(-1, off + 0x44); b2.writeInt32LE(-1, off + 0x48); b2.writeInt32LE(-1, off + 0x4C); dEnt.type = 0; dEnt.name = ''; }
+        // 3. renumber survivors: BIN000k → BIN000(k-1) for k > delId. The 4 digits sit
+        //    at byte 6 (after "BIN", UTF-16LE); ext + start/size are untouched so each
+        //    stream keeps its sector class. Lower (k < delId) keep their names.
+        const survivors = [];
+        for (let k = 1; k <= N; k++) {
+          if (k === delId || slotOfBin[k] == null) continue;
+          const e = entries[slotOfBin[k]];
+          if (k > delId) { const nn = String(k - 1).padStart(4, '0'); Buffer.from(nn, 'utf16le').copy(b2, e.entryFileOffset + 6); e.name = 'BIN' + nn + e.name.slice(7); }
+          survivors.push(slotOfBin[k]);
+        }
+        // 4. rebuild the BinData child tree from the survivors — or, if none remain,
+        //    drop the now-empty BinData storage (a clean no-binary .hwp has NO BinData
+        //    folder; an empty folder makes Hancom reject the document).
+        const binDataIdx = entries.findIndex((e) => e.type === 1 && e.name === 'BinData');
+        if (binDataIdx >= 0) {
+          if (survivors.length > 0) {
+            rebuildChildTree(b2, entries, binDataIdx, survivors);
+          } else {
+            const rootKids = collectTreeNodes(entries, entries[0].child).filter((i) => i !== binDataIdx);
+            const off = entries[binDataIdx].entryFileOffset; b2.fill(0, off, off + 128); b2.writeInt32LE(-1, off + 0x44); b2.writeInt32LE(-1, off + 0x48); b2.writeInt32LE(-1, off + 0x4C); entries[binDataIdx].type = 0; entries[binDataIdx].name = '';
+            rebuildChildTree(b2, entries, 0, rootKids);
+          }
+        }
+      }
+      writeFileSync(filePath, b2);
+    }
+    summary.push({ deleted_object: targetIndex, binDataId: delId });
+  }
+  // The stored page-1 thumbnail (PrvImage) is now stale — for an object that sat on page 1
+  // it would still show the thing we just deleted (a redaction leak). We can't render a
+  // faithful new thumbnail in a raw patch, so invalidate it; Hancom regenerates PrvImage on
+  // the next open/save and a file manager shows a blank thumbnail instead of a stale one.
+  if (summary.length) _invalidatePreviewImage(filePath);
+  return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
+}
+
+// Zero + empty the PrvImage stream (see deleteObjectInPlace). PrvText is left intact —
+// deleting an object changes no body text, so the text preview stays valid.
+function _invalidatePreviewImage(filePath) {
+  const b = readFileSync(filePath);
+  const h = parseCfbHeader(b);
+  const fat = readFat(b, h.fatAddrs, h.ssz);
+  const { entries } = readDirectory(b, fat, h.ssz, h.dirStart);
+  const mf = readMinifat(b, fat, h.ssz, h.minifatStart);
+  const rc = entries[0].start >= 0 ? walkChain(fat, entries[0].start) : [];
+  const e = entries.find((x) => x.type === 2 && x.name === 'PrvImage');
+  if (!e) return;
+  const start = b.readInt32LE(e.entryFileOffset + 0x74);
+  const size = b.readUInt32LE(e.entryFileOffset + 0x78);
+  if (size > 0 && start >= 0) {
+    const mini = size < 4096;
+    for (const s of (mini ? walkChain(mf, start) : walkChain(fat, start))) {
+      if (mini) { const bo = s * h.mssz; const o = (512 + rc[Math.floor(bo / h.ssz)] * h.ssz) + (bo % h.ssz); b.fill(0, o, o + h.mssz); writeMinifatEntry(b, h.ssz, h.mssz, fat, h.minifatStart, s, FREESECT); }
+      else { b.fill(0, 512 + s * h.ssz, 512 + s * h.ssz + h.ssz); writeFatEntry(b, h.ssz, h.fatAddrs, s, FREESECT); }
+    }
+  }
+  b.writeInt32LE(ENDOFCHAIN, e.entryFileOffset + 0x74); // empty stream → Hancom regenerates
+  b.writeUInt32LE(0, e.entryFileOffset + 0x78);
+  writeFileSync(filePath, b);
+}
+
+
+// ── 도형 (shapes: rectangle / ellipse) raw-patch ──────────────────────────
+//
+// GT-first (shape_rect.hwp / shape_ellipse from Hancom's 입력 › 도형): a shape
+// is a gso drawing object (same family as 문단 띠) attached to the anchor
+// paragraph — an inline gso char (0x000b "gso ") goes into the paragraph's
+// PARA_TEXT (char_count += 8, control_mask |= 0x800), and a gso cluster is
+// appended: CTRL_HEADER "gso " + SHAPE_COMPONENT (id "cer$"=rect / "lle$"=
+// ellipse) + the shape record (RECTANGLE 0x4f / ELLIPSE 0x50). The rect and
+// ellipse SHAPE_COMPONENTs are byte-identical except the 8-byte id prefix.
+// Default size 15000×6750 HWPUNIT (~53×24mm), floating. Section0-only.
+// rect & ellipse share a 62-byte gso CTRL and a 252-byte SHAPE_COMPONENT
+// (identical except the 8-byte shape-id prefix). line has its own 58-byte
+// gso CTRL and 239-byte SHAPE_COMPONENT. Each kind: {gsoCtrl, comp, recTag,
+// recHex}; the SHAPE_COMPONENT instance id sits at comp.length-6.
+const SHAPE_GSO_CTRL_HEX = '206f736700406a144a2e00002c4c0000983a00005e1a0000000000000000000000000000ec969a42000000000800acc001ac15d6200085c7c8b2e4b22e00';
+const SHAPE_COMP_RECT_HEX = '6365722463657224000000000000000000000100983a00005e1a0000983a00005e1a000000000b00000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000000000000021000000410000c00001000000ffffff0000000000ffffffff000000000000000000b2b2b2000000000000000000ed969a020000';
+const SHAPE_LINE_GSO_HEX  = '206f736700406a144a2e00002c4c0000983a00005e1a0000000000000000000000000000fb5a9b4200000000060020c1200085c7c8b2e4b22e00';
+const SHAPE_LINE_COMP_HEX = '6e696c246e696c24000000000000000000000100983a00005e1a0000983a00005e1a000000000b00000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000000000000021000000410000c000000000000000000000000000b2b2b2000000000000000000fc5a9b020000';
+const SHAPE_KINDS = {
+  rect:    { gsoCtrl: SHAPE_GSO_CTRL_HEX, comp: SHAPE_COMP_RECT_HEX, recTag: TAG_SHAPE_COMPONENT_RECTANGLE, recHex: '000000000000000000983a000000000000983a00005e1a0000000000005e1a0000' },
+  ellipse: { gsoCtrl: SHAPE_GSO_CTRL_HEX, comp: SHAPE_COMP_RECT_HEX, idPrefix: '6c6c65246c6c6524', recTag: 0x50, recHex: '000000004c1d00002f0d0000983a00002f0d00004c1d0000000000000000000000000000000000000000000000000000000000000000000000000000' },
+  line:    { gsoCtrl: SHAPE_LINE_GSO_HEX, comp: SHAPE_LINE_COMP_HEX, recTag: 0x4e, recHex: '0000000000000000983a00005e1a000000000000' },
+  arc:     { gsoCtrl: SHAPE_LINE_GSO_HEX, comp: SHAPE_COMP_RECT_HEX, idPrefix: '6372612463726124', recTag: 0x51, recHex: '000000000000000000000000005e1a0000983a000000000000' },
+};
+
+export async function insertShapeInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  // Objects dropped into a table cell are centered by default (user pref): make
+  // sure a centered ParaShape exists (DocInfo write) before we touch Section0.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const shapeName = SHAPE_KINDS[op.shape] ? op.shape : 'rect';
+    const kind = SHAPE_KINDS[shapeName];
+    if ((op.width_mm != null || op.height_mm != null) && shapeName === 'arc') {
+      // arc geometry is center+axis+sweep-angle; resizing W/H alone won't keep the
+      // curve, and the layout isn't GT-mapped — reject cleanly rather than distort.
+      throw new Error('insert_shape: width_mm/height_mm not yet supported for arc (rect/ellipse/line only — resize the arc in Hancom desktop)');
+    }
+    const records = parseRecords(raw);
+
+    if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+      // ── Insert the shape INSIDE a table cell as a new treat-as-char paragraph.
+      // Build a self-contained shape paragraph (like the image path), force the gso
+      // to like-char (글자처럼 취급, attr bit 0) so it sits in the cell flow, drop it
+      // two levels deeper, and splice it at the cell's end (count++ + last-para flag).
+      const para = op.cell.para ?? 0, control = op.cell.control ?? 0;
+      const target = tableCellRecords(records, raw, para, control)
+        .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+      if (!target) throw new Error(`insert_shape: cell (row=${op.cell.row}, col=${op.cell.col}) not found in table at para ${para} control ${control}`);
+      const inst = pickFreshInstanceId(records, raw);
+      const ph = Buffer.alloc(24);
+      ph.writeUInt32LE(9, 0); ph.writeUInt32LE(0x800, 4);
+      ph.writeUInt16LE(centerPsId & 0xFFFF, 8); // centered paragraph (object centered in cell)
+      ph.writeUInt16LE(1, 12); ph.writeUInt32LE(inst >>> 0, 18);
+      const pt = Buffer.from('0b00206f736700000000000000000b000d00', 'hex'); // gso char + EOP
+      const cs = Buffer.alloc(8);
+      const ch = Buffer.from(kind.gsoCtrl, 'hex');
+      ch.writeUInt32LE((inst + 0x10) >>> 0, 36);
+      ch.writeUInt32LE((ch.readUInt32LE(4) | 1) >>> 0, 4); // 글자처럼 취급
+      const sc = Buffer.from(kind.comp, 'hex');
+      if (kind.idPrefix) Buffer.from(kind.idPrefix, 'hex').copy(sc, 0);
+      sc.writeUInt32LE((inst + 0x11) >>> 0, sc.length - 6);
+      const rec = Buffer.from(kind.recHex, 'hex');
+      const shapePara = Buffer.concat([
+        buildRecordHeader(TAG_PARA_HEADER, 0, ph.length), ph,
+        buildRecordHeader(TAG_PARA_TEXT, 1, pt.length), pt,
+        buildRecordHeader(TAG_PARA_CHAR_SHAPE, 1, cs.length), cs,
+        buildRecordHeader(TAG_CTRL_HEADER, 1, ch.length), ch,
+        buildRecordHeader(TAG_SHAPE_COMPONENT, 2, sc.length), sc,
+        buildRecordHeader(kind.recTag, 3, rec.length), rec,
+      ]);
+      const shapeCell = relevelCluster(shapePara, 2);
+      setGsoOutMarginTopBottom(shapeCell, CELL_OBJ_VMARGIN_HU); // top/bottom breathing room
+      raw = Buffer.concat([raw.slice(0, target.endByte), shapeCell, raw.slice(target.endByte)]);
+      const t2 = tableCellRecords(parseRecords(raw), raw, para, control)
+        .find((c) => c.row === op.cell.row && c.col === op.cell.col);
+      const lhDataOff = t2.startByte + 4;
+      raw.writeUInt16LE((raw.readUInt16LE(lhDataOff) + 1) & 0xFFFF, lhDataOff); // nParagraphs++
+      normalizeCellLastParaFlag(raw, t2.startByte, t2.endByte, 2);
+      summary.push({ section: 0, shape: shapeName, cell: { row: op.cell.row, col: op.cell.col } });
+      continue;
+    }
+
+    // Anchor paragraph + its level-1 PARA_TEXT.
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1 &&
+              raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf) !== -1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) {
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) throw new Error('insert_shape: no top-level body paragraph found to anchor the shape');
+
+    const paraHeaderRec = records[cluster.startIdx];
+    const inst = pickFreshInstanceId(records, raw);
+
+    // 1) Inline gso char (0x000b "gso ") before the paragraph's EOP.
+    const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) gso cluster: CTRL_HEADER + SHAPE_COMPONENT + shape record.
+    const ch = Buffer.from(kind.gsoCtrl, 'hex'); ch.writeUInt32LE(inst >>> 0, 36);
+    const sc = Buffer.from(kind.comp, 'hex');
+    if (kind.idPrefix) Buffer.from(kind.idPrefix, 'hex').copy(sc, 0); // ellipse: swap rect→ellipse id
+    sc.writeUInt32LE((inst + 1) >>> 0, sc.length - 6);          // fresh shape instance id
+    const rec = Buffer.from(kind.recHex, 'hex');
+    const cluster2 = Buffer.concat([
+      buildRecordHeader(TAG_CTRL_HEADER, 1, ch.length), ch,
+      buildRecordHeader(TAG_SHAPE_COMPONENT, 2, sc.length), sc,
+      buildRecordHeader(kind.recTag, 3, rec.length), rec,
+    ]);
+    // Placement: inline (글자처럼) by default, or wrap=topbottom/square/behind/front.
+    applyGsoPlacement(cluster2, op, resolveWrapMode(op));
+    applyGsoSize(cluster2, resolveAspectSize(op, gsoCtrlRatio(cluster2))); // size, aspect-preserved
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x800 (char 0x0b).
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), cluster2, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, shape: shapeName, anchor: op.anchor ?? null });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 수식 (equation: EQEDIT) raw-patch ─────────────────────────────────────
+// GT-first (Hancom 입력 › 수식, downloaded as .hwp & byte-reversed — no HWPX
+// conversion): an equation is a self-contained like-char control paragraph —
+//   PARA_HEADER + PARA_TEXT(inline eqedit char 0x000b "deqe") + PARA_CHAR_SHAPE
+//   + CTRL_HEADER "deqe" (CommonObjAttr, like-char) + EQEDIT(0x58) record.
+// The EQEDIT(0x58) record carries the script: 00000000 + u16(script char count)
+// + UTF-16(script) + a 72-byte GT-verbatim tail (base size 1000=10pt, color,
+// "Equation Version 60" / "HancomEQN" engine strings). Only the script region
+// varies. Default object size ~5200×1163 HWPUNIT. Section0-only (no BinData /
+// DocInfo). Centered (+ a default top/bottom margin) when dropped into a cell.
+const TAG_EQEDIT = 0x58;
+const EQ_PARA_TEXT_HEX = '0b006465716500000000000000000b000d00'; // eqedit inline char + EOP
+const EQ_CHAR_SHAPE_HEX = '0000000008000000';
+const EQ_DEQE_CTRL_HEX = '6465716511232a1c0000000000000000501400008b040000000000003800380000000000ca56a94200000000070018c2ddc2200085c7c8b2e4b22e00';
+const EQ_DATA_SUFFIX_HEX = 'e8030000000000005900000013004500710075006100740069006f006e002000560065007200730069006f006e002000360030000900480061006e0063006f006d00450051004e00';
+
+// Build a self-contained equation paragraph for `script` (the EQEDIT source,
+// e.g. "x^2 + y^2 = z^2"). psId = the paragraph's para_shape (alignment).
+// inst seeds a fresh instance id (deqe CTRL @36 = inst+0x10). cellMarginHu
+// (optional) sets the deqe CommonObjAttr top/bottom outMargin (off 32/34) so an
+// in-cell equation gets a little vertical breathing room (the row grows to fit).
+function buildEquationCluster(script, inst, psId, cellMarginHu) {
+  const ph = Buffer.alloc(24);
+  ph.writeUInt32LE(9, 0); ph.writeUInt32LE(0x800, 4);
+  ph.writeUInt16LE((psId || 0) & 0xFFFF, 8); // para_shape (alignment)
+  ph.writeUInt16LE(1, 12); ph.writeUInt32LE(inst >>> 0, 18);
+  const pt = Buffer.from(EQ_PARA_TEXT_HEX, 'hex');
+  const cs = Buffer.from(EQ_CHAR_SHAPE_HEX, 'hex');
+  const ch = Buffer.from(EQ_DEQE_CTRL_HEX, 'hex');
+  ch.writeUInt32LE((inst + 0x10) >>> 0, 36);
+  if (Number.isInteger(cellMarginHu)) {
+    ch.writeUInt16LE(cellMarginHu & 0xFFFF, 32); // deqe outMargin top
+    ch.writeUInt16LE(cellMarginHu & 0xFFFF, 34); // deqe outMargin bottom
+  }
+  const lenField = Buffer.alloc(2); lenField.writeUInt16LE(script.length & 0xFFFF, 0);
+  const eq = Buffer.concat([
+    Buffer.from('00000000', 'hex'), lenField, Buffer.from(script, 'utf16le'),
+    Buffer.from(EQ_DATA_SUFFIX_HEX, 'hex'),
+  ]);
+  return Buffer.concat([
+    buildRecordHeader(TAG_PARA_HEADER, 0, ph.length), ph,
+    buildRecordHeader(TAG_PARA_TEXT, 1, pt.length), pt,
+    buildRecordHeader(TAG_PARA_CHAR_SHAPE, 1, cs.length), cs,
+    buildRecordHeader(TAG_CTRL_HEADER, 1, ch.length), ch,
+    buildRecordHeader(TAG_EQEDIT, 2, eq.length), eq,
+  ]);
+}
+
+// Insert an equation. Each op: { script: string, anchor?: string,
+// cell?: {row, col, para?, control?} }. `script` is the EQEDIT (Hancom 수식)
+// source string. In a cell the equation is centered + given a default vertical
+// margin (matching insert_image/shape/chart). Size/spacing tuning is deferred
+// to the HWPX-team coordination (per user) — default object size goes in as-is.
+export async function insertEquationInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  // Equations dropped into a table cell are centered by default (user pref):
+  // make sure a centered ParaShape exists (DocInfo write) before Section0.
+  let centerPsId = 0;
+  if (ops.some((o) => o.cell && (Number.isInteger(o.cell.row) || Number.isInteger(o.cell.col)))) {
+    centerPsId = await ensureAlignedParaShapeInFile(filePath, 'center');
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const script = (typeof op.script === 'string' && op.script.length) ? op.script : 'x^2 + y^2 = z^2';
+    const records = parseRecords(raw);
+    const inst = pickFreshInstanceId(records, raw);
+
+    if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
+      // ── Drop the equation INSIDE a table cell — centered, with vertical margin.
+      // spliceGsoIntoCell re-levels +2, sets the centered para_shape, splices at
+      // the cell end, bumps nParagraphs, fixes the last-para flag. Its gso-margin
+      // step is a no-op for "deqe" (not ' osg'), so we pre-set the deqe outMargin.
+      const cluster = buildEquationCluster(script, inst, centerPsId, CELL_OBJ_VMARGIN_HU);
+      raw = spliceGsoIntoCell(raw, cluster, op.cell.para ?? 0, op.cell.control ?? 0, op.cell.row, op.cell.col, centerPsId);
+      summary.push({ section: 0, equation: script, cell: { row: op.cell.row, col: op.cell.col } });
+      continue;
+    }
+
+    // ── Body: insert as a new paragraph after the anchor (or last body para),
+    // cloning that paragraph's para_shape so the equation line matches its
+    // alignment.
+    const clusters = findClusterBoundaries(records);
+    let psId = 0, insertAt = raw.length;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const ab = Buffer.from(op.anchor, 'utf16le');
+      for (const c of clusters) {
+        let hit = false;
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; }
+        }
+        if (hit) {
+          psId = raw.readUInt16LE(records[c.startIdx].dataOff + 8);
+          insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length;
+          break;
+        }
+      }
+    } else {
+      const t = findLastSimpleBodyParagraph(records);
+      psId = raw.readUInt16LE(records[t.startIdx].dataOff + 8);
+      insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+    }
+    const cluster = buildEquationCluster(script, inst, psId);
+    raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+    normalizeLastParaFlag(raw);
+    summary.push({ section: 0, equation: script, anchor: op.anchor ?? null });
+  }
+
+  // Deflate + write back (mirror insert_shape's Section0-only path).
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion(
+      { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] },
+      raw, chain
+    );
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+    newCompressed = ext.compressed;
+    if (ext.promoted) {
+      chain = ext.newRegularChain;
+      writeChainBytes(buf, chain, ssz, newCompressed);
+      buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74);
+    } else {
+      rootChain = ext.rootChain;
+      chain = ext.miniChain;
+      writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed);
+    }
+  } else {
+    const capacity = chain.length * ssz;
+    const ext = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain;
+    newCompressed = ext.compressed;
+    writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+  writeFileSync(filePath, buf);
+
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── 글상자 (text box) raw-patch ───────────────────────────────────────────
+// GT-first (Hancom's 입력 › 글상자): a text box is a rect gso object carrying
+// inner text. Same anchor-attach as insert_shape (inline gso char 0x000b in
+// the anchor PARA_TEXT, char_count += 8, control_mask |= 0x800), but the gso
+// cluster is richer: CTRL_HEADER "gso " + SHAPE_COMPONENT "cer$" + LIST_HEADER
+// + an inner text paragraph (PARA_HEADER/PARA_TEXT/CHAR_SHAPE, level 3-4) +
+// the RECTANGLE record. Only the inner paragraph varies with the user's text;
+// the geometry records are GT-verbatim (so the default-text box is byte-
+// identical to Hancom's). Default size ~53×24mm, floating. Section0-only.
+const TB_PREFIX_HEX = '4704e003206f736700406a14b42d00002c4c0000983a00005e1a0000000000000000000000000000537a9b42000000000800acc001ac15d6200085c7c8b2e4b22e004c08c00f6365722463657224000000000000000000000100983a00005e1a0000983a00005e1a000000000b01000000000000000000000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000000000000021000000410000c00001000000ffffff0000000000ffffffff000000000000000000b2b2b2000000000000000000547a9b020000480c100201000000200000001b011b011b011b01ffffffff00000000000000000000000000';
+const TB_INNER_PARAHEADER_HEX = '420c80010a0000800000000000000000010000000000000000000000'; // char_count field rewritten per text
+const TB_INNER_CHARSHAPE_HEX = '441080000000000000000000';
+const TB_RECTANGLE_HEX = '4f0c1002000000000000000000983a000000000000983a00005e1a0000000000005e1a0000';
+
+// Build the text box's gso cluster for the given inner text.
+function buildTextboxCluster(text) {
+  const prefix = Buffer.from(TB_PREFIX_HEX, 'hex');
+  // inner PARA_HEADER with char_count = text chars + 1 (the trailing 0x000d),
+  // high bit preserved (HWP sets it on the last paragraph of a list).
+  const ph = Buffer.from(TB_INNER_PARAHEADER_HEX, 'hex');
+  ph.writeUInt32LE((0x80000000 | (text.length + 1)) >>> 0, 4); // data starts at offset 4
+  // inner PARA_TEXT = text (UTF-16) + 0x000d paragraph terminator.
+  const txt = Buffer.concat([Buffer.from(text, 'utf16le'), Buffer.from('0d00', 'hex')]);
+  const ptRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 4, txt.length), txt]);
+  return Buffer.concat([prefix, ph, ptRec, Buffer.from(TB_INNER_CHARSHAPE_HEX, 'hex'), Buffer.from(TB_RECTANGLE_HEX, 'hex')]);
+}
+
+// Insert a text box. Each op: { anchor?: string, text: string }
+export async function insertTextboxInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const dirEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const inMiniStream = dirEntry.size < 4096;
+  let chain, compressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    chain = walkChain(minifat, dirEntry.start);
+    compressed = readMiniChainBytes(buf, chain, rc, ssz, mssz, dirEntry.size);
+  } else {
+    chain = walkChain(fat, dirEntry.start);
+    compressed = readChainBytes(buf, chain, ssz, dirEntry.size);
+  }
+  let raw = Buffer.from(inflateRawSync(compressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const text = (typeof op.text === 'string') ? op.text : '';
+    const records = parseRecords(raw);
+    const clusters = findClusterBoundaries(records);
+    let cluster = null, ptRec = null;
+    if (op.anchor && typeof op.anchor === 'string') {
+      const anchorBuf = Buffer.from(op.anchor, 'utf16le');
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1 && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(anchorBuf) !== -1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) {
+      for (const c of clusters) {
+        for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+          const r = records[i];
+          if (r.tag === TAG_PARA_TEXT && r.level === 1) { cluster = c; ptRec = r; break; }
+        }
+        if (ptRec) break;
+      }
+    }
+    if (!ptRec) throw new Error('insert_textbox: no top-level body paragraph found to anchor the text box');
+
+    const paraHeaderRec = records[cluster.startIdx];
+
+    // 1) Inline gso char (0x000b "gso ") before the paragraph's EOP.
+    const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex');
+    const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+    const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
+    const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, newBody.length), newBody]);
+
+    // 2) text box gso cluster.
+    const cluster2 = buildTextboxCluster(text);
+    // Placement: inline (글자처럼) by default, or wrap=topbottom/square/behind/front.
+    applyGsoPlacement(cluster2, op, resolveWrapMode(op));
+    applyGsoSize(cluster2, resolveAspectSize(op, gsoCtrlRatio(cluster2))); // size, aspect-preserved
+    const clusterEndOff = cluster.endIdx < records.length ? records[cluster.endIdx].headOff : raw.length;
+
+    // 3) PARA_HEADER patch: char_count += 8, control_mask |= 0x800.
+    const phOff = paraHeaderRec.dataOff;
+    const curCount = raw.readUInt32LE(phOff);
+    const flag = curCount & 0x80000000;
+    raw.writeUInt32LE(((flag | ((curCount & 0x7FFFFFFF) + 8)) >>> 0), phOff);
+    raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
+
+    raw = Buffer.concat([raw.slice(0, clusterEndOff), cluster2, raw.slice(clusterEndOff)]);
+    raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+
+    summary.push({ section: 0, anchor: op.anchor ?? null, text });
+  }
+
+  // Deflate + write back.
+  let newCompressed;
+  if (inMiniStream) {
+    const rc = ensureRootChain();
+    const ext = deflateMiniChainWithExpansion({ buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: rc, rootEntry: entries[0] }, raw, chain);
+    buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart; newCompressed = ext.compressed;
+    if (ext.promoted) { chain = ext.newRegularChain; writeChainBytes(buf, chain, ssz, newCompressed); buf.writeInt32LE(chain[0], dirEntry.entryFileOffset + 0x74); }
+    else { rootChain = ext.rootChain; chain = ext.miniChain; writeMiniChainBytes(buf, chain, rootChain, ssz, mssz, newCompressed); }
+  } else {
+    const ext = deflateAndFitWithExpansion(raw, chain.length * ssz, ssz, fat, fatAddrs, chain, buf, false);
+    buf = ext.buf; fat = ext.fat; chain = ext.chain; newCompressed = ext.compressed; writeChainBytes(buf, chain, ssz, newCompressed);
+  }
+  buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
+  buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
+
+  writeFileSync(filePath, buf);
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
 // ── Phase 6: append_image raw-patch ──────────────────────────────────────
 //
 // Step 1: add a new BinData/BIN000N.<ext> CFB stream containing the user's
@@ -2403,6 +5983,39 @@ function findUnusedDirSlot(entries) {
   return -1;
 }
 
+// Ensure the directory has at least one unused (type 0) entry slot. CFB stores
+// directory entries in a chain of sectors (ssz/128 entries each); when every slot
+// is taken, append a fresh zeroed sector to the chain so the next stream has a
+// home. Without this, a doc whose directory sector is exactly full (common after
+// a few streams) rejects a SECOND image/chart ("no free directory slot"). Returns
+// the (possibly reallocated) { buf, fat }. Caller must re-read the directory.
+function ensureDirSlot(buf, ssz, fat, fatAddrs, dirStart) {
+  const slotsPerSector = ssz >>> 7;
+  const dirChain = walkChain(fat, dirStart);
+  for (const s of dirChain) {
+    const base = (s + 1) * ssz;
+    for (let i = 0; i < slotsPerSector; i++) {
+      if (buf.readUInt8(base + i * 128 + 0x42) === 0) return { buf, fat }; // a free slot exists
+    }
+  }
+  // No free slot — append a new directory sector and link it to the chain's tail.
+  const exp = expandFatCapacity(buf, ssz, fat, fatAddrs, (buf.length / ssz) + 1);
+  buf = exp.buf; fat = exp.fat;
+  const a = appendBlankSector(buf, ssz); buf = a.buf;
+  const newSec = a.newSecIdx;
+  writeFatEntry(buf, ssz, fatAddrs, newSec, ENDOFCHAIN); fat[newSec] = ENDOFCHAIN;
+  const last = dirChain[dirChain.length - 1];
+  writeFatEntry(buf, ssz, fatAddrs, last, newSec); fat[last] = newSec;
+  const base = (newSec + 1) * ssz; // init 4 unused entries (type 0, siblings/child = NOSTREAM)
+  for (let i = 0; i < slotsPerSector; i++) {
+    const o = base + i * 128;
+    buf.writeInt32LE(FREESECT, o + 0x44);
+    buf.writeInt32LE(FREESECT, o + 0x48);
+    buf.writeInt32LE(FREESECT, o + 0x4C);
+  }
+  return { buf, fat };
+}
+
 function cfbNameCompare(a, b) {
   if (a.length !== b.length) return a.length - b.length;
   const au = a.toUpperCase();
@@ -2442,6 +6055,24 @@ function allocMiniChain(ctx, byteCount) {
   return { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain, rootEntry, chain };
 }
 
+// Allocate a fresh regular-FAT chain large enough for `byteLen` bytes (for a
+// new stream stored in the regular FAT, e.g. a chart OLE > 4096 bytes).
+function allocRegularChain(buf, ssz, fat, fatAddrs, byteLen) {
+  const totalSectors = Math.max(1, Math.ceil(byteLen / ssz));
+  // First sector: ensure FAT capacity, append a blank sector, mark ENDOFCHAIN.
+  let exp = expandFatCapacity(buf, ssz, fat, fatAddrs, (buf.length / ssz) + 1);
+  buf = exp.buf; fat = exp.fat;
+  let alloc = appendBlankSector(buf, ssz); buf = alloc.buf;
+  const first = alloc.newSecIdx;
+  writeFatEntry(buf, ssz, fatAddrs, first, ENDOFCHAIN); fat[first] = ENDOFCHAIN;
+  let chain = [first];
+  if (totalSectors > 1) {
+    const e = extendFatChain(buf, ssz, fat, fatAddrs, chain, totalSectors - 1);
+    buf = e.buf; fat = e.fat; chain = e.chain;
+  }
+  return { buf, fat, chain };
+}
+
 function insertEntryIntoTree(buf, entries, parentIdx, newIdx) {
   const parent = entries[parentIdx];
   const newName = entries[newIdx].name;
@@ -2472,6 +6103,41 @@ function insertEntryIntoTree(buf, entries, parentIdx, newIdx) {
       throw new Error(`insertEntryIntoTree: duplicate name "${newName}"`);
     }
   }
+}
+
+// Collect every node in a storage's child tree — the left/right-sibling BST rooted at
+// `rootSlot`. Does NOT descend into nodes' own `child` subtrees, so it returns only the
+// direct children of one storage (e.g. all of Root Entry's top-level entries).
+function collectTreeNodes(entries, rootSlot) {
+  const out = [];
+  if (rootSlot == null || rootSlot < 0) return out;
+  const stack = [rootSlot];
+  const seen = new Set();
+  while (stack.length) {
+    const i = stack.pop();
+    if (i < 0 || i >= entries.length || seen.has(i)) continue;
+    seen.add(i);
+    out.push(i);
+    if (entries[i].leftSibling >= 0) stack.push(entries[i].leftSibling);
+    if (entries[i].rightSibling >= 0) stack.push(entries[i].rightSibling);
+  }
+  return out;
+}
+
+// Rebuild a storage's child tree from scratch over `kids` (slot indices): clear the
+// parent's child pointer and each kid's SIBLING links (left/right) — never a kid's own
+// `child`, so folders keep their subtrees — then re-insert each via the same simple-BST
+// insert used on creation. Lets us remove an entry from a tree by collecting the
+// survivors and rebuilding, without implementing general BST node deletion.
+function rebuildChildTree(buf, entries, parentIdx, kids) {
+  buf.writeInt32LE(-1, entries[parentIdx].entryFileOffset + 0x4C);
+  entries[parentIdx].child = -1;
+  for (const idx of kids) {
+    const off = entries[idx].entryFileOffset;
+    buf.writeInt32LE(-1, off + 0x44); entries[idx].leftSibling = -1;
+    buf.writeInt32LE(-1, off + 0x48); entries[idx].rightSibling = -1;
+  }
+  for (const idx of kids) insertEntryIntoTree(buf, entries, parentIdx, idx);
 }
 
 function writeDirEntry(buf, entry, name, type, startSector, byteSize, color = 0) {
@@ -2664,7 +6330,7 @@ function parseDocInfoRecords(raw) {
   return parseRecords(raw); // identical record format
 }
 
-async function addBinDataDefToDocInfo(filePath, storageId, ext) {
+async function addBinDataDefToDocInfo(filePath, storageId, ext, attrOverride) {
   let buf = readFileSync(filePath);
   let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
   let fat = readFat(buf, fatAddrs, ssz);
@@ -2702,7 +6368,7 @@ async function addBinDataDefToDocInfo(filePath, storageId, ext) {
   raw.writeUInt32LE(oldCount + 1, idMap.dataOff);
 
   // Build new HWPTAG_BIN_DATA record.
-  const body = buildBinDataDefBody(storageId, ext);
+  const body = buildBinDataDefBody(storageId, ext, attrOverride);
   const header = buildRecordHeader(TAG_BIN_DATA_DEF, 1, body.length);
   const newRec = Buffer.concat([header, body]);
 
@@ -3263,6 +6929,13 @@ function buildCharShapeBody(base, style) {
   const buf = Buffer.alloc(outSize);
   base.copy(buf, 0, 0, Math.min(base.length, outSize));
 
+  // face-ids: 7 WORDs at offset 0-13 (one per language slot). When a font is
+  // requested the caller resolves it to 7 face-ids via findOrCreateFaceNameIds
+  // and passes them here; otherwise the base's face-ids are inherited.
+  if (Array.isArray(style.faceIds) && style.faceIds.length === 7) {
+    for (let i = 0; i < 7; i++) buf.writeUInt16LE(style.faceIds[i] & 0xffff, i * 2);
+  }
+
   // attr u32 at offset 46 — start from base, clear managed bits, then OR
   // requested flags. This way unmanaged fields (outline / shadow /
   // emboss / engrave / emphasis_dot / kerning) inherited from base are
@@ -3309,6 +6982,20 @@ function buildCharShapeBody(base, style) {
   if (style.highlight && style.highlight !== false) {
     const hex = style.highlight === true ? '#ffff00' : style.highlight;
     buf.writeUInt32LE(parseColorBGR(hex) >>> 0, 60);
+  }
+
+  // 장평 (char width ratio %, 7× u8 at 14-20; default 100) and 자간 (letter
+  // spacing %, 7× i8 at 21-27; default 0). Offsets are GT-confirmed against
+  // Hancom's char-shape --width/--spacing output. Broadcast to all 7 slots.
+  const charRatio = style.char_ratio ?? style.charRatio;
+  if (charRatio != null) {
+    const v = Math.max(1, Math.min(255, Math.round(charRatio)));
+    for (let i = 0; i < 7; i++) buf.writeUInt8(v, 14 + i);
+  }
+  const letterSpacing = style.letter_spacing ?? style.letterSpacing;
+  if (letterSpacing != null) {
+    const v = Math.max(-128, Math.min(127, Math.round(letterSpacing)));
+    for (let i = 0; i < 7; i++) buf.writeInt8(v, 21 + i);
   }
 
   return buf;
@@ -3378,6 +7065,84 @@ function appendCharShapeToDocInfo(diRaw, body) {
   const oldCount = newDi.readUInt32LE(off);
   newDi.writeUInt32LE(oldCount + 1, off);
   return { newDi, newCsId: csCount };
+}
+
+// ── Font (글꼴) registration for raw-patch text styling ────────────────────
+// HWP keeps fonts in a DocInfo FACE_NAME table grouped by 7 language slots
+// (Korean, Latin, Hanja, Japanese, Other, Symbol, User), stored contiguously
+// slot-by-slot. A CHAR_SHAPE carries 7 face-ids (one per slot) indexing into
+// each slot's sub-list. To apply an arbitrary font we register it in every
+// slot (so every script renders in it) and point the new CHAR_SHAPE's 7
+// face-ids at it. ID_MAPPINGS holds the per-slot font counts at array indices
+// 1..7 (right after BIN_DATA at index 0).
+const TAG_FACE_NAME = 0x13;
+const ID_MAPPINGS_FACE_NAME_OFFSET = 1 * 4; // first (Korean) FACE_NAME count
+
+// Minimal FACE_NAME record body: attribute=0 (no substitute / type / base
+// font) + nameLen(WORD, in WCHARs) + UTF-16LE name. Valid for any installed
+// font — Hancom renders by name; the optional substitute font only matters
+// when the face is absent on the rendering system.
+function buildFaceNameBody(name) {
+  const nm = Buffer.from(name, 'utf16le');
+  const body = Buffer.alloc(3 + nm.length);
+  body.writeUInt8(0, 0);
+  body.writeUInt16LE(name.length, 1);
+  nm.copy(body, 3);
+  return body;
+}
+
+// Ensure `fontName` exists in all 7 FACE_NAME language slots; returns the
+// updated DocInfo buffer and the 7 face-ids to write into a CHAR_SHAPE.
+function findOrCreateFaceNameIds(diRaw, fontName) {
+  let idMapOff = -1;
+  for (const r of walkRecords(diRaw)) { if (r.tag === TAG_ID_MAPPINGS) { idMapOff = r.dataOff; break; } }
+  if (idMapOff < 0) throw new Error('apply_text_style(font): HWPTAG_ID_MAPPINGS not found');
+  const counts = [];
+  for (let i = 0; i < 7; i++) counts.push(diRaw.readUInt32LE(idMapOff + ID_MAPPINGS_FACE_NAME_OFFSET + i * 4));
+
+  const faces = [];
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === TAG_FACE_NAME) {
+      const len = diRaw.readUInt16LE(r.dataOff + 1);
+      faces.push({ name: diRaw.slice(r.dataOff + 3, r.dataOff + 3 + len * 2).toString('utf16le'), headOff: r.headOff, endOff: r.dataOff + r.size });
+    }
+  }
+  if (faces.length === 0) throw new Error('apply_text_style(font): no FACE_NAME records in DocInfo');
+
+  // Per-slot insert offset (end of slot's run) and current font names.
+  const faceIds = new Array(7);
+  const inserts = [];
+  let i = 0;
+  let prevEnd = faces[0].headOff;
+  for (let s = 0; s < 7; s++) {
+    const cnt = counts[s];
+    const slot = faces.slice(i, i + cnt);
+    const insOff = cnt > 0 ? slot[slot.length - 1].endOff : prevEnd;
+    const existing = slot.findIndex((f) => f.name === fontName);
+    if (existing >= 0) {
+      faceIds[s] = existing;
+    } else {
+      faceIds[s] = cnt;
+      const body = buildFaceNameBody(fontName);
+      inserts.push({ offset: insOff, bytes: Buffer.concat([buildRecordHeader(TAG_FACE_NAME, 0, body.length), body]), slot: s });
+    }
+    if (cnt > 0) prevEnd = slot[slot.length - 1].endOff;
+    i += cnt;
+  }
+  if (inserts.length === 0) return { newDi: diRaw, faceIds };
+
+  // Splice in descending offset order so earlier offsets stay valid.
+  let out = diRaw;
+  for (const ins of [...inserts].sort((a, b) => b.offset - a.offset)) {
+    out = Buffer.concat([out.slice(0, ins.offset), ins.bytes, out.slice(ins.offset)]);
+  }
+  // Bump per-slot ID_MAPPINGS counts (ID_MAPPINGS precedes FACE_NAME, so its
+  // offset is unaffected by the splices above).
+  for (const ins of inserts) {
+    const off = idMapOff + ID_MAPPINGS_FACE_NAME_OFFSET + ins.slot * 4;
+    out.writeUInt32LE(out.readUInt32LE(off) + 1, off);
+  }
+  return { newDi: out, faceIds };
 }
 
 // Locate the target string in Section0 raw. Returns the FIRST occurrence:
@@ -3672,14 +7437,26 @@ export async function applyTextStyleInPlace(filePath, ops) {
 
     // Determine base CharShape (the one active at the target start).
     const baseCsId = csIdAtOffset(hit.paraCharShapeRec, secRaw, hit.start);
+
+    // Font: register the requested face in DocInfo's FACE_NAME table (every
+    // language slot) and resolve it to 7 face-ids for the new CharShape. This
+    // mutates diRaw, so it must run before readCharShapeBodies below.
+    const fontName = op.font_family || op.fontFamily || op.font;
+    let faceIds = null;
+    if (typeof fontName === 'string' && fontName.length > 0) {
+      const fr = findOrCreateFaceNameIds(diRaw, fontName);
+      diRaw = fr.newDi;
+      faceIds = fr.faceIds;
+    }
+
     const csBodies = readCharShapeBodies(diRaw);
     if (baseCsId >= csBodies.length) {
       throw new Error(`apply_text_style: base csId ${baseCsId} out of range (have ${csBodies.length})`);
     }
-    // Build new CharShape from base + style overlay.
-    // Apply size=pt → fontSize, font_family handling (Phase B v1: defer fontId resolution).
+    // Build new CharShape from base + style overlay (incl. resolved font face-ids).
     const styleInput = { ...op };
     if (op.size != null && styleInput.fontSize == null) styleInput.fontSize = op.size;
+    if (faceIds) styleInput.faceIds = faceIds;
     const newBody = buildCharShapeBody(csBodies[baseCsId], styleInput);
 
     // Dedup: if a CharShape with identical body already exists, reuse it.
@@ -3869,6 +7646,16 @@ const TAG_BORDER_FILL = 20;
 //   16-17 reserved
 const ID_MAPPINGS_BORDER_FILL_OFFSET = 8 * 4;
 const ID_MAPPINGS_PARA_SHAPE_OFFSET = 13 * 4;
+const ID_MAPPINGS_NUMBERING_OFFSET = 11 * 4;
+const ID_MAPPINGS_BULLET_OFFSET = 12 * 4;
+const TAG_NUMBERING = 23;
+const TAG_BULLET = 24;
+// Native Hancom records, GT-extracted (cell-style/list via Hancom web → .hwp):
+//   NUMBERING = standard decimal "^1." per level (^1 = the auto-number).
+//   BULLET    = "●" glyph (U+F06C). Replayed verbatim so a numbered/bulleted
+//   paragraph that references them renders identically to Hancom's own output.
+const NUMBERING_TEMPLATE_HEX = '0c00000000003200ffffffff03005e0031002e000c01000000003200ffffffff03005e0032002e000c00000000003200ffffffff03005e00330029000c01000000003200ffffffff03005e00340029000c00000000003200ffffffff040028005e00350029000c01000000003200ffffffff040028005e00360029002c00000000003200ffffffff02005e0037000100010000000100000001000000010000000100000001000000010000002c01000000003200ffffffff02005e0038000c00000000003200ffffffff00000c00000000003200ffffffff0000010000000100000001000000';
+const BULLET_TEMPLATE_HEX = '0800000000003200ffffffff6cf00000000000000000002000';
 
 const ALIGNMENT_MAP = {
   justify: 0,
@@ -3924,6 +7711,14 @@ function buildParaShapeBody(base, style) {
     if (t == null) throw new Error(`apply_paragraph_style: unknown lineSpacingType "${style.lineSpacingType}"`);
     attr1 = ((attr1 & ~0x03) | t) >>> 0;
   }
+  // 문단 머리 종류 (heading kind) — attr1 bits 23-24: 0=none, 1=outline,
+  // 2=number, 3=bullet. GT-confirmed (a Hancom-authored list: numbered para
+  // attr1 0x01000180 vs plain 0x00000180 = bit 24; bullet 0x01800180 = bits
+  // 23+24). The id ref at offset 30 then points to the matching NUMBERING
+  // (kind 2) or BULLET (kind 3) record.
+  if (style.headingKind != null) {
+    attr1 = ((attr1 & ~(0x3 << 23)) | ((style.headingKind & 0x3) << 23)) >>> 0;
+  }
   buf.writeUInt32LE(attr1 >>> 0, 0);
 
   if (style.marginLeft != null) buf.writeInt32LE(Math.round(style.marginLeft), 4);
@@ -3938,6 +7733,11 @@ function buildParaShapeBody(base, style) {
   }
   if (style.borderFillId != null) {
     buf.writeUInt16LE(style.borderFillId & 0xFFFF, 32);
+  }
+  // numbering_id / bullet_id share this u16 (which one is decided by the
+  // heading kind in attr1 above).
+  if (style.headingId != null) {
+    buf.writeUInt16LE(style.headingId & 0xFFFF, 30);
   }
   return buf;
 }
@@ -3986,6 +7786,221 @@ function appendParaShapeToDocInfo(diRaw, body) {
   const oldCount = newDi.readUInt32LE(off);
   newDi.writeUInt32LE(oldCount + 1, off);
   return { newDi, newPsId: psCount };
+}
+
+// Append a NUMBERING (tag 23) or BULLET (tag 24) record (built from a native
+// template) into DocInfo, keeping the tag-ascending record order, and bump the
+// matching HWPTAG_ID_MAPPINGS count. Returns { newDi, newId } with newId 1-based
+// (paragraph numbering/bullet id refs are 1-based, like BorderFill).
+function appendHeadingRecordToDocInfo(diRaw, tag, body, idMappingsOffset) {
+  let count = 0;
+  let lastSameTagEnd = -1;
+  let lastLowerTagEnd = -1;   // fallback insert point: after the last record whose tag < target (but ≥ ID_MAPPINGS)
+  let idMappingsDataOff = -1;
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === tag) { count++; lastSameTagEnd = r.dataOff + r.size; }
+    else if (r.tag >= 17 && r.tag < tag) lastLowerTagEnd = r.dataOff + r.size;
+    if (r.tag === 17) idMappingsDataOff = r.dataOff;
+  }
+  if (idMappingsDataOff < 0) {
+    throw new Error('HWPTAG_ID_MAPPINGS not found in DocInfo — file looks malformed');
+  }
+  const insertAt = lastSameTagEnd >= 0 ? lastSameTagEnd
+    : (lastLowerTagEnd >= 0 ? lastLowerTagEnd : diRaw.length);
+  const header = buildRecordHeader(tag, 0, body.length);
+  const newRec = Buffer.concat([header, body]);
+  const newDi = Buffer.concat([diRaw.slice(0, insertAt), newRec, diRaw.slice(insertAt)]);
+  const off = idMappingsDataOff + idMappingsOffset;
+  if (off + 4 > newDi.length) {
+    throw new Error('ID_MAPPINGS body too short to hold numbering/bullet count');
+  }
+  newDi.writeUInt32LE(newDi.readUInt32LE(off) + 1, off);
+  return { newDi, newId: count + 1 };
+}
+function appendNumberingToDocInfo(diRaw) {
+  return appendHeadingRecordToDocInfo(diRaw, TAG_NUMBERING, Buffer.from(NUMBERING_TEMPLATE_HEX, 'hex'), ID_MAPPINGS_NUMBERING_OFFSET);
+}
+function appendBulletToDocInfo(diRaw) {
+  return appendHeadingRecordToDocInfo(diRaw, TAG_BULLET, Buffer.from(BULLET_TEMPLATE_HEX, 'hex'), ID_MAPPINGS_BULLET_OFFSET);
+}
+
+/**
+ * Apply list formatting (numbered / bulleted) to existing `.hwp` paragraphs via
+ * raw-patch. Ops: `set_numbered_list` / `set_bullet_list`, each targeting one
+ * body paragraph by `target` (string, first paragraph containing it) or `index`
+ * (0-based level-0 paragraph in Section0) — same addressing apply_paragraph_style
+ * uses.
+ *
+ * Mechanism (GT-confirmed): HWP renders a paragraph's number/bullet purely from
+ * its PARA_SHAPE — attr1 heading-kind bits (2=number, 3=bullet) + a NUMBERING /
+ * BULLET id ref at offset 30; NO inline text control char is needed. We append a
+ * native NUMBERING (or BULLET) record to DocInfo ONCE per call (so multiple items
+ * share one id and number continuously), then for each target clone its
+ * PARA_SHAPE with the heading kind + id set, dedup/append, and repoint the
+ * PARA_HEADER. Section0 only.
+ */
+export async function applyListInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', listed_count: 0 });
+  }
+  for (const op of ops) {
+    const hasTarget = typeof op.target === 'string' && op.target.length > 0;
+    const hasIdx = Number.isInteger(op.index) && op.index >= 0;
+    if (!hasTarget && !hasIdx) {
+      throw new Error(`${op.type}: 'target' (string) or 'index' (non-negative integer) is required`);
+    }
+    if (op.type !== 'set_numbered_list' && op.type !== 'set_bullet_list') {
+      throw new Error(`applyListInPlace: unsupported op type "${op.type}"`);
+    }
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const diEntry = findStreamEntry(entries, ['DocInfo']);
+  const diInMini = diEntry.size < 4096;
+  let diChain, diCompressed;
+  if (diInMini) {
+    const rc = ensureRootChain();
+    diChain = walkChain(minifat, diEntry.start);
+    diCompressed = readMiniChainBytes(buf, diChain, rc, ssz, mssz, diEntry.size);
+  } else {
+    diChain = walkChain(fat, diEntry.start);
+    diCompressed = readChainBytes(buf, diChain, ssz, diEntry.size);
+  }
+  let diRaw = Buffer.from(inflateRawSync(diCompressed));
+
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  // One shared NUMBERING / BULLET record per call → continuous numbering.
+  let sharedNumberingId = null, sharedBulletId = null;
+  const summary = [];
+  for (const op of ops) {
+    const kind = op.type === 'set_numbered_list' ? 2 : 3;
+    let hit;
+    if (typeof op.target === 'string' && op.target.length > 0) {
+      hit = findTextRangeInSection(secRaw, op.target);
+      if (!hit) throw new Error(`${op.type}: target "${op.target}" not found in body`);
+      hit.start = 0; hit.end = hit.textLength;
+    } else {
+      hit = findParagraphByIndexInSection(secRaw, op.index);
+      if (!hit) throw new Error(`${op.type}: index ${op.index} not found in section`);
+    }
+    if (hit.paraHeaderRec.size < 10) {
+      throw new Error(`${op.type}: PARA_HEADER body too short to read paraShapeId`);
+    }
+    const basePsId = secRaw.readUInt16LE(hit.paraHeaderRec.dataOff + 8);
+    const psBodies = readParaShapeBodies(diRaw);
+    if (basePsId >= psBodies.length) {
+      throw new Error(`${op.type}: basePsId ${basePsId} out of range (have ${psBodies.length})`);
+    }
+    const base = psBodies[basePsId];
+
+    let headingId;
+    if (kind === 2) {
+      if (sharedNumberingId == null) { const r = appendNumberingToDocInfo(diRaw); diRaw = r.newDi; sharedNumberingId = r.newId; }
+      headingId = sharedNumberingId;
+    } else {
+      if (sharedBulletId == null) { const r = appendBulletToDocInfo(diRaw); diRaw = r.newDi; sharedBulletId = r.newId; }
+      headingId = sharedBulletId;
+    }
+
+    const newPsBody = buildParaShapeBody(base, { headingKind: kind, headingId });
+    let newPsId = readParaShapeBodies(diRaw).findIndex((b) => b.equals(newPsBody));
+    if (newPsId < 0) {
+      const psRes = appendParaShapeToDocInfo(diRaw, newPsBody);
+      diRaw = psRes.newDi;
+      newPsId = psRes.newPsId;
+    }
+    secRaw = setParaHeaderShapeId(secRaw, hit.paraHeaderRec, newPsId);
+
+    summary.push({ op: op.type, target: op.target, index: op.index, paraIdx: hit.paraIdx, basePsId, newPsId, headingId });
+  }
+
+  // Deflate + write DocInfo (mirror applyParagraphStyleInPlace).
+  {
+    const inMini = diInMini;
+    const capacity = inMini ? diChain.length * mssz : diChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        diRaw, diChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        diChain = ext.newRegularChain;
+        writeChainBytes(buf, diChain, ssz, ext.compressed);
+        buf.writeInt32LE(diChain[0], diEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        diChain = ext.miniChain;
+        writeMiniChainBytes(buf, diChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(diRaw, capacity, ssz, fat, fatAddrs, diChain, buf, false);
+      buf = ext.buf; fat = ext.fat; diChain = ext.chain;
+      writeChainBytes(buf, diChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    }
+  }
+  // Deflate + write Section0.
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', listed_count: summary.length });
 }
 
 // Build a 53-byte BORDER_FILL body with a solid background fill at the
@@ -4052,6 +8067,120 @@ function appendBorderFillToDocInfo(diRaw, body) {
   // border_fill_id = 2 in its ParaShape — i.e. (id - 1) is the
   // array index. We mirror that convention.
   return { newDi, newBfId: bfCount + 1 };
+}
+
+// Read every HWPTAG_BORDER_FILL body in DocInfo, in document order. The
+// array is 0-indexed; a cell/paragraph's 1-based borderFillId references
+// element (id - 1). Mirrors readParaShapeBodies.
+function readBorderFillBodies(diRaw) {
+  const out = [];
+  for (const r of walkRecords(diRaw)) {
+    if (r.tag === TAG_BORDER_FILL) {
+      out.push(diRaw.slice(r.dataOff, r.dataOff + r.size));
+    }
+  }
+  return out;
+}
+
+// Merge a solid background fill into an EXISTING BorderFill body, preserving
+// that body's border + diagonal styling. This is what makes cell shading
+// safe: a table cell already references a BorderFill that draws its 4
+// borders, so we must keep those bytes and only (re)write the fill block —
+// otherwise the cell loses its borders and becomes a bare colored box.
+//
+// Layout: the border + diagonal block is a FIXED 32 bytes regardless of
+// fill type —
+//   [0-1]   attribute u16
+//   [2-7]   left border    (type, width, COLORREF)
+//   [8-13]  right border
+//   [14-19] top border
+//   [20-25] bottom border
+//   [26-31] diagonal       (type, width, COLORREF)
+// The fill block starts at offset 32 and its length depends on fill_type,
+// so a cell with NO current fill has a shorter body. We therefore rebuild a
+// full 53-byte body: copy [0..31] from the base, then append the same solid
+// fill block buildBorderFillSolidBody emits (which the paragraph-shading
+// path has verified renders in Hancom Docs).
+function mergeSolidFillIntoBorderFillBody(baseBody, hexColor, pattern = 'rhwp') {
+  const out = Buffer.alloc(53);
+  // Preserve borders + diagonal. A valid BorderFill body is always >= 32
+  // bytes (all four borders + diagonal are present even when "none"); the
+  // Math.min guard is purely defensive against a malformed short record.
+  baseBody.copy(out, 0, 0, Math.min(32, baseBody.length));
+  // Solid fill block — identical to buildBorderFillSolidBody, EXCEPT we do
+  // not touch the diagonal-type byte at offset 26 (that belongs to the
+  // preserved border block above; the 'hancom' size_marker variant only
+  // differs in offset 48).
+  if (pattern !== 'hancom') {
+    out.writeUInt32LE(1, 48);           // size_marker (rhwp pattern)
+  }
+  out.writeUInt32LE(1, 32);             // fill_type = solid
+  out.writeUInt32LE(parseColorBGR(hexColor) >>> 0, 36);
+  out.writeUInt32LE(0x00999999, 40);    // pattern_color = #999999
+  out.writeInt32LE(-1, 44);             // pattern_type = -1
+  return out;
+}
+
+// HWP border/diagonal line "종류" (type) enum. 0=none, 1=solid, then dashed/
+// dotted/double. We expose the common few; others fall back to solid.
+const LINE_TYPE = { none: 0, solid: 1, dash: 2, dashed: 2, dot: 3, dotted: 3, double: 4 };
+// Byte offset of each border side inside a BorderFill body. Each side is 6
+// bytes: type[+0], width[+1], color COLORREF[+2..+5].
+const BORDER_SIDE_OFF = { left: 2, right: 8, top: 14, bottom: 20 };
+
+// Set one or more cell borders, PRESERVING the body's fill + diagonal + the
+// other sides. `sides` = 'all' or an array of 'left'|'right'|'top'|'bottom'.
+// Default is a thin solid black line — the exact encoding existing Hancom
+// table cells use for their visible grid (type=1, width=1, color=#000000).
+function mergeBordersIntoBorderFillBody(baseBody, sides, hexColor = '#000000', lineType = 1, width = 1) {
+  const out = Buffer.alloc(Math.max(baseBody.length, 32)); // ensure full border block
+  baseBody.copy(out, 0);
+  const color = parseColorBGR(hexColor) >>> 0;
+  const list = (sides === 'all' || (Array.isArray(sides) && sides.includes('all')))
+    ? ['left', 'right', 'top', 'bottom']
+    : (Array.isArray(sides) ? sides : [sides]);
+  for (const side of list) {
+    const o = BORDER_SIDE_OFF[side];
+    if (o == null) throw new Error(`set_cell_border: unknown side "${side}" (use left/right/top/bottom/all)`);
+    out.writeUInt8(lineType & 0xFF, o);
+    out.writeUInt8(width & 0xFF, o + 1);
+    out.writeUInt32LE(color, o + 2);
+  }
+  return out;
+}
+
+// Diagonal direction → BorderFill attribute(u16) bits. The attribute carries
+// two 3-bit diagonal fields (value 1 = basic straight diagonal) at bits 3-5
+// and 6-8. Mapped here by the GLYPH each value actually RENDERS (capture-
+// verified 2026-06-16), which is what users expect:
+//   slash ／  (bottom-left→top-right)  → bit 3 = 0x08
+//   backslash ＼ (top-left→bottom-right) → bit 6 = 0x40
+//   x ╳ (both)                          → 0x48
+// NOTE the field/glyph naming is counter-intuitive: 0x08 lives in the byte
+// the HWP spec labels "BackSlash" yet Hancom draws it as ／, and the Hancom
+// web `cell-style --diagonal backslash` likewise emits 0x08 (= ／). We name
+// by rendered glyph, not the spec/tool label. The diagonal LINE at [26-31]
+// (type/width/color via parseColorBGR) matches Hancom rendering byte-for-byte.
+const DIAG_ATTR = { slash: 1 << 3, backslash: 1 << 6, x: (1 << 3) | (1 << 6), both: (1 << 3) | (1 << 6) };
+
+// Set a cell diagonal (대각선), PRESERVING fill + borders. Writes the diagonal
+// line at [26-31] (type/width/color) AND OR-s the direction bits into the
+// attribute u16 [0-1]. `kind` = 'slash'(／) | 'backslash'(＼) | 'x'(╳).
+function mergeDiagonalIntoBorderFillBody(baseBody, kind, hexColor = '#000000', lineType = 1, width = 1) {
+  const out = Buffer.alloc(Math.max(baseBody.length, 32));
+  baseBody.copy(out, 0);
+  const bits = DIAG_ATTR[kind];
+  if (bits == null) throw new Error(`set_cell_diagonal: unknown direction "${kind}" (use slash/backslash/x)`);
+  out.writeUInt16LE((out.readUInt16LE(0) | bits) & 0xFFFF, 0); // attribute direction bits
+  out.writeUInt8(lineType & 0xFF, 26);                          // diagonal line type
+  out.writeUInt8(width & 0xFF, 27);                             // diagonal width
+  // Diagonal color = standard COLORREF 0x00BBGGRR, SAME as the border/fill
+  // fields (parseColorBGR). Capture-verified: #ff0000 must render red, which
+  // needs 0x000000ff (BGR), not 0x00ff0000. (The Hancom-web cell-style GT
+  // happens to store it straight-RGB = its own R↔B quirk that renders the
+  // wrong color; we don't copy that — we store what renders correctly.)
+  out.writeUInt32LE(parseColorBGR(hexColor) >>> 0, 28);         // diagonal color (BGR)
+  return out;
 }
 
 // Rewrite PARA_HEADER body offset 8-9 (u16) with `newPsId`. Returns updated
@@ -4160,6 +8289,1759 @@ function resolveBackgroundColor(op) {
   if (v == null || v === false) return null;
   if (v === true) return '#ffff00';
   return v;
+}
+
+const HWPUNIT_PER_MM = 283.46;
+// Cell vertical alignment — LIST_HEADER attribute(u32 @ offset 2) bits 21-22.
+// GT-confirmed: h22 cells default to middle (0x00200000); valign bottom →
+// 0x00400000; the merged top cells sit at 0x00000000 (top). So top=0/middle=1/
+// bottom=2 in those 2 bits.
+const CELL_VALIGN = { top: 0, middle: 1, center: 1, bottom: 2 };
+
+/**
+ * Apply table-cell properties (vertical align / height / width / inner margins)
+ * to existing `.hwp` cells via raw-patch. Patches the cell's LIST_HEADER body
+ * directly in Section0 — NO DocInfo change.
+ *
+ * Op `set_cell_property`: `{ section?, para?, control?, row, col, valign?,
+ *   height_mm?, width_mm?, margin_mm? | margins?:[l,r,t,b] }`. Addressing matches
+ *   set_cell_text. LIST_HEADER layout (GT-confirmed): attr@2 (valign bits 21-22),
+ *   width@16 / height@20 (u32 HWPUNIT = mm×283.46), margins L/R/T/B@24/26/28/30
+ *   (u16 HWPUNIT). Section 0 only.
+ */
+export async function applyCellPropertyInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) {
+      throw new Error(`set_cell_property: only section 0 is supported (got section ${op.section})`);
+    }
+    const has = op.valign != null || op.height_mm != null || op.width_mm != null || op.margin_mm != null || Array.isArray(op.margins) || op.header != null;
+    if (!has) throw new Error('set_cell_property: at least one of valign / height_mm / width_mm / margin_mm / header is required');
+    if (op.valign != null && CELL_VALIGN[String(op.valign).toLowerCase()] == null) {
+      throw new Error(`set_cell_property: valign must be top / middle / bottom (got "${op.valign}")`);
+    }
+  }
+  const resolved = await resolveCellIndexes(filePath, ops);
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const mm = (v) => Math.round(v * HWPUNIT_PER_MM);
+  const summary = [];
+  for (const e of resolved) {
+    const para = e.para ?? 0, ctrl = e.control ?? 0;
+    const records = parseRecords(secRaw);
+    const loc = locateCell(records, para, ctrl, e.cellIndex);
+    const o = records[loc.listHeaderRec].dataOff;
+    // Self-check the cell-attr layout (col@8 / row@10) before patching.
+    if (secRaw.readUInt16LE(o + 8) !== e.col || secRaw.readUInt16LE(o + 10) !== e.row) {
+      throw new Error(`set_cell_property: cell-attr layout mismatch at (${e.row},${e.col}) — refusing to patch`);
+    }
+    if (e.valign != null) {
+      const v = CELL_VALIGN[String(e.valign).toLowerCase()];
+      const attr = secRaw.readUInt32LE(o + 2);
+      secRaw.writeUInt32LE(((attr & ~(0x3 << 21)) | (v << 21)) >>> 0, o + 2);
+    }
+    if (e.width_mm != null) secRaw.writeUInt32LE(mm(e.width_mm) >>> 0, o + 16);
+    if (e.height_mm != null) secRaw.writeUInt32LE(mm(e.height_mm) >>> 0, o + 20);
+    const margins = Array.isArray(e.margins) ? e.margins
+      : (e.margin_mm != null ? [e.margin_mm, e.margin_mm, e.margin_mm, e.margin_mm] : null);
+    if (margins) for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + 24 + i * 2);
+    // Header / title cell (제목 셀): LIST_HEADER offset 6 (u16). GT-confirmed
+    // (gt_title: claw-hancomdocs table-cell-prop --title-cell, .hwp download) —
+    // base 0 → 4 (bit 2). On the top row this is HWP's repeat-header-row behavior.
+    if (e.header != null) secRaw.writeUInt16LE(e.header ? 4 : 0, o + 6);
+    summary.push({ op: e.type, para, control: ctrl, cellIndex: e.cellIndex, row: e.row, col: e.col,
+      valign: e.valign ?? null, height_mm: e.height_mm ?? null, width_mm: e.width_mm ?? null, header: e.header ?? null });
+  }
+
+  // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
+}
+
+// ── 표 바깥 여백 (table outer margin) raw-patch ──────────────────────────────
+//
+// GT-first (gt_margin: claw-hancomdocs `table-cell-prop --table-margin "5,5,3,3"`
+// applied in 한컴 web, downloaded as .hwp — NOT converted from .hwpx). The table's
+// outer margin lives in the table CTRL_HEADER (tag 0x47, ctrl_id " lbt" = "tbl "
+// reversed in-stream, body size 46). In-record offset 28/30/32/34 = u16
+// left/right/top/bottom in HWPUNIT (mm × 283.46). Default 283 (=1mm) all sides;
+// GT 5,5,3,3mm → 1417,1417,850,850 (exact byte match vs Hancom). Length-preserving
+// fixed-width edit, Section 0 only. (Verify long+short docs Tier-1 both — CFB path
+// differs.)
+//
+// Each op: { table_index?, margins?:[l,r,t,b] | margin_mm? }.
+const TABLE_CTRL_ID = ' lbt'; // "tbl " stored reversed (little-endian ctrl_id)
+const TABLE_OUTMARGIN_OFF = 28; // in-record offset of the 4 outer-margin u16s
+// Page-split mode = TABLE record (0x4d) attribute bits 0-1. GT-confirmed
+// (claw-hancomdocs table-cell-prop --page-split, .hwp download): none→0,
+// cell→1, table→2 (table == the default). 한컴 spec: 0 나누지않음 / 1 셀단위로나눔 / 2 나눔.
+const TABLE_PAGE_SPLIT = { none: 0, cell: 1, table: 2 };
+// Text-wrap / placement = bits in the gso/table CTRL_HEADER attribute (offset 4).
+// mask 0x600001 = bit0 (글자처럼 취급 / like-char) + bits 21-22 (float wrap mode).
+// inline (글자처럼) = ONLY the like-char bit (0x1); the wrap-mode bits stay 0 because
+// an inline object doesn't wrap text. The float modes clear like-char and set the
+// 2-bit wrap (square 00 / topbottom 01 / behind 10 / front 11).
+// ⚠️ inline was 0x200001 (like-char + an errant topbottom bit) — GT (a chart set to
+// 글자처럼 in Hancom + downloaded, and insert_image's $pic) both encode inline as a
+// bare 0x1. The stray bit 21 made a terminal-paragraph OLE chart render blank; 0x1
+// renders everywhere (verified). Only the attribute changes (record size unchanged).
+const TABLE_WRAP_MASK = 0x600001;
+const TABLE_WRAP = { inline: 0x1, square: 0x0, topbottom: 0x200000, behind: 0x400000, front: 0x600000 };
+
+// Each table = its CTRL_HEADER (" lbt", outer margin) + the TABLE record (0x4d,
+// rows/cols/attr) that follows it. Return both so one op can patch either.
+function findTables(records, secRaw) {
+  const out = [];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1 && r.size >= TABLE_OUTMARGIN_OFF + 8
+        && secRaw.slice(r.dataOff, r.dataOff + 4).toString('latin1') === TABLE_CTRL_ID) {
+      let table = null;
+      for (let j = i + 1; j < records.length; j++) {
+        const rj = records[j];
+        if (rj.tag === TAG_PARA_HEADER && rj.level === 0) break;
+        if (rj.tag === TAG_CTRL_HEADER && rj.level === 1) break;
+        if (rj.tag === TAG_TABLE) { table = rj; break; }
+      }
+      out.push({ ctrl: r, table });
+    }
+  }
+  return out;
+}
+
+export async function applyTablePropertyInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`set_table_property: only section 0 is supported (got ${op.section})`);
+    if (!Array.isArray(op.margins) && op.margin_mm == null && op.page_split == null && op.table_wrap == null) {
+      throw new Error('set_table_property: margins:[l,r,t,b] / margin_mm / page_split / table_wrap is required');
+    }
+    if (Array.isArray(op.margins) && op.margins.length !== 4) {
+      throw new Error('set_table_property: margins must be [left,right,top,bottom] (4 values, mm)');
+    }
+    if (op.page_split != null && TABLE_PAGE_SPLIT[String(op.page_split).toLowerCase()] == null) {
+      throw new Error('set_table_property: page_split must be none / cell / table');
+    }
+    if (op.table_wrap != null && TABLE_WRAP[String(op.table_wrap).toLowerCase()] == null) {
+      throw new Error('set_table_property: table_wrap must be inline / square / topbottom / behind / front');
+    }
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const mm = (v) => Math.round(v * HWPUNIT_PER_MM);
+  const summary = [];
+  for (const op of ops) {
+    const records = parseRecords(secRaw);
+    const tables = findTables(records, secRaw);
+    const idx = op.table_index ?? 0;
+    if (idx < 0 || idx >= tables.length) {
+      throw new Error(`set_table_property: table_index ${idx} out of range (found ${tables.length} table(s))`);
+    }
+    const { ctrl, table } = tables[idx];
+    const rec = { op: 'set_table_property', table_index: idx };
+    if (Array.isArray(op.margins) || op.margin_mm != null) {
+      const o = ctrl.dataOff;
+      const margins = Array.isArray(op.margins)
+        ? op.margins
+        : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
+      for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + TABLE_OUTMARGIN_OFF + i * 2);
+      rec.margins_mm = margins;
+    }
+    if (op.page_split != null) {
+      if (!table) throw new Error(`set_table_property: TABLE record not found for table_index ${idx}`);
+      const v = TABLE_PAGE_SPLIT[String(op.page_split).toLowerCase()];
+      const attr = secRaw.readUInt32LE(table.dataOff);
+      secRaw.writeUInt32LE(((attr & ~0x3) | v) >>> 0, table.dataOff);
+      rec.page_split = String(op.page_split).toLowerCase();
+    }
+    if (op.table_wrap != null) {
+      const bits = TABLE_WRAP[String(op.table_wrap).toLowerCase()];
+      const attr = secRaw.readUInt32LE(ctrl.dataOff + 4);
+      secRaw.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | bits) >>> 0, ctrl.dataOff + 4);
+      rec.table_wrap = String(op.table_wrap).toLowerCase();
+    }
+    summary.push(rec);
+  }
+
+  // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
+}
+
+// ── 객체(그림/도형) 속성 (object fill / border / outer margin) raw-patch ────
+//
+// GT-first (claw-hancomdocs object-prop --fill/--border/--border-width/--margin
+// on a gso shape, downloaded as .hwp and diffed vs a round-trip baseline). A
+// drawing object = a gso CTRL_HEADER (ctrl_id ' osg' = "gso " reversed, a
+// CommonObjAttr like the table's ' lbt') followed by a SHAPE_COMPONENT (0x4c)
+// that carries the inline fill + line. GT-confirmed offsets:
+//   gso CTRL_HEADER  off 28-35 = outer margin, 4× u16 L/R/T/B HWPUNIT (same
+//                                layout as the table outer margin)
+//   SHAPE_COMPONENT  off 196 = border (line) color, u32 BGR (0x00BBGGRR)
+//                    off 200 = border (line) width, u16 HWPUNIT
+//                    off 213 = fill color, u32 BGR
+// Verified: --fill #FF0000 → 0x000000FF @213, --border #0000FF → 0x00FF0000
+// @196, --border-width 2mm → 566 @200, --margin 4mm → 1133×4 @28. Section 0 only.
+//
+// Each op: { object_index?, fill?, border_color?, border_width_mm?,
+//            margins?:[l,r,t,b] | margin_mm? }.
+const GSO_CTRL_ID = ' osg'; // "gso " stored reversed (little-endian ctrl_id)
+const GSO_OUTMARGIN_OFF = 28;
+// Object position (floating objects). GT-confirmed (object-prop --pos "80,120"):
+// gso CTRL off8 = vertical offset (y), off12 = horizontal offset (x), u32 HWPUNIT.
+const GSO_POS_Y_OFF = 8;
+const GSO_POS_X_OFF = 12;
+const COMP_BORDER_COLOR_OFF = 196;
+const COMP_BORDER_WIDTH_OFF = 200;
+const COMP_FILL_OFF = 213;
+const COMP_FILL_ALPHA_OFF = 229; // fill transparency: alpha byte = round(t% × 255/100)
+const COMP_BORDER_TYPE_OFF = 204; // line style byte = 0x40 | enum
+// GT-confirmed (object-prop --border-type, .hwp download). claw-hancomdocs already
+// corrects Hancom's UI dash↔dot combo swap, so these are the standard values —
+// no swap needed here.
+const BORDER_TYPE = {
+  solid: 0x41, dotted: 0x42, dashed: 0x43, 'dash-dot': 0x44,
+  'dash-dot-dot': 0x45, 'long-dash': 0x46, 'circle-dot': 0x47, double: 0x48,
+};
+const COMP_HATCH_COLOR_OFF = 217; // fill pattern (hatch) color, u32 BGR
+const COMP_HATCH_STYLE_OFF = 221; // fill pattern (hatch) style, u32 (0xFFFFFFFF = none)
+// GT-confirmed (object-prop --fill-pattern, .hwp download). 0xFFFFFFFF = solid (no
+// hatch); 0-5 = hatch style.
+const FILL_PATTERN = {
+  horizontal: 0, vertical: 1, 'down-diagonal': 2, 'up-diagonal': 3, grid: 4, cross: 5,
+};
+// Line arrow endpoints (선 끝모양). GT-confirmed on a Hancom-native line: head
+// style @205, tail style @206 (enum), and a flag byte @207 whose 0x10 bit = "has
+// arrow". none 0 / triangle 1 / line 2 / sharp 3 / diamond 4 / circle 5 / square 6.
+// (Arrows are a line/connector property — Hancom ignores them on closed shapes.)
+const COMP_ARROW_HEAD_OFF = 205;
+const COMP_ARROW_TAIL_OFF = 206;
+const COMP_ARROW_FLAG_OFF = 207;
+const ARROW_STYLE = { none: 0, triangle: 1, line: 2, sharp: 3, diamond: 4, circle: 5, square: 6 };
+
+// Each drawing object = its gso CTRL_HEADER + the SHAPE_COMPONENT (0x4c) that
+// immediately follows it (holds the inline fill/line).
+function findGsoObjects(records, secRaw) {
+  const out = [];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1 && r.size >= GSO_OUTMARGIN_OFF + 8
+        && secRaw.slice(r.dataOff, r.dataOff + 4).toString('latin1') === GSO_CTRL_ID) {
+      let comp = null;
+      for (let j = i + 1; j < records.length; j++) {
+        const rj = records[j];
+        if (rj.tag === TAG_PARA_HEADER && rj.level === 0) break;
+        if (rj.tag === TAG_CTRL_HEADER && rj.level === 1) break;
+        if (rj.tag === TAG_SHAPE_COMPONENT) { comp = rj; break; }
+      }
+      out.push({ ctrl: r, comp });
+    }
+  }
+  return out;
+}
+
+export async function applyObjectPropertyInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`set_object_property: only section 0 is supported (got ${op.section})`);
+    const has = op.fill != null || op.border_color != null || op.border_width_mm != null
+      || Array.isArray(op.margins) || op.margin_mm != null || op.wrap != null
+      || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null
+      || op.arrow_start != null || op.arrow_end != null
+      || op.pos_x_mm != null || op.pos_y_mm != null;
+    if (!has) throw new Error('set_object_property: at least one of fill / border_color / border_width_mm / border_type / fill_pattern / arrow_start / arrow_end / margins / margin_mm / wrap / fill_transparency is required');
+    for (const k of ['arrow_start', 'arrow_end']) {
+      if (op[k] != null && ARROW_STYLE[String(op[k]).toLowerCase()] == null) {
+        throw new Error(`set_object_property: ${k} must be one of ${Object.keys(ARROW_STYLE).join(' / ')}`);
+      }
+    }
+    if (op.fill_transparency != null && (op.fill_transparency < 0 || op.fill_transparency > 100)) {
+      throw new Error('set_object_property: fill_transparency must be 0-100');
+    }
+    if (op.border_type != null && BORDER_TYPE[String(op.border_type).toLowerCase()] == null) {
+      throw new Error(`set_object_property: border_type must be one of ${Object.keys(BORDER_TYPE).join(' / ')}`);
+    }
+    if (op.fill_pattern != null && op.fill_pattern !== 'none' && FILL_PATTERN[String(op.fill_pattern).toLowerCase()] == null) {
+      throw new Error(`set_object_property: fill_pattern must be 'none' or one of ${Object.keys(FILL_PATTERN).join(' / ')}`);
+    }
+    if (Array.isArray(op.margins) && op.margins.length !== 4) {
+      throw new Error('set_object_property: margins must be [left,right,top,bottom] (4 values, mm)');
+    }
+    if (op.wrap != null && TABLE_WRAP[String(op.wrap).toLowerCase()] == null) {
+      throw new Error('set_object_property: wrap must be inline / square / topbottom / behind / front');
+    }
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const mm = (v) => Math.round(v * HWPUNIT_PER_MM);
+  const summary = [];
+  for (const op of ops) {
+    const records = parseRecords(secRaw);
+    const objs = findGsoObjects(records, secRaw);
+    const idx = op.object_index ?? 0;
+    if (idx < 0 || idx >= objs.length) {
+      throw new Error(`set_object_property: object_index ${idx} out of range (found ${objs.length} drawing object(s))`);
+    }
+    const { ctrl, comp } = objs[idx];
+    const rec = { op: 'set_object_property', object_index: idx };
+    if (Array.isArray(op.margins) || op.margin_mm != null) {
+      const margins = Array.isArray(op.margins)
+        ? op.margins
+        : [op.margin_mm, op.margin_mm, op.margin_mm, op.margin_mm];
+      for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, ctrl.dataOff + GSO_OUTMARGIN_OFF + i * 2);
+      rec.margins_mm = margins;
+    }
+    if (op.pos_x_mm != null) { secRaw.writeUInt32LE(mm(op.pos_x_mm) >>> 0, ctrl.dataOff + GSO_POS_X_OFF); rec.pos_x_mm = op.pos_x_mm; }
+    if (op.pos_y_mm != null) { secRaw.writeUInt32LE(mm(op.pos_y_mm) >>> 0, ctrl.dataOff + GSO_POS_Y_OFF); rec.pos_y_mm = op.pos_y_mm; }
+    if (op.wrap != null) {
+      // Object text-wrap = the gso CTRL_HEADER attribute, GT-confirmed to use the
+      // SAME bit field as the table (mask 0x600001: bit0 like-char + bits 21-22).
+      const bits = TABLE_WRAP[String(op.wrap).toLowerCase()];
+      const attr = secRaw.readUInt32LE(ctrl.dataOff + 4);
+      secRaw.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | bits) >>> 0, ctrl.dataOff + 4);
+      rec.wrap = String(op.wrap).toLowerCase();
+    }
+    if (op.fill != null || op.border_color != null || op.border_width_mm != null
+        || op.fill_transparency != null || op.border_type != null || op.fill_pattern != null
+        || op.arrow_start != null || op.arrow_end != null) {
+      if (!comp) throw new Error(`set_object_property: no SHAPE_COMPONENT for object ${idx} (fill/border need a shape)`);
+      if (op.arrow_start != null) {
+        secRaw.writeUInt8(ARROW_STYLE[String(op.arrow_start).toLowerCase()], comp.dataOff + COMP_ARROW_HEAD_OFF);
+        rec.arrow_start = String(op.arrow_start).toLowerCase();
+      }
+      if (op.arrow_end != null) {
+        secRaw.writeUInt8(ARROW_STYLE[String(op.arrow_end).toLowerCase()], comp.dataOff + COMP_ARROW_TAIL_OFF);
+        rec.arrow_end = String(op.arrow_end).toLowerCase();
+      }
+      if (op.arrow_start != null || op.arrow_end != null) {
+        const head = secRaw.readUInt8(comp.dataOff + COMP_ARROW_HEAD_OFF);
+        const tail = secRaw.readUInt8(comp.dataOff + COMP_ARROW_TAIL_OFF);
+        let flag = secRaw.readUInt8(comp.dataOff + COMP_ARROW_FLAG_OFF);
+        flag = (head || tail) ? (flag | 0x10) : (flag & ~0x10);
+        secRaw.writeUInt8(flag & 0xFF, comp.dataOff + COMP_ARROW_FLAG_OFF);
+      }
+      if (op.border_type != null) {
+        secRaw.writeUInt8(BORDER_TYPE[String(op.border_type).toLowerCase()], comp.dataOff + COMP_BORDER_TYPE_OFF);
+        rec.border_type = String(op.border_type).toLowerCase();
+      }
+      if (op.fill_pattern != null) {
+        const style = op.fill_pattern === 'none' ? 0xFFFFFFFF : FILL_PATTERN[String(op.fill_pattern).toLowerCase()];
+        secRaw.writeUInt32LE(style >>> 0, comp.dataOff + COMP_HATCH_STYLE_OFF);
+        if (op.fill_pattern_color != null) {
+          secRaw.writeUInt32LE(parseColorBGR(op.fill_pattern_color) >>> 0, comp.dataOff + COMP_HATCH_COLOR_OFF);
+        }
+        rec.fill_pattern = String(op.fill_pattern).toLowerCase();
+      }
+      if (op.fill != null && op.fill !== 'none') {
+        secRaw.writeUInt32LE(parseColorBGR(op.fill) >>> 0, comp.dataOff + COMP_FILL_OFF);
+        rec.fill = op.fill;
+      }
+      if (op.border_color != null) {
+        secRaw.writeUInt32LE(parseColorBGR(op.border_color) >>> 0, comp.dataOff + COMP_BORDER_COLOR_OFF);
+        rec.border_color = op.border_color;
+      }
+      if (op.border_width_mm != null) {
+        secRaw.writeUInt16LE(mm(op.border_width_mm) & 0xFFFF, comp.dataOff + COMP_BORDER_WIDTH_OFF);
+        rec.border_width_mm = op.border_width_mm;
+      }
+      // Fill transparency (0-100%): alpha byte = round(t × 255/100). GT-confirmed
+      // (--fill-transparency 60 → 153 @229). 0 = opaque.
+      if (op.fill_transparency != null) {
+        secRaw.writeUInt8(Math.round(op.fill_transparency * 255 / 100) & 0xFF, comp.dataOff + COMP_FILL_ALPHA_OFF);
+        rec.fill_transparency = op.fill_transparency;
+      }
+    }
+    summary.push(rec);
+  }
+
+  // Deflate + write Section0 (only fixed-width fields changed → size unchanged).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
+}
+
+// ── 셀 너비/높이 같게 (equalize table columns / rows) raw-patch ────────────
+//
+// GT-first (eqw_1row.hwp, table-op equal-width on a single-row table): making
+// a uniform table's columns equal is a clean width set — each column becomes
+// tableWidth / cols, total preserved (verified: 19567+28623 → 24095+24095).
+// No re-grid: re-gridding (column-boundary union) only happens when a PARTIAL
+// selection misaligns rows; equalizing the WHOLE table keeps every row
+// aligned, so it stays a length-preserving LIST_HEADER width@16 / height@20
+// edit. Merged cells get span × the equal unit. Section0-only, no DocInfo.
+//
+// Each op: { section?, para?, control?, dim: 'width'|'height' }.
+export async function equalizeTableInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', equalized_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`equalize_table: only section 0 is supported (got ${op.section})`);
+  }
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    const dim = op.dim === 'height' ? 'height' : 'width';
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cols = secRaw.readUInt16LE(tableRec.dataOff + 6);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    if (dim === 'width') {
+      // Total = sum of widths of the cells in row 0 (covers all columns).
+      let total = 0;
+      for (const c of cells) if (c.row === 0) total += secRaw.readUInt32LE(c.lhDataOff + 16);
+      if (cols < 1 || total < 1) { summary.push({ para, control: ctrl, dim, cols, skipped: true }); continue; }
+      const unit = Math.floor(total / cols);
+      const rem = total - unit * cols; // give the remainder to the last column
+      for (const c of cells) {
+        let w = c.colSpan * unit;
+        if (c.col + c.colSpan >= cols) w += rem;
+        secRaw.writeUInt32LE(w >>> 0, c.lhDataOff + 16);
+      }
+      summary.push({ para, control: ctrl, dim, cols, unit });
+    } else {
+      let total = 0;
+      for (const c of cells) if (c.col === 0) total += secRaw.readUInt32LE(c.lhDataOff + 20);
+      if (rows < 1 || total < 1) { summary.push({ para, control: ctrl, dim, rows, skipped: true }); continue; }
+      const unit = Math.floor(total / rows);
+      const rem = total - unit * rows;
+      for (const c of cells) {
+        let h = c.rowSpan * unit;
+        if (c.row + c.rowSpan >= rows) h += rem;
+        secRaw.writeUInt32LE(h >>> 0, c.lhDataOff + 20);
+      }
+      summary.push({ para, control: ctrl, dim, rows, unit });
+    }
+  }
+
+  // Deflate + write Section0 (length-preserving — only width/height fields).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', equalized_count: summary.length });
+}
+
+// The TAG_TABLE record (table grid: rows, cols, and the per-row cell-count
+// array at body offset 18) for the table at (sectionParaIdx, controlIdx).
+function findTableRecord(records, sectionParaIdx, controlIdx) {
+  let para = -1, start = -1;
+  for (let i = 0; i < records.length; i++) {
+    if (records[i].tag === TAG_PARA_HEADER && records[i].level === 0) { para++; if (para === sectionParaIdx) { start = i; break; } }
+  }
+  if (start < 0) throw new Error(`merge_cells: paragraph ${sectionParaIdx} not found`);
+  let ctrl = -1, tStart = -1;
+  for (let i = start + 1; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_PARA_HEADER && r.level === 0) break;
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1) { ctrl++; if (ctrl === controlIdx) { tStart = i; break; } }
+  }
+  if (tStart < 0) throw new Error(`merge_cells: control ${controlIdx} not found`);
+  for (let i = tStart + 1; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_PARA_HEADER && r.level === 0) break;
+    if (r.tag === TAG_TABLE && r.level === 2) return r;
+  }
+  throw new Error('merge_cells: TABLE record not found');
+}
+
+// Byte range [startByte, endByte) of one cell's whole cluster (its level-2
+// LIST_HEADER record + the cell's paragraphs) — i.e. up to the next cell's
+// LIST_HEADER, or the end of the table.
+function cellClusterByteRange(records, secRaw, sectionParaIdx, controlIdx, cellIndex) {
+  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex);
+  const lhIdx = loc.listHeaderRec;
+  const startByte = records[lhIdx].headOff;
+  let endByte = secRaw.length;
+  for (let i = lhIdx + 1; i < records.length; i++) {
+    const r = records[i];
+    if ((r.tag === TAG_PARA_HEADER && r.level === 0) ||
+        (r.tag === TAG_CTRL_HEADER && r.level === 1) ||
+        (r.tag === TAG_LIST_HEADER && r.level === 2)) { endByte = r.headOff; break; }
+  }
+  return { startByte, endByte };
+}
+
+// Enumerate every cell of the table at (paraIdx, ctrlIdx): its grid address
+// (col@8, row@10, colSpan@12, rowSpan@14), the LIST_HEADER body offset, and the
+// cluster byte range [startByte, endByte) (LIST_HEADER + the cell's paragraphs).
+function tableCellRecords(records, secRaw, sectionParaIdx, controlIdx) {
+  let para = -1, start = -1;
+  for (let i = 0; i < records.length; i++) {
+    if (records[i].tag === TAG_PARA_HEADER && records[i].level === 0) { para++; if (para === sectionParaIdx) { start = i; break; } }
+  }
+  if (start < 0) throw new Error(`paragraph ${sectionParaIdx} not found`);
+  let ctrl = -1, tStart = -1;
+  for (let i = start + 1; i < records.length; i++) {
+    const r = records[i];
+    if (r.tag === TAG_PARA_HEADER && r.level === 0) break;
+    if (r.tag === TAG_CTRL_HEADER && r.level === 1) { ctrl++; if (ctrl === controlIdx) { tStart = i; break; } }
+  }
+  if (tStart < 0) throw new Error(`control ${controlIdx} not found in paragraph ${sectionParaIdx}`);
+  // table end = next level-0 PARA_HEADER or level-1 CTRL_HEADER
+  let tEnd = records.length;
+  for (let i = tStart + 1; i < records.length; i++) {
+    const r = records[i];
+    if ((r.tag === TAG_PARA_HEADER && r.level === 0) || (r.tag === TAG_CTRL_HEADER && r.level === 1)) { tEnd = i; break; }
+  }
+  const lhIdxs = [];
+  for (let i = tStart + 1; i < tEnd; i++) if (records[i].tag === TAG_LIST_HEADER && records[i].level === 2) lhIdxs.push(i);
+  return lhIdxs.map((recIdx, k) => {
+    const r = records[recIdx];
+    const nextHead = k + 1 < lhIdxs.length ? records[lhIdxs[k + 1]].headOff : (tEnd < records.length ? records[tEnd].headOff : secRaw.length);
+    return {
+      recIdx, lhDataOff: r.dataOff,
+      col: secRaw.readUInt16LE(r.dataOff + 8), row: secRaw.readUInt16LE(r.dataOff + 10),
+      colSpan: secRaw.readUInt16LE(r.dataOff + 12), rowSpan: secRaw.readUInt16LE(r.dataOff + 14),
+      startByte: r.headOff, endByte: nextHead,
+    };
+  });
+}
+
+/**
+ * Delete a whole table row (`delete_table_row`) from an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, row }`. GT-confirmed: TABLE
+ * rows−1 + its row-size array entry for `row` removed (record shrinks), the
+ * row's cell clusters deleted, every cell below renumbered (row−1), and any
+ * cell vertically spanning across the deleted row has its rowSpan−1. A cell
+ * that *starts* in the deleted row with rowSpan>1 is rejected (unmerge first).
+ * Section 0 only.
+ */
+export async function deleteTableRowInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', deleted_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`delete_table_row: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row)) throw new Error("delete_table_row: 'row' (integer) is required");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0, delRow = op.row;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    if (delRow < 0 || delRow >= rows) throw new Error(`delete_table_row: row ${delRow} out of range (table has ${rows} rows)`);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    const removeRanges = [];
+    for (const c of cells) {
+      if (c.row === delRow) {
+        if (c.rowSpan > 1) throw new Error(`delete_table_row: cell (${c.row},${c.col}) spans down (rowSpan ${c.rowSpan}) through row ${delRow} — unmerge first`);
+        removeRanges.push({ startByte: c.startByte, endByte: c.endByte });
+      } else if (c.row < delRow && c.row + c.rowSpan > delRow) {
+        secRaw.writeUInt16LE((c.rowSpan - 1) & 0xFFFF, c.lhDataOff + 14); // spans across → rowSpan−1
+      } else if (c.row > delRow) {
+        secRaw.writeUInt16LE((c.row - 1) & 0xFFFF, c.lhDataOff + 10);     // below → row−1
+      }
+    }
+
+    // Rebuild the TABLE record: rows−1, drop the deleted row's row-size entry.
+    const oldBody = secRaw.slice(tableRec.dataOff, tableRec.dataOff + tableRec.size);
+    const cut = 18 + delRow * 2;
+    const newBody = Buffer.concat([oldBody.slice(0, cut), oldBody.slice(cut + 2)]);
+    newBody.writeUInt16LE((rows - 1) & 0xFFFF, 4);
+    const newTableRec = Buffer.concat([buildRecordHeader(TAG_TABLE, 2, newBody.length), newBody]);
+
+    // Apply all splices high→low so earlier offsets stay valid (TABLE record is
+    // at the lowest offset, so it's applied last). Renumber writes above were
+    // in-place on survivor cells (preserved through the concats).
+    const splices = [
+      { start: tableRec.headOff, end: tableRec.dataOff + tableRec.size, repl: newTableRec },
+      ...removeRanges.map((r) => ({ start: r.startByte, end: r.endByte, repl: Buffer.alloc(0) })),
+    ].sort((a, b) => b.start - a.start);
+    for (const s of splices) secRaw = Buffer.concat([secRaw.slice(0, s.start), s.repl, secRaw.slice(s.end)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, row: delRow, removed: removeRanges.length });
+  }
+  return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
+}
+
+/**
+ * Split one table cell into N stacked rows (`split_cell`) in an existing
+ * `.hwp` via raw-patch. Op: `{ section?, para?, control?, row, col, into_rows? }`
+ * (into_rows default 2). GT-confirmed (Hancom 셀 나누기, 3 samples): the cell
+ * keeps its content as the top piece; N−1 new blank cells appear below it in
+ * the same column; every OTHER cell in the row grows rowSpan by N−1 to keep the
+ * grid rectangular; the table gains N−1 rows (each new row-size entry = 1, since
+ * only the split column has a fresh cell there); cells below are renumbered.
+ * Only a plain 1×1 cell can be split. Section 0 only. (Vertical split only —
+ * the Hancom tool emits this regardless of its row/col args.)
+ */
+export async function splitCellInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', split_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`split_cell: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row) || !Number.isInteger(op.col)) throw new Error("split_cell: 'row' and 'col' (integers) are required");
+    if (op.into_rows != null && (!Number.isInteger(op.into_rows) || op.into_rows < 2)) throw new Error('split_cell: into_rows must be an integer ≥ 2');
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0, R = op.row, C = op.col, N = op.into_rows ?? 2;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+    const target = cells.find((c) => c.row === R && c.col === C);
+    if (!target) throw new Error(`split_cell: cell (${R},${C}) not found`);
+    if (target.colSpan > 1 || target.rowSpan > 1) throw new Error(`split_cell: cell (${R},${C}) is merged (${target.colSpan}×${target.rowSpan}) — only a plain 1×1 cell can be split`);
+
+    // other cells in the same row grow rowSpan by N−1 (keep grid rectangular)
+    for (const c of cells) if (c.row === R && c.col !== C) secRaw.writeUInt16LE((c.rowSpan + N - 1) & 0xFFFF, c.lhDataOff + 14);
+    // cells below shift down
+    for (const c of cells) if (c.row > R) secRaw.writeUInt16LE((c.row + N - 1) & 0xFFFF, c.lhDataOff + 10);
+
+    // N−1 new blank cells at (R+1..R+N−1, C), cloned from an empty cell in col C
+    const make = cellCloner(cells, secRaw, C);
+    if (!make) throw new Error(`split_cell: no plain 1×1 cell to clone for the new cell(s)`);
+    const newCells = [];
+    for (let k = 1; k < N; k++) newCells.push(make(R + k, C));
+    const newCellsBuf = Buffer.concat(newCells);
+    let insOff = null;
+    for (const c of cells) { if (c.row >= R + 1) { insOff = c.startByte; break; } }
+    if (insOff == null) insOff = cells.length ? cells[cells.length - 1].endByte : (tableRec.dataOff + tableRec.size);
+
+    // TABLE: rows + (N−1); insert (N−1) row-size entries (=1) at index R+1
+    const oldBody = secRaw.slice(tableRec.dataOff, tableRec.dataOff + tableRec.size);
+    const insAt = 18 + (R + 1) * 2;
+    const rsEntries = Buffer.alloc((N - 1) * 2); for (let k = 0; k < N - 1; k++) rsEntries.writeUInt16LE(1, k * 2);
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), rsEntries, oldBody.slice(insAt)]);
+    newBody.writeUInt16LE((rows + N - 1) & 0xFFFF, 4);
+    const newTableRec = Buffer.concat([buildRecordHeader(TAG_TABLE, 2, newBody.length), newBody]);
+
+    const splices = [
+      { start: insOff, end: insOff, repl: newCellsBuf },
+      { start: tableRec.headOff, end: tableRec.dataOff + tableRec.size, repl: newTableRec },
+    ].sort((a, b) => b.start - a.start);
+    for (const s of splices) secRaw = Buffer.concat([secRaw.slice(0, s.start), s.repl, secRaw.slice(s.end)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, row: R, col: C, into_rows: N });
+  }
+  return Object.assign(summary, { mode: 'in-place', split_count: summary.length });
+}
+
+// True if a cell cluster holds just an empty paragraph (PARA_HEADER text_count
+// ≤ 1 = the EOP terminator only) — safe to clone as a fresh blank cell.
+function isEmptyCellCluster(clusterBytes) {
+  for (const r of parseRecords(clusterBytes)) {
+    if (r.tag === TAG_PARA_HEADER && r.level === 2) {
+      return (clusterBytes.readUInt32LE(r.dataOff) & 0x7FFFFFFF) <= 1;
+    }
+  }
+  return false;
+}
+
+// Clone a cell cluster, overwriting its LIST_HEADER grid address (col@8, row@10).
+function cloneCellCluster(clusterBytes, newRow, newCol) {
+  const out = Buffer.from(clusterBytes);
+  const lh = parseRecords(out).find((r) => r.tag === TAG_LIST_HEADER && r.level === 2);
+  if (!lh) throw new Error('cloneCellCluster: no LIST_HEADER in cluster');
+  out.writeUInt16LE(newCol & 0xFFFF, lh.dataOff + 8);
+  out.writeUInt16LE(newRow & 0xFFFF, lh.dataOff + 10);
+  return out;
+}
+
+// Build a blank cell by cloning a cell (even a non-empty one) and stripping it
+// down to a single empty paragraph — the FALLBACK for a fully-populated table
+// with no empty 1×1 cell to clone. Keeps the source cell's width/borderFill (so
+// the new cell matches its column) but reduces its content to one empty
+// paragraph (char_count 1 = just the 0x000d EOP) so the result satisfies
+// isEmptyCellCluster. nParagraphs→1, col@8/row@10 rewritten to (newRow, newCol);
+// the first paragraph's PARA_CHAR_SHAPE / PARA_LINE_SEG are kept (so the cell
+// looks like a real Hancom cell — line layout is recomputed on render).
+function emptyCellClusterFromClone(clusterBytes, newRow, newCol) {
+  const recs = parseRecords(clusterBytes);
+  const lh = recs.find((r) => r.tag === TAG_LIST_HEADER && r.level === 2);
+  if (!lh) throw new Error('emptyCellClusterFromClone: no LIST_HEADER in cluster');
+  const phIdx = recs.findIndex((r) => r.tag === TAG_PARA_HEADER && r.level === 2 && r.headOff > lh.headOff);
+  if (phIdx < 0) throw new Error('emptyCellClusterFromClone: no cell paragraph');
+  // The first paragraph runs [phIdx, endIdx) — up to the next level-2 PARA_HEADER.
+  let endIdx = recs.length;
+  for (let i = phIdx + 1; i < recs.length; i++) { if (recs[i].tag === TAG_PARA_HEADER && recs[i].level === 2) { endIdx = i; break; } }
+  const out = [];
+  // LIST_HEADER record (verbatim) with nParagraphs→1 and the new grid address.
+  const lhRec = Buffer.from(clusterBytes.slice(lh.headOff, recs[phIdx].headOff));
+  const lhBody = lh.dataOff - lh.headOff;
+  lhRec.writeUInt16LE(1, lhBody + 0);                 // nParagraphs = 1
+  lhRec.writeUInt16LE(newCol & 0xFFFF, lhBody + 8);
+  lhRec.writeUInt16LE(newRow & 0xFFFF, lhBody + 10);
+  out.push(lhRec);
+  // Keep ONLY the first paragraph, reduced to a real Hancom EMPTY-cell shape:
+  //   PARA_HEADER (char_count 1) + PARA_CHAR_SHAPE + PARA_LINE_SEG, NO PARA_TEXT.
+  // A genuine empty cell paragraph OMITS the PARA_TEXT record entirely (just the
+  // implicit 0x000d EOP) and keeps its line seg; emitting a PARA_TEXT or dropping
+  // the line seg makes Hancom reject the file. The line seg is cloned from the
+  // source cell (same column → right width); Hancom recomputes layout on open.
+  for (let i = phIdx; i < endIdx; i++) {
+    const r = recs[i];
+    if (r.tag === TAG_PARA_TEXT) continue;               // omit — empty para has no text record
+    const recBytes = Buffer.from(clusterBytes.slice(r.headOff, r.dataOff + r.size));
+    const bodyOff = r.dataOff - r.headOff;
+    if (r.tag === TAG_PARA_HEADER) {
+      const flag = recBytes.readUInt32LE(bodyOff) & 0x80000000;
+      recBytes.writeUInt32LE((flag | 1) >>> 0, bodyOff); // char_count = 1 (keep last-para flag)
+      out.push(recBytes);
+    } else {
+      out.push(recBytes);                                 // PARA_CHAR_SHAPE / PARA_LINE_SEG as-is
+    }
+  }
+  return Buffer.concat(out);
+}
+
+// Pick a cloneable 1×1 cell + a builder for a new blank cell. The source MUST
+// carry the column's real width: rhwp emits header-row cells with a degenerate
+// width (1 HWPUNIT), and dropping a width-1 cell into a DATA row makes Hancom
+// reject the table as a grid-width mismatch (the data rows say the column is
+// ~20977, the new row says 1). So we pick the WIDEST 1×1 cell in `preferCol`
+// (the representative full-width cell), and clone it verbatim if it is already
+// empty, else clone+empty it. Returns make(row,col) → Buffer, or null if the
+// table has no plain 1×1 cell to clone.
+function cellCloner(cells, secRaw, preferCol) {
+  const width = (c) => secRaw.readUInt32LE(c.lhDataOff + 16);
+  const oneByOne = cells.filter((c) => c.colSpan === 1 && c.rowSpan === 1);
+  const inCol = oneByOne.filter((c) => c.col === preferCol);
+  const pool = inCol.length ? inCol : oneByOne;
+  if (!pool.length) return null;
+  const src = pool.reduce((a, b) => (width(b) > width(a) ? b : a)); // widest = real column width
+  const bytes = secRaw.slice(src.startByte, src.endByte);
+  return isEmptyCellCluster(bytes)
+    ? (row, col) => cloneCellCluster(bytes, row, col)
+    : (row, col) => emptyCellClusterFromClone(bytes, row, col);
+}
+
+/**
+ * Insert a blank table row (`insert_table_row`) into an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, row, position? }` where
+ * `position` = 'below' (default) or 'above' relative to `row`. GT-confirmed:
+ * TABLE rows+1 with a new row-size entry (value = cols) inserted at the new
+ * row's index (record grows), every cell at/after the new row renumbered
+ * (row+1), and `cols` blank cell clusters synthesized and spliced in. Each
+ * blank cell is cloned from an existing EMPTY 1×1 cell in that column (so it
+ * inherits the right width/border), with its address rewritten — no record
+ * field surgery. A column with no empty 1×1 cell to clone is rejected. Sec 0.
+ */
+export async function insertTableRowInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`insert_table_row: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row)) throw new Error("insert_table_row: 'row' (integer) is required");
+    if (op.position && op.position !== 'above' && op.position !== 'below') throw new Error("insert_table_row: position must be 'above' or 'below'");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cols = secRaw.readUInt16LE(tableRec.dataOff + 6);
+    if (op.row < 0 || op.row >= rows) throw new Error(`insert_table_row: row ${op.row} out of range (table has ${rows} rows)`);
+    const insertRow = (op.position ?? 'below') === 'below' ? op.row + 1 : op.row;
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    // synthesize the new row's blank cells (clone an empty 1×1 cell per column)
+    const newClusters = [];
+    for (let c = 0; c < cols; c++) {
+      const make = cellCloner(cells, secRaw, c);
+      if (!make) throw new Error(`insert_table_row: no plain 1×1 cell in the table to clone as the new cell`);
+      newClusters.push(make(insertRow, c));
+    }
+    const newCellsBuf = Buffer.concat(newClusters);
+
+    // document insertion point: before the first cell at/after the new row.
+    let insOff = null;
+    for (const cc of cells) { if (cc.row >= insertRow) { insOff = cc.startByte; break; } }
+    if (insOff == null) insOff = cells.length ? cells[cells.length - 1].endByte : (tableRec.dataOff + tableRec.size);
+
+    // renumber cells at/after the new row (in-place, before splicing)
+    for (const cc of cells) if (cc.row >= insertRow) secRaw.writeUInt16LE((cc.row + 1) & 0xFFFF, cc.lhDataOff + 10);
+
+    // TABLE record: rows+1 and a new row-size entry (cols) at index insertRow.
+    const oldBody = secRaw.slice(tableRec.dataOff, tableRec.dataOff + tableRec.size);
+    const insAt = 18 + insertRow * 2;
+    const entry = Buffer.alloc(2); entry.writeUInt16LE(cols, 0);
+    const newBody = Buffer.concat([oldBody.slice(0, insAt), entry, oldBody.slice(insAt)]);
+    newBody.writeUInt16LE((rows + 1) & 0xFFFF, 4);
+    const newTableRec = Buffer.concat([buildRecordHeader(TAG_TABLE, 2, newBody.length), newBody]);
+
+    const splices = [
+      { start: insOff, end: insOff, repl: newCellsBuf },
+      { start: tableRec.headOff, end: tableRec.dataOff + tableRec.size, repl: newTableRec },
+    ].sort((a, b) => b.start - a.start);
+    for (const s of splices) secRaw = Buffer.concat([secRaw.slice(0, s.start), s.repl, secRaw.slice(s.end)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, insertRow, added: cols });
+  }
+  return Object.assign(summary, { mode: 'in-place', inserted_count: summary.length });
+}
+
+/**
+ * Insert a blank table column (`insert_table_col`) into an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, col, position? }` where
+ * `position` = 'right' (default) or 'left' relative to `col`. GT-confirmed:
+ * TABLE cols+1, every cell to the right renumbered (col+1), a cell SPANNING
+ * across the new column gets colSpan+1 (so a merged title cell grows and that
+ * row gets no separate new cell), and every other row gets one blank cell
+ * cloned at the new column. Blank cells are cloned from an existing empty 1×1
+ * cell; a table with none is rejected. Section 0 only.
+ */
+export async function insertTableColInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', inserted_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`insert_table_col: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.col)) throw new Error("insert_table_col: 'col' (integer) is required");
+    if (op.position && op.position !== 'left' && op.position !== 'right') throw new Error("insert_table_col: position must be 'left' or 'right'");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const rows = secRaw.readUInt16LE(tableRec.dataOff + 4);
+    const cols = secRaw.readUInt16LE(tableRec.dataOff + 6);
+    if (op.col < 0 || op.col >= cols) throw new Error(`insert_table_col: col ${op.col} out of range (table has ${cols} cols)`);
+    const newCol = (op.position ?? 'right') === 'right' ? op.col + 1 : op.col;
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    // expand cells spanning across the new column; track which rows they cover.
+    const covered = new Set();
+    for (const c of cells) {
+      if (c.col < newCol && c.col + c.colSpan > newCol) {
+        secRaw.writeUInt16LE((c.colSpan + 1) & 0xFFFF, c.lhDataOff + 12);
+        for (let rr = c.row; rr < c.row + c.rowSpan; rr++) covered.add(rr);
+      }
+    }
+    // renumber cells to the right of the new column (in-place).
+    for (const c of cells) if (c.col >= newCol) secRaw.writeUInt16LE((c.col + 1) & 0xFFFF, c.lhDataOff + 8);
+
+    // one blank cell per uncovered row, at the new column.
+    const inserts = [];
+    for (let r = 0; r < rows; r++) {
+      if (covered.has(r)) continue;
+      // prefer an empty cell from the REFERENCE column (op.col) so the new
+      // column inherits a sensible width; if the table has no empty 1×1 cell at
+      // all, cellCloner clones any 1×1 cell and empties it.
+      const make = cellCloner(cells, secRaw, op.col);
+      if (!make) throw new Error(`insert_table_col: no plain 1×1 cell to clone for row ${r}`);
+      const cluster = make(r, newCol);
+      let off = null;
+      for (const cc of cells) { if (cc.row === r && cc.col >= newCol) { off = cc.startByte; break; } }
+      if (off == null) { const rc = cells.filter((cc) => cc.row === r); off = rc.length ? rc[rc.length - 1].endByte : (tableRec.dataOff + tableRec.size); }
+      inserts.push({ off, cluster });
+      const rsOff = tableRec.dataOff + 18 + r * 2;
+      secRaw.writeUInt16LE((secRaw.readUInt16LE(rsOff) + 1) & 0xFFFF, rsOff);
+    }
+    secRaw.writeUInt16LE((cols + 1) & 0xFFFF, tableRec.dataOff + 6); // TABLE cols+1 (in place)
+
+    inserts.sort((a, b) => b.off - a.off);
+    for (const ins of inserts) secRaw = Buffer.concat([secRaw.slice(0, ins.off), ins.cluster, secRaw.slice(ins.off)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, newCol, added: inserts.length });
+  }
+  return Object.assign(summary, { mode: 'in-place', inserted_count: summary.length });
+}
+
+/**
+ * Delete a whole table column (`delete_table_col`) from an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, col }`. GT-confirmed: TABLE
+ * cols−1 (in place — no record resize, unlike row delete), each affected row's
+ * cell-count decremented, the column's cell clusters deleted, every cell to the
+ * right renumbered (col−1), and any cell spanning across the column has its
+ * colSpan−1. A cell starting in the column with colSpan>1 is rejected. Sec 0.
+ */
+export async function deleteTableColInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', deleted_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`delete_table_col: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.col)) throw new Error("delete_table_col: 'col' (integer) is required");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0, delCol = op.col;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const cols = secRaw.readUInt16LE(tableRec.dataOff + 6);
+    if (delCol < 0 || delCol >= cols) throw new Error(`delete_table_col: col ${delCol} out of range (table has ${cols} cols)`);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+
+    const removeRanges = [];
+    for (const c of cells) {
+      if (c.col === delCol) {
+        if (c.colSpan > 1) throw new Error(`delete_table_col: cell (${c.row},${c.col}) spans right (colSpan ${c.colSpan}) from col ${delCol} — unmerge first`);
+        removeRanges.push({ startByte: c.startByte, endByte: c.endByte });
+        const off = tableRec.dataOff + 18 + c.row * 2;       // that row loses a cell
+        secRaw.writeUInt16LE(Math.max(0, secRaw.readUInt16LE(off) - 1), off);
+      } else if (c.col < delCol && c.col + c.colSpan > delCol) {
+        secRaw.writeUInt16LE((c.colSpan - 1) & 0xFFFF, c.lhDataOff + 12); // spans across → colSpan−1
+      } else if (c.col > delCol) {
+        secRaw.writeUInt16LE((c.col - 1) & 0xFFFF, c.lhDataOff + 8);      // right of it → col−1
+      }
+    }
+    secRaw.writeUInt16LE((cols - 1) & 0xFFFF, tableRec.dataOff + 6);      // TABLE cols−1 (in place)
+
+    removeRanges.sort((a, b) => b.startByte - a.startByte);
+    for (const r of removeRanges) secRaw = Buffer.concat([secRaw.slice(0, r.startByte), secRaw.slice(r.endByte)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, col: delCol, removed: removeRanges.length });
+  }
+  return Object.assign(summary, { mode: 'in-place', deleted_count: summary.length });
+}
+
+/**
+ * Merge a rectangular block of table cells into one, in `.hwp`, via raw-patch.
+ *
+ * Op `merge_cells`: `{ section?, para?, control?, from_row, from_col, to_row,
+ * to_col }`. GT-confirmed mechanism (diff of a Hancom table-op merge):
+ *   1. the top-left cell's LIST_HEADER gets colSpan = cols, rowSpan = rows;
+ *   2. every other cell in the block has its whole cluster (LIST_HEADER +
+ *      paragraphs) deleted — remaining cells keep their original col/row
+ *      addresses (no renumber);
+ *   3. the TABLE record's per-row cell-count array (body offset 18, one u16
+ *      per row) is decremented once per removed cell's row.
+ * Section 0 only.
+ */
+export async function mergeCellsInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', merged_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`merge_cells: only section 0 is supported (got section ${op.section})`);
+    for (const k of ['from_row', 'from_col', 'to_row', 'to_col']) {
+      if (!Number.isInteger(op[k])) throw new Error(`merge_cells: '${k}' (integer) is required`);
+    }
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0;
+    const r0 = Math.min(op.from_row, op.to_row), r1 = Math.max(op.from_row, op.to_row);
+    const c0 = Math.min(op.from_col, op.to_col), c1 = Math.max(op.from_col, op.to_col);
+    if (r0 === r1 && c0 === c1) throw new Error('merge_cells: region must span more than one cell');
+
+    const region = [];
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) region.push({ section: 0, para, control: ctrl, row: r, col: c });
+    const resolved = await resolveCellIndexes(filePath, region);
+
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    // 1. top-left cell → colSpan / rowSpan
+    const tl = resolved.find((e) => e.row === r0 && e.col === c0);
+    if (!tl) throw new Error(`merge_cells: top-left cell (${r0},${c0}) not resolved`);
+    const tlOff = records[locateCell(records, para, ctrl, tl.cellIndex).listHeaderRec].dataOff;
+    if (secRaw.readUInt16LE(tlOff + 8) !== c0 || secRaw.readUInt16LE(tlOff + 10) !== r0) {
+      throw new Error(`merge_cells: top-left cell-attr layout mismatch at (${r0},${c0})`);
+    }
+    secRaw.writeUInt16LE((c1 - c0 + 1) & 0xFFFF, tlOff + 12);  // colSpan
+    secRaw.writeUInt16LE((r1 - r0 + 1) & 0xFFFF, tlOff + 14);  // rowSpan
+
+    // 2/3. compute clusters to delete + decrement TABLE row-size (in-place,
+    // before any deletion — all offsets below are still original).
+    const tableRec = findTableRecord(records, para, ctrl);
+    const toRemove = resolved.filter((e) => !(e.row === r0 && e.col === c0));
+    const ranges = toRemove.map((e) => ({ row: e.row, ...cellClusterByteRange(records, secRaw, para, ctrl, e.cellIndex) }));
+    for (const rng of ranges) {
+      const off = tableRec.dataOff + 18 + rng.row * 2;
+      secRaw.writeUInt16LE(Math.max(0, secRaw.readUInt16LE(off) - 1), off);
+    }
+    // delete clusters high→low so earlier byte offsets stay valid.
+    ranges.sort((a, b) => b.startByte - a.startByte);
+    for (const rng of ranges) secRaw = Buffer.concat([secRaw.slice(0, rng.startByte), secRaw.slice(rng.endByte)]);
+
+    // writeback Section0 (length shrank).
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, from: [r0, c0], to: [r1, c1], removed: toRemove.length });
+  }
+  return Object.assign(summary, { mode: 'in-place', merged_count: summary.length });
+}
+
+/**
+ * Apply cell-level styling (background / border / diagonal) to existing `.hwp`
+ * table cells via raw-patch (no rhwp round-trip, Hancom-Docs-safe).
+ *
+ * Ops (by `type`):
+ *   - `set_cell_background` — `{ section?, para?, control?, row, col, background_color }`
+ *   - `set_cell_border`     — `{ ..., sides, color?, width?, line_type? }`
+ *   - `set_cell_diagonal`   — `{ ..., direction, color?, width?, line_type? }`
+ *       direction = 'slash' ／ | 'backslash' ＼ | 'x' ╳ (GT/capture-verified).
+ *   section/para/control default to 0 (first table on the first body paragraph
+ *   of Section0). row/col are 0-based; resolveCellIndexes maps them to a flat
+ *   cell index via rhwp — the same addressing set_cell_text uses.
+ *
+ * Mechanism: a cell's styling all lives in ONE BorderFill that its LIST_HEADER
+ * references (the borderFillID u16 at a FIXED offset 32 in the level-2
+ * LIST_HEADER body — NOT the last u16; see locateCell usage below). For each
+ * op we read the cell's current BorderFill body, MERGE only the requested
+ * change while preserving the rest (background keeps borders+diagonal; border
+ * keeps fill+diagonal; diagonal keeps fill+borders), append the result to
+ * DocInfo (or reuse an identical existing one), and repoint just this cell.
+ * Sibling cells keep their own BorderFill, so only the targeted cell changes.
+ *
+ * First cut: Section0 only (matching applyParagraphStyleInPlace). A non-zero
+ * section throws a clear error.
+ */
+export async function applyCellStyleInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) {
+    return Object.assign([], { mode: 'in-place', styled_count: 0 });
+  }
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) {
+      throw new Error(`${op.type}: only section 0 is supported in the raw-patch path (got section ${op.section})`);
+    }
+    if (op.type === 'set_cell_background' && !resolveBackgroundColor(op)) {
+      throw new Error('set_cell_background: background_color is required (e.g. "#dfe6f0")');
+    }
+    if (op.type === 'set_cell_border' && !op.sides) {
+      throw new Error('set_cell_border: sides is required ("all" or ["top","bottom","left","right"])');
+    }
+    if (op.type === 'set_cell_diagonal' && !(op.direction || op.kind)) {
+      throw new Error('set_cell_diagonal: direction is required (slash / backslash / x)');
+    }
+  }
+
+  // Resolve (row,col) → flat cellIndex via rhwp (same as set_cell_text).
+  const resolved = await resolveCellIndexes(filePath, ops);
+
+  let buf = readFileSync(filePath);
+  let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+  let fat = readFat(buf, fatAddrs, ssz);
+  const { entries } = readDirectory(buf, fat, ssz, dirStart);
+  let minifat = readMinifat(buf, fat, ssz, minifatStart);
+  let rootChain = null;
+  const ensureRootChain = () => {
+    if (rootChain) return rootChain;
+    if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) {
+      throw new Error('mini-stream needed but root entry has no chain');
+    }
+    rootChain = walkChain(fat, entries[0].start);
+    return rootChain;
+  };
+
+  const diEntry = findStreamEntry(entries, ['DocInfo']);
+  const diInMini = diEntry.size < 4096;
+  let diChain, diCompressed;
+  if (diInMini) {
+    const rc = ensureRootChain();
+    diChain = walkChain(minifat, diEntry.start);
+    diCompressed = readMiniChainBytes(buf, diChain, rc, ssz, mssz, diEntry.size);
+  } else {
+    diChain = walkChain(fat, diEntry.start);
+    diCompressed = readChainBytes(buf, diChain, ssz, diEntry.size);
+  }
+  let diRaw = Buffer.from(inflateRawSync(diCompressed));
+
+  const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+  const secInMini = secEntry.size < 4096;
+  let secChain, secCompressed;
+  if (secInMini) {
+    const rc = ensureRootChain();
+    secChain = walkChain(minifat, secEntry.start);
+    secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+  } else {
+    secChain = walkChain(fat, secEntry.start);
+    secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+  }
+  let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+  const summary = [];
+  for (const e of resolved) {
+    const para = e.para ?? 0;
+    const ctrl = e.control ?? 0;
+    const bg = resolveBackgroundColor(e);
+
+    // Re-parse per op: the only secRaw mutation below is a 2-byte in-place
+    // borderFillId write, which doesn't shift record offsets, so a fresh
+    // parse stays valid across ops.
+    const records = parseRecords(secRaw);
+    const loc = locateCell(records, para, ctrl, e.cellIndex);
+    const listRec = records[loc.listHeaderRec];
+    // A table-cell LIST_HEADER body lays out (after an 8-byte generic list
+    // header): col@8, row@10, colSpan@12, rowSpan@14, width@16, height@20,
+    // margins L/R/T/B @24/26/28/30, then borderFillID @32. The borderFillID
+    // is at a FIXED offset 32 — NOT the last u16. (rhwp emits exactly-34-byte
+    // cell bodies so size-2 lands on 32 by coincidence, but real-form cell
+    // bodies carry trailing bytes after the borderFillID; remapCluster's
+    // size-2 trick only works on rhwp's synthesized clusters.)
+    const CELL_BFID_OFFSET = 32;
+    if (listRec.size < CELL_BFID_OFFSET + 2) {
+      throw new Error(`set_cell_background: LIST_HEADER body too short (${listRec.size}b) for a table-cell borderFillID`);
+    }
+    // Self-check the layout: col@8 / row@10 must match the resolved cell, or
+    // the fixed offset assumption is wrong for this file — fail loudly rather
+    // than corrupt an unrelated u16.
+    const bodyCol = secRaw.readUInt16LE(listRec.dataOff + 8);
+    const bodyRow = secRaw.readUInt16LE(listRec.dataOff + 10);
+    if (bodyCol !== e.col || bodyRow !== e.row) {
+      throw new Error(`set_cell_background: cell-attr layout mismatch (body col/row ${bodyCol}/${bodyRow} != requested ${e.col}/${e.row}); borderFillID offset unreliable for this file`);
+    }
+    const bfRefOff = listRec.dataOff + CELL_BFID_OFFSET;
+    const curBfId = secRaw.readUInt16LE(bfRefOff);
+
+    // Base body to merge onto: the cell's current BorderFill (1-based;
+    // 0 = "no fill" sentinel → start from a full all-zero body, which carries
+    // the border+diagonal block and an explicit fill_type=0).
+    const bfBodies = readBorderFillBodies(diRaw);
+    const baseBody = (curBfId >= 1 && curBfId - 1 < bfBodies.length)
+      ? bfBodies[curBfId - 1]
+      : Buffer.alloc(53);
+
+    // Read-merge-write per op type — each preserves the parts it doesn't touch
+    // (background keeps borders/diagonal; border keeps fill/diagonal; diagonal
+    // keeps fill/borders).
+    let newBody;
+    if (e.type === 'set_cell_border') {
+      newBody = mergeBordersIntoBorderFillBody(
+        baseBody, e.sides ?? 'all',
+        e.color ?? e.border_color ?? '#000000',
+        LINE_TYPE[String(e.line_type ?? 'solid').toLowerCase()] ?? 1,
+        Number(e.width ?? 1));
+    } else if (e.type === 'set_cell_diagonal') {
+      newBody = mergeDiagonalIntoBorderFillBody(
+        baseBody, String(e.direction ?? e.kind).toLowerCase(),
+        e.color ?? e.diagonal_color ?? '#000000',
+        LINE_TYPE[String(e.line_type ?? 'solid').toLowerCase()] ?? 1,
+        Number(e.width ?? 1));
+    } else {
+      newBody = mergeSolidFillIntoBorderFillBody(baseBody, bg, e._bfPattern || 'rhwp');
+    }
+
+    // Dedup: reuse an identical existing BorderFill if present (1-based; 0
+    // means "not found" → append).
+    let newBfId = bfBodies.findIndex((b) => b.equals(newBody)) + 1;
+    if (newBfId === 0) {
+      const bfRes = appendBorderFillToDocInfo(diRaw, newBody);
+      diRaw = bfRes.newDi;
+      newBfId = bfRes.newBfId;
+    }
+
+    // Repoint just this cell.
+    secRaw.writeUInt16LE(newBfId & 0xFFFF, bfRefOff);
+
+    summary.push({
+      op: e.type, para, control: ctrl, cellIndex: e.cellIndex,
+      row: e.row, col: e.col,
+      background_color: bg, sides: e.sides ?? null, diagonal: e.direction ?? e.kind ?? null,
+      oldBfId: curBfId, newBfId,
+    });
+  }
+
+  // Deflate + write DocInfo (BorderFill run grew). Same mini/regular and
+  // mini→regular promotion handling as applyParagraphStyleInPlace.
+  {
+    const inMini = diInMini;
+    const capacity = inMini ? diChain.length * mssz : diChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        diRaw, diChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        diChain = ext.newRegularChain;
+        writeChainBytes(buf, diChain, ssz, ext.compressed);
+        buf.writeInt32LE(diChain[0], diEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        diChain = ext.miniChain;
+        writeMiniChainBytes(buf, diChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(diRaw, capacity, ssz, fat, fatAddrs, diChain, buf, false);
+      buf = ext.buf; fat = ext.fat; diChain = ext.chain;
+      writeChainBytes(buf, diChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, diEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, diEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  // Deflate + write Section0 (only cell borderFillId u16s changed, so size
+  // is unchanged — written back through the same path for uniformity).
+  {
+    const inMini = secInMini;
+    const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+    if (inMini) {
+      const ext = deflateMiniChainWithExpansion(
+        { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+        secRaw, secChain,
+      );
+      buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+      if (ext.promoted) {
+        secChain = ext.newRegularChain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+      } else {
+        rootChain = ext.rootChain;
+        secChain = ext.miniChain;
+        writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+      }
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    } else {
+      const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+      buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+      writeChainBytes(buf, secChain, ssz, ext.compressed);
+      buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+      buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+    }
+  }
+
+  writeFileSync(filePath, buf);
+  return Object.assign(summary, { mode: 'in-place', styled_count: summary.length });
 }
 
 /**

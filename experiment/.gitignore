@@ -1,0 +1,6 @@
+# secure-fill test run artifacts (never commit — may contain fixture PII / are machine-specific)
+cold-suite-results.json
+cold-suite.log
+*.log
+suite/
+_sfx_*
