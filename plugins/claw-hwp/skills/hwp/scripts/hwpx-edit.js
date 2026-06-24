@@ -3173,15 +3173,19 @@ function sealTableAdvanceMm(doc, tblInner) {
   return top + h + bot;
 }
 
-// Locate the (possibly NESTED) table cell whose own text contains `anchor`, and
-// return the seal origin (mm) measured from the TOP-LEVEL table's top-left,
-// accumulated down the nesting path (a table inside a cell sits at that cell's
-// content corner). Floating offsets are relative to the top-level table anchor,
-// so a deep cell is just the path sum — and the seal run can be spliced into the
-// top-level cell (its render position is offset-driven, not run-location-driven).
-// Without this, a signature cell inside a nested table matched the OUTER cell and
-// the stamp landed on the wrong (outer) row — the nested-cell-width bug.
-function sealDescend(doc, tblInner, anchor, accX, accY, H) {
+// Enumerate every (possibly NESTED) table cell whose text contains `anchor`, in
+// document order (rows top-to-bottom, cells left-to-right; nested tables at their
+// cell's position), pushing each one's seal geometry to `out`. Geometry (mm) is
+// measured from the TOP-LEVEL table's top-left, accumulated down the nesting path
+// (a table inside a cell sits at that cell's content corner) — floating offsets are
+// relative to the top-level table anchor, so a deep cell is just the path sum, and
+// the seal run is spliced into the TOP-LEVEL cell that holds it (geom.rc — its render
+// position is offset-driven, not run-location-driven). Each entry carries `rc` = the
+// top-level [ri,ci] to splice into (kept across recursion). Was a single-match return
+// before `occurrence`; the forward order + nested recursion + own()-tail attr reading
+// fix the nested-cell-width bug (a signature cell inside a nested table once matched
+// the OUTER cell and stamped the wrong row). `topRC` is internal (null at the top call).
+function sealDescend(doc, tblInner, anchor, accX, accY, H, out, topRC) {
   const ptxt = (inner) => (inner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((s) => s.replace(/<\/?hp:t>/g, '')).join('');
   // A cell's OWN cellAddr/cellSpan/cellSz/cellMargin come AFTER its <hp:subList>.
   // If the cell holds a NESTED table, that table's cellAddr/Sz/... sit inside the
@@ -3190,7 +3194,7 @@ function sealDescend(doc, tblInner, anchor, accX, accY, H) {
   // the cell's last </hp:subList>. (This was the nested-cell-width bug.)
   const own = (ti) => { const k = ti.lastIndexOf('</hp:subList>'); return k >= 0 ? ti.slice(k) : ti; };
   const rows = scanTopLevel(tblInner, 'hp:tr');
-  if (!rows.length) return null;
+  if (!rows.length) return;
   const tblW = Number((tblInner.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
   const om = tblInner.match(/<hp:outMargin\b[^>]*\bleft="(\d+)"[^>]*\btop="(\d+)"/);
   const outL = om ? Number(om[1]) / H : 0;
@@ -3225,9 +3229,9 @@ function sealDescend(doc, tblInner, anchor, accX, accY, H) {
     }
     return h || 7;
   };
-  for (let ri = rows.length - 1; ri >= 0; ri--) {
+  for (let ri = 0; ri < rows.length; ri++) {
     const tcs = scanTopLevel(rows[ri].inner, 'hp:tc');
-    for (let ci = tcs.length - 1; ci >= 0; ci--) {
+    for (let ci = 0; ci < tcs.length; ci++) {
       const tc = tcs[ci];
       if (!ptxt(tc.inner).includes(anchor)) continue;
       const o = own(tc.inner);
@@ -3239,11 +3243,17 @@ function sealDescend(doc, tblInner, anchor, accX, accY, H) {
       const cmL = cm ? Number(cm[1]) / H : 1.41, cmR = cm ? Number(cm[2]) / H : 1.41, cmT = cm ? Number(cm[3]) / H : 1.41;
       const cellX = accX + outL + colX + cmL;     // content-left from top-level table top-left
       const cellTopY = accY + outT + rowY + cmT;   // content-top
-      // A table nested inside this cell that also carries the anchor → recurse.
-      const nested = scanTopLevel(tc.inner, 'hp:tbl').find((nt) => ptxt(nt.inner).includes(anchor));
-      if (nested) {
-        const deep = sealDescend(doc, nested.inner, anchor, cellX, cellTopY, H);
-        if (deep) return deep;
+      // rc = the TOP-LEVEL cell to splice into. At the section-level table that's this
+      // [ri,ci]; for a nested table keep the ancestor's (passed down as topRC).
+      const rc = topRC || { ri, ci };
+      // A table nested inside this cell that also carries the anchor → recurse; its
+      // matches map to this top-level cell (rc). Skip this cell's own paragraph then,
+      // since the anchor lives in the nested table, not this cell's own text.
+      const nestedTbls = scanTopLevel(tc.inner, 'hp:tbl').filter((nt) => ptxt(nt.inner).includes(anchor));
+      if (nestedTbls.length) {
+        const before = out.length;
+        for (const nt of nestedTbls) sealDescend(doc, nt.inner, anchor, cellX, cellTopY, H, out, rc);
+        if (out.length > before) continue;
       }
       const sub = scanTopLevel(tc.inner, 'hp:subList')[0];
       if (!sub) continue;
@@ -3256,10 +3266,9 @@ function sealDescend(doc, tblInner, anchor, accX, accY, H) {
       const originYMm = centred ? (accY + outT + rowY + (tcH / tcRs) / H / 2) : cellTopY;
       const alignH = sealParaAlign(doc, (p.attrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
       const boxWidthMm = Math.max(2, colWmm(tcCol) - cmL - cmR);
-      return { pInner: p.inner, originXMm: cellX, originYMm, boxWidthMm, vFactor: centred ? 0 : -0.08, alignH };
+      out.push({ pInner: p.inner, originXMm: cellX, originYMm, boxWidthMm, vFactor: centred ? 0 : -0.08, alignH, rc });
     }
   }
-  return null;
 }
 
 function opPlaceSeal(doc, op) {
@@ -3372,22 +3381,25 @@ function opPlaceSeal(doc, op) {
     return { sealMm, wMm, dx, dy, mode: ov ? 'overlap' : 'right' };
   };
   const r1 = (v) => Math.round(v * 10) / 10;
-  // 1) body top-level paragraphs (skip table-wrapper paragraphs). Free body text
-  // defaults to the PAGE frame so the stamp aligns ON the line: the PARA frame
-  // clamps a tall stamp to the line top (it then rests low), but PAGE has no
-  // such clamp. We compute the anchor line's distance from the page content top
-  // by summing the heights of the blocks above it (real paraPr line-spacing +
-  // 문단여백), then centre on the line. op.frame / dy_mm override.
-  for (const name of doc.sectionNames()) {
-    const xml = doc.read(name);
+  // occurrence (0-based, default 0) — when the SAME anchor (e.g. "(서명)") repeats
+  // across the form (a main signature line AND an attached 동의서 line, two cells,
+  // two free lines…), pick which match to stamp. We enumerate every anchor-bearing
+  // location — free body paragraphs and table cells (nested cells via sealDescend) —
+  // in true DOCUMENT order (by byte offset within each section, sections in order),
+  // so occurrence 0 is the first in reading order, matching the .hwp track. A single
+  // match (the common case) is unaffected. Granularity = an anchor-bearing location:
+  // a free top-level paragraph, or a top-level cell whose subtree holds the anchor
+  // (so two markers in different cells/tables/lines each count; the rare case of two
+  // markers nested inside ONE top-level cell counts as that one location).
+  const occ = op.occurrence != null ? Math.max(0, Math.floor(Number(op.occurrence))) : 0;
+  // Place the stamp on a FREE top-level paragraph. Free body text defaults to the
+  // PAGE frame so the stamp aligns ON the line: the PARA frame clamps a tall stamp to
+  // the line top (it then rests low), but PAGE has no such clamp — we compute the
+  // anchor line's distance from the page content top by summing the heights of the
+  // blocks above it (real paraPr line-spacing + 문단여백), then centre on the line.
+  // op.frame / dy_mm override.
+  const placePara = (name, blocks, k) => {
     const roomWidthMm = pageTextWidth(doc, name) / H;
-    const blocks = scanTopLevel(xml, 'hp:p');
-    let k = -1;
-    for (let i = 0; i < blocks.length; i++) {
-      if (blocks[i].inner.includes('<hp:tbl')) continue;
-      if (paraText(blocks[i].inner).includes(anchor)) { k = i; break; }
-    }
-    if (k < 0) continue;
     const p = blocks[k];
     const frm = userFrame || 'PAGE';
     let o;
@@ -3403,51 +3415,60 @@ function opPlaceSeal(doc, op) {
       o = { roomWidthMm }; // user forced PARA/PAPER (PARA rests low — its choice)
     }
     const { sealMm, wMm, dx, dy, mode } = calc(p.inner, o);
-    doc.write(name, dropLinesegs(spliceEl(xml, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, frm)}</hp:p>`)));
-    return { placed: true, anchor, mode, frame: frm.toLowerCase(), where: 'paragraph', size_mm: sealMm, width_mm: r1(wMm), dx_mm: r1(dx), dy_mm: r1(dy) };
-  }
-  // 2) table cells. sealDescend() finds the cell whose own text holds the anchor
-  // — recursing through NESTED tables — and returns the seal origin summed down
-  // the nesting path (relative to the top-level table's top-left). The seal run
-  // is then spliced into the TOP-LEVEL cell that contains the anchor: because the
-  // object is floating, its render position is the offset, not where the run
-  // lives, so we never have to rebuild deeply-nested XML.
+    doc.write(name, dropLinesegs(spliceEl(doc.read(name), p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, frm)}</hp:p>`)));
+    return { placed: true, anchor, mode, frame: frm.toLowerCase(), where: 'paragraph', occurrence: occ, size_mm: sealMm, width_mm: r1(wMm), dx_mm: r1(dx), dy_mm: r1(dy) };
+  };
+  // Place the stamp in a table cell. The seal run is spliced into the TOP-LEVEL cell
+  // that holds the anchor (geom.rc) — because the object is floating, its render
+  // position is the offset, not where the run lives, so we never rebuild nested XML.
+  const placeCell = (name, tbl, tblIndex, geom) => {
+    const { sealMm, wMm, dx, dy, mode } = calc(geom.pInner, {
+      originXMm: geom.originXMm,
+      originYMm: geom.originYMm,
+      boxWidthMm: geom.boxWidthMm,
+      roomWidthMm: geom.boxWidthMm,
+      vFactor: geom.vFactor,
+      alignH: geom.alignH,
+    });
+    const rows = scanTopLevel(tbl.inner, 'hp:tr');
+    const { ri, ci } = geom.rc;
+    const tcs = scanTopLevel(rows[ri].inner, 'hp:tc');
+    const tc = tcs[ci];
+    const sub = scanTopLevel(tc.inner, 'hp:subList')[0];
+    const p = scanTopLevel(sub.inner, 'hp:p')[0];
+    const newSub = `<hp:subList${sub.attrs}>${spliceEl(sub.inner, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, 'PARA')}</hp:p>`)}</hp:subList>`;
+    const newTc = `<hp:tc${tc.attrs}>${spliceEl(tc.inner, sub, newSub)}</hp:tc>`;
+    const newRow = `<hp:tr${rows[ri].attrs}>${spliceEl(rows[ri].inner, tc, newTc)}</hp:tr>`;
+    doc.write(name, dropLinesegs(spliceEl(doc.read(name), tbl, `<hp:tbl${tbl.attrs}>${spliceEl(tbl.inner, rows[ri], newRow)}</hp:tbl>`)));
+    return { placed: true, anchor, mode, where: 'cell', table: tblIndex, row: ri, col: ci, occurrence: occ, size_mm: sealMm, width_mm: r1(wMm), dx_mm: r1(dx), dy_mm: r1(dy) };
+  };
+  // Enumerate all anchor matches in document order (free paragraphs + table cells
+  // interleaved by byte offset within each section), then place the occ-th. Nothing
+  // is mutated until we place the selected one, so the elements' offsets stay valid.
+  const matches = [];
   for (const name of doc.sectionNames()) {
-    let xml = doc.read(name);
+    const xml = doc.read(name);
+    const blocks = scanTopLevel(xml, 'hp:p');
     const tbls = scanTopLevel(xml, 'hp:tbl');
-    for (let ti = tbls.length - 1; ti >= 0; ti--) {
+    const local = [];
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const b = blocks[bi];
+      if (b.inner.includes('<hp:tbl')) continue; // table-wrapper paragraph → handled via tbls
+      if (paraText(b.inner).includes(anchor)) local.push({ start: b.start, place: () => placePara(name, blocks, bi) });
+    }
+    for (let ti = 0; ti < tbls.length; ti++) {
       const tbl = tbls[ti];
       if (!paraText(tbl.inner).includes(anchor)) continue;
-      const geom = sealDescend(doc, tbl.inner, anchor, 0, 0, H);
-      if (!geom) continue;
-      const { sealMm, wMm, dx, dy, mode } = calc(geom.pInner, {
-        originXMm: geom.originXMm,
-        originYMm: geom.originYMm,
-        boxWidthMm: geom.boxWidthMm,
-        roomWidthMm: geom.boxWidthMm,
-        vFactor: geom.vFactor,
-        alignH: geom.alignH,
-      });
-      // Splice the seal run into the top-level cell that contains the anchor.
-      const rows = scanTopLevel(tbl.inner, 'hp:tr');
-      for (let ri = rows.length - 1; ri >= 0; ri--) {
-        const tcs = scanTopLevel(rows[ri].inner, 'hp:tc');
-        for (let ci = tcs.length - 1; ci >= 0; ci--) {
-          const tc = tcs[ci];
-          if (!paraText(tc.inner).includes(anchor)) continue;
-          const sub = scanTopLevel(tc.inner, 'hp:subList')[0];
-          const p = scanTopLevel(sub.inner, 'hp:p')[0];
-          const newSub = `<hp:subList${sub.attrs}>${spliceEl(sub.inner, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, 'PARA')}</hp:p>`)}</hp:subList>`;
-          const newTc = `<hp:tc${tc.attrs}>${spliceEl(tc.inner, sub, newSub)}</hp:tc>`;
-          const newRow = `<hp:tr${rows[ri].attrs}>${spliceEl(rows[ri].inner, tc, newTc)}</hp:tr>`;
-          xml = spliceEl(xml, tbl, `<hp:tbl${tbl.attrs}>${spliceEl(tbl.inner, rows[ri], newRow)}</hp:tbl>`);
-          doc.write(name, dropLinesegs(xml));
-          return { placed: true, anchor, mode, where: 'cell', table: ti, row: ri, col: ci, size_mm: sealMm, width_mm: r1(wMm), dx_mm: r1(dx), dy_mm: r1(dy) };
-        }
-      }
+      const found = [];
+      sealDescend(doc, tbl.inner, anchor, 0, 0, H, found, null);
+      for (const geom of found) local.push({ start: tbl.start, place: () => placeCell(name, tbl, ti, geom) });
     }
+    local.sort((a, b) => a.start - b.start);
+    for (const mtc of local) matches.push(mtc);
   }
-  throw new Error(`place_seal: anchor "${anchor}" not found in any paragraph or cell`);
+  if (!matches.length) throw new Error(`place_seal: anchor "${anchor}" not found in any paragraph or cell`);
+  if (occ >= matches.length) throw new Error(`place_seal: anchor "${anchor}" occurrence ${occ} not found (${matches.length} occurrence(s) of this anchor in the document — use occurrence 0..${matches.length - 1})`);
+  return matches[occ].place();
 }
 
 function placeObjectInCell(doc, tableIndex, row, col, objXml, opName) {
