@@ -3386,7 +3386,11 @@ async function readStdin() {
         if (!globalThis.__rhwp_loaded_for_template) {
           await rhwp.default({
             module_or_path: fs.readFileSync(
-              path.resolve(path.dirname(new URL(import.meta.url).pathname), "vendor/rhwp/rhwp_bg.wasm")
+              // Windows-safe: new URL(import.meta.url).pathname yields
+              // "/C:/.../scripts" → path.resolve prepends the drive → "C:\C:\..."
+              // (ENOENT). Reuse the module-level __dirname (fileURLToPath, line 32),
+              // same as the main init at line 110. Works on Win + Mac + Linux.
+              path.join(__dirname, "vendor", "rhwp", "rhwp_bg.wasm")
             ),
           });
           if (typeof globalThis.measureTextWidth !== "function") {
@@ -3473,7 +3477,9 @@ async function readStdin() {
               if (!globalThis.__rhwp_loaded_for_template) {
                 await rhwpForTable.default({
                   module_or_path: fs.readFileSync(
-                    path.resolve(path.dirname(new URL(import.meta.url).pathname), 'vendor/rhwp/rhwp_bg.wasm')
+                    // Windows-safe path (see note at the append_image init above):
+                    // reuse module-level __dirname instead of new URL().pathname.
+                    path.join(__dirname, 'vendor', 'rhwp', 'rhwp_bg.wasm')
                   ),
                 });
                 if (typeof globalThis.measureTextWidth !== 'function') {
