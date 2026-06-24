@@ -77,3 +77,37 @@ HWP 트랙이 개인정보로 서식 채우는 기능 `secure-fill`을 만들어
 **참고/제안:**
 - §4의 `cell-inspect.js describeTable`(다단락)·`create.js` 라벨 normalize 수정 → **HWPX는 불필요**. fill_template/replace_text를 이미 control/run-aware(fwSpace·멀티run·다단락)로 만들어둬서(commit `ca81380`) placeholder 경로가 그 문제를 우회함. label+offset 리졸버는 V2로 보류.
 - 잔여: secure 배터리에 `.hwpx` 전용 인젝션 케이스 추가(현재는 .hwp 폼 기준 + 수동 .hwpx 검증). 영구프로필 암호화도 양 트랙 공통 미결.
+
+---
+
+## 후속 요청 — `fit` 길이보존 (HWP 트랙, 2026-06-24, commit `bb02bfd`)
+
+> 한 줄: **secure-fill의 길이보존(작성란 글자수 유지)을 HWP는 `.hwp` 경로에 `fit`으로 넣었다. `.hwpx` 경로(`hwpx-edit.js`)에도 동일 in-tool 길이보존이 필요하다 — 너희 슬라이스.**
+
+### 왜 (secure-fill에선 필수, 선택 아님)
+위치잡이 셀 — **라벨 + 패딩 공백 + 끝 마커**(`(직인)`/`(인)` 같은 도장/서명 표식이 고정 컬럼에 박힌 칸) — 또는 고정폭 placeholder 칸은, 문단(셀 텍스트)을 **통째 교체**할 때 새 문자열 글자수가 원본과 다르면 **마커가 밀리고 줄바꿈/행이 늘어난다.** 일반 `set_cell_text`라면 에이전트가 "원본 읽고 세서 패딩 공백을 그만큼 지운다"로 처리하지만(SKILL `set_cell_text` 행 가이드), **secure-fill은 PII 값이 에이전트 컨텍스트에 안 들어가서 에이전트가 글자수를 셀 수 없다.** ⇒ **길이보존을 도구 안에서 자동으로** 해야 한다 (포맷 변환 `formatValue`와 같은 자리).
+
+### 알고리즘 (`.hwp` 구현 그대로 — `cell-patch.js` `fitValueIntoLayout` 참고)
+원본 셀 텍스트 `orig`, 넣을 값 `value`:
+1. `orig`에서 **공백 2칸 이상 런** 중 **가장 긴 것**을 찾는다 (정규식 `/ {2,}/g`, 최장 런의 시작 index·길이).
+2. 최장 런 길이 `< value.length` → 보존할 패딩이 부족 → `value` 그대로 쓴다(폴백).
+3. 충분 → 그 런에 `value`를 끼워넣고 **딱 `value.length`칸만큼 공백을 지운다.** 단 **앞 1칸은 남긴다**(라벨에 안 붙게): `keep = (런길이 > value.length) ? 1 : 0` → `orig[:idx+keep] + value + orig[idx+keep+value.length:]`. 총 글자수·라벨·끝 마커 모두 보존.
+4. **셀 문단이 inline control/개체를 품으면 skip**(`.hwp`는 codepoint<0x20 체크 → 무회귀). HWPX 등가 = 셀 `<hp:p>`가 `<hp:t>` 외에 `<hp:ctrl>`/`<hp:pic>` 등을 품으면 fit 적용 안 함(텍스트 깔끔히 격리 못 하면 그대로 쓰기).
+
+검증된 예: `기업명 :          (직인)`(공백10) + `리콘랩스` → `기업명 : 리콘랩스     (직인)` (len 19=19, 마커 제자리, 한컴 totalPages:1 렌더 정상).
+
+### HWPX 슬라이스로 할 일
+1. **`hwpx-edit.js` `set_cell_text` 핸들러에 `fit` 옵션 추가** — `op.fit`이면 셀의 기존 run 텍스트를 **합쳐서**(멀티 `<hp:t>` 가능 — 너희 `ca81380` run-aware 머신 재사용) `orig`로 보고 위 알고리즘 적용 후 써넣기. (placeholder식 `fill_template`은 토큰 치환이라 보통 위치잡이 아님 → 우선순위 낮음. 단 `기업명 : {{co}}        (직인)`처럼 placeholder가 패딩 레이아웃 안에 있으면 동일 밀림 발생 → V2 고려 항목으로만 메모.)
+2. **`secure-fill.mjs` `.hwpx` 분기 — `set_cell_text` op에 `fit` 기본 ON.** HWP가 `.hwp` 분기에 한 것과 동형:
+   ```js
+   // line ~261 .hwpx set_cell_text op
+   operations.push({ type:'set_cell_text', table:f.table, row:f.row, col:f.col, text:val, fit: f.fit ?? true });
+   ```
+   (패딩런 없으면 no-op이라 빈 칸/일반 칸엔 무해. 기본 ON인 이유 = secure-fill은 에이전트가 못 세니 자동이어야.)
+3. **검증** — 위치잡이 셀(라벨+패딩+`(직인)`) 있는 `.hwpx` 폼으로 fit fill → **길이 동일 + 마커 제자리 + 한컴 Tier-2 렌더 정상**. (한컴 캡처가 세션 락 누수로 `session_busy` 뜨면 detached 실행: `nohup node hancom.js capture --file X > /tmp/c.txt 2>&1 &` 후 결과파일 읽기.)
+
+### 참고
+- `.hwp` 구현: commit `bb02bfd` — `cell-patch.js`(`fitValueIntoLayout`+`applyCellText` `fit` 파라미터), `create.js`(set_cell_text·by_label non-append edit 리졸루션에 fit 스레드), `secure-fill.mjs` `.hwp` 분기(fit 기본 ON), `SKILL.md`(fit 옵션 문서화).
+- SKILL `set_cell_text` 행에 fit 옵션 + 수동 길이보존 가이드 둘 다 있음 — HWPX SKILL에도 동일 반영 권장.
+
+질문/회신은 이 아래에.
