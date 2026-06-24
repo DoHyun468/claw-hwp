@@ -15,6 +15,11 @@ import url from "node:url";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 
+// Port. Reads ONLY the claw-hwp-specific env var — deliberately NOT the generic
+// `process.env.PORT`, which other tools/shells set freely: honoring it would move
+// the server off 3737, the port Claude Code Desktop's preview pane auto-discovers
+// (so the pane would silently go blank). Set CLAW_HWP_PREVIEW_PORT to override when
+// 3737 is taken. (Cross-platform-safe as-is; do not "fix" this to add process.env.PORT.)
 const PORT = Number(process.env.CLAW_HWP_PREVIEW_PORT || 3737);
 const HOST = process.env.CLAW_HWP_PREVIEW_HOST || "127.0.0.1";
 

@@ -28,6 +28,7 @@ import {
   strFromU8,
   strToU8,
 } from "./vendor/fflate/index.mjs";
+import { describeTable, enumerateTables } from "./cell-inspect.js";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const requireCJS = createRequire(import.meta.url);
@@ -611,6 +612,8 @@ const HEADING_DEFAULTS = {
   // visible enough now. spacer paragraphs supplement vertical breathing.
   // Bumped 2026-06-17: 1300/800 read as "모자라" (insufficient) on Hancom — a
   // section heading needs a clear band above it and breathing room to its body.
+  // Values kept byte-identical to the HWPX track (shared §B default spec) so the
+  // rhwp builder emits the same spacing whether serialized to .hwp or .hwpx.
   1: { fontSize: 18,   color: "#1A1A1A", spacingBefore: 2200, spacingAfter: 1100 },
   2: { fontSize: 14,   color: "#2D2D2D", spacingBefore: 1700, spacingAfter: 900 },
   3: { fontSize: 12,   color: "#404040", spacingBefore: 1400, spacingAfter: 750 },
@@ -633,29 +636,62 @@ const LIST_SPACING_AFTER = 700;
 // but not airy para↔para rhythm.
 const BODY_SPACING_AFTER = 1000;
 
-// ── Themes ────────────────────────────────────────────────────────────────
-//
-// A theme bundles the document's *visual identity* — heading colour per level,
-// heading font, body font, an accent colour — so a caller picks a whole look
-// with one `theme` field instead of repeating font_family/color on every op.
-// Layout knobs (font SIZE, spacing) stay in HEADING_DEFAULTS: a theme restyles,
-// it does not re-flow the page.
-//
-// HARD RULE — fonts must come from Hancom Docs web's supported set or they
-// silently substitute in the web viewer (we are HWPX, font_family registers any
-// name in fontfaces, but the *renderer* only has the picker's fonts). The
-// authoritative 39-font GT lives in memory `hancom-web-font-list`; every font
-// below is from it. A caller passing a font outside that set still works — it
-// just may substitute on web; that is on them.
-//
-// `government` (default) === the exact prior behaviour: gov-style gray heading
-// gradient + NO font override (so rhwp's default 함초롬 renders, unchanged).
-// Per-op `color` / `font_family` ALWAYS beat the theme, and `theme_overrides`
-// deep-patches any field at the payload level — the "agent got user feedback,
-// tweak the look without defining a whole theme" fallback the user asked for.
-//
-// A null font means "do not override" (keep rhwp default) — only `government`
-// uses null; every other theme names real Hancom-web fonts.
+// Table cell inner margin. GT-confirmed (2026-06-21, hancomdocs capture A/B vs
+// the HWPX track): Hancom-web's .hwp renderer ignores the PER-CELL inner margin
+// and lays out cell content/height from the TABLE record's DEFAULT inMargin
+// instead. rhwp emits that default as left/right=510, top/bottom=141 → rows
+// render cramped no matter what padding we set on the cells. Post-export we set
+// the TABLE inMargin to 400 on ALL FOUR sides — byte-identical to the HWPX
+// track's <hp:cellMargin left/right/top/bottom="400"> (hasMargin=1) — so our
+// .hwp tables render with the same breathing room AND the same horizontal
+// padding. See setTableInMarginInPlace(). Per-cell paddings (append_table) are
+// kept at the same 400 so desktop Hancom (which honors per-cell) matches too.
+const TABLE_DEFAULT_INNER_MARGIN = 400;
+
+// Table outer BOTTOM margin (gap below a table). GT-matched to the HWPX track's
+// <hp:outMargin bottom="500"> (~10px). rhwp emits 283 (~1mm, ~5px) by default and
+// Hancom-web ignores the host paragraph's spacingAfter for a table-only paragraph,
+// so this is raw-patched into the table CTRL_HEADER post-export (see
+// setTableInMarginInPlace). Unscaled — it's a table-object attribute, not a paraPr
+// margin. Env override for empirical re-derivation only.
+const TABLE_OUTER_BOTTOM_MARGIN = Number(process.env.TABLE_OUTER_BOTTOM ?? 500);
+
+// .hwp paragraph-spacing render-match factor. GT-confirmed (2026-06-21, hancomdocs
+// capture A/B vs the HWPX track): the shared spacing constants above (HEADING_DEFAULTS,
+// BODY/LIST_SPACING_AFTER) are byte-identical to the HWPX track, but the two tracks
+// SERIALIZE them differently. The HWPX track wraps every paraPr margin in an
+// <hp:switch> whose rendered branch (<hp:default>) carries the constant scaled by
+// 0.7056 (e.g. H1 2200→1552, body-after 1000→706); Hancom-web renders that branch, so
+// a .hwpx heading sits ~0.7× as far from its neighbour as the raw constant would imply.
+// Our .hwp path writes the constant straight into PARA_SHAPE (1.0×), so an identical
+// document renders consistently LOOSER (+~7px per heading gap, ~+40px over a one-page
+// report). To land the SAME render we apply the same 0.7056 scale at the one chokepoint
+// where every heading/body/list margin reaches rhwp — WITHOUT editing the shared
+// constants (keeps the byte-identical merge surface intact, exactly like the HWPX track
+// keeps its constants raw and scales only on export). Applies to spacingBefore/After
+// only — lineSpacing is a PERCENT, identical in both tracks, and must stay unscaled.
+// Env overrides SCALE_BEFORE / SCALE_AFTER / SCALE_HEADING_AFTER are for empirical
+// re-derivation only; the defaults below are the locked values.
+// Empirically (band-for-band A/B vs the HWPX render): scaling EVERY before/after
+// margin uniformly by 0.7056 lands 14 of 16 row gaps exactly on the HWPX render, but
+// the body paragraph that immediately FOLLOWS a heading then sits too far below it.
+// That boundary is governed by the heading's spacingAfter, and because paragraphs
+// snapToGrid (="1", same as the HWPX track) it quantises NON-monotonically — shrinking
+// the heading's spacingAfter pushes the next body line down to a further grid line, so
+// the gap grows instead of shrinking. So spacingAfter on HEADINGS is left effectively
+// unscaled (it already lands ~right at 1.0×); everything else (all spacingBefore, plus
+// body/list/title spacingAfter) takes the 0.7056 render-match factor. Splitting the two
+// keeps all 16 gaps on the HWPX render. None of this touches the shared constants.
+const SCALE_BEFORE = Number(process.env.SCALE_BEFORE ?? 0.7056);
+const SCALE_AFTER = Number(process.env.SCALE_AFTER ?? 0.7056);
+const SCALE_HEADING_AFTER = Number(process.env.SCALE_HEADING_AFTER ?? 1.0);
+const scaleBy = (v, f) => (v == null ? v : Math.round(v * f));
+
+// ── Themes (heading colour + font) — shared with the HWPX track ──────────────
+// Ported byte-identical from the HWPX track (create.js is a shared file). Only the
+// rhwp-emit application (append_heading/paragraph colour+font via applyCharFormat →
+// binary CharShape) is used on the .hwp path; the .hwpx post-export patchers
+// (patchHwpxHeadings / patchHwpxTableHeaderFill …) are NOT part of the .hwp route.
 const THEMES = {
   government: {
     label: "정부·공문서 (회색, 기본값)",
@@ -850,8 +886,10 @@ function applyParaProps(doc, cursor, opts = {}) {
     // re-apply default fill on the next paragraph if it matters.
   };
   if (opts.lineSpacing != null) props.lineSpacing = opts.lineSpacing;
-  if (opts.spacingBefore != null) props.spacingBefore = opts.spacingBefore;
-  if (opts.spacingAfter != null) props.spacingAfter = opts.spacingAfter;
+  if (opts.spacingBefore != null) props.spacingBefore = scaleBy(opts.spacingBefore, SCALE_BEFORE);
+  if (opts.spacingAfter != null) {
+    props.spacingAfter = scaleBy(opts.spacingAfter, opts.isHeading ? SCALE_HEADING_AFTER : SCALE_AFTER);
+  }
   unwrap(
     doc.applyParaFormat(cursor.sec, cursor.para, JSON.stringify(props)),
     "applyParaFormat(props)",
@@ -1007,6 +1045,71 @@ const HANDLERS = {
     });
     applyParaBorders(doc, cursor, op);
     log.push(`append_paragraph (${cursor.charOffset} chars)`);
+  },
+
+  // Insert a Hancom equation (수식) from a Hancom equation script. rhwp's
+  // insertEquation builds a native HYhwpEQ object — the same equation engine
+  // Hancom's own editor uses — so every token in references/equation-syntax.md
+  // renders identically to the UI editor (verified: 21-case syntax sweep all
+  // embed + render). Routes through the rhwp emit path (NOT raw-patch), so it's
+  // a from-scratch / small-file feature like append_image.
+  append_equation(doc, op, cursor) {
+    const script = String(op.script ?? "").trim();
+    if (!script) throw new Error("append_equation: 'script' (Hancom equation script) is required");
+    startNewParagraph(doc, cursor);
+    const size = Number.isFinite(op.size) ? op.size : 1000;   // HWP units/100 (1000 ≈ 10pt)
+    const color = op.color ?? "#000000";
+    unwrap(
+      doc.insertEquation(cursor.sec, cursor.para, cursor.charOffset, script, size, color),
+      "insertEquation",
+    );
+    // Advance past the equation control so the next op splits after it.
+    try { cursor.charOffset = doc.getParagraphLength(cursor.sec, cursor.para); } catch {}
+    applyParaProps(doc, cursor, {
+      align: op.align,
+      spacingBefore: op.spacing_before ?? 0,
+      spacingAfter: op.spacing_after ?? BODY_SPACING_AFTER,
+    });
+    log.push(`append_equation (${script.length} chars)`);
+  },
+
+  // Header / footer (머리말 / 꼬리말). Document-level, via rhwp createHeaderFooter
+  // + insertTextInHeaderFooter — renders in Hancom (verified). apply_to 0 = both
+  // pages. Doesn't touch the body cursor. from-scratch / rhwp-emit path only.
+  set_header(doc, op, cursor) {
+    const text = String(op.text ?? "");
+    const applyTo = Number.isFinite(op.apply_to) ? op.apply_to : 0;
+    unwrap(doc.createHeaderFooter(cursor.sec, true, applyTo), "createHeaderFooter(header)");
+    if (text) unwrap(doc.insertTextInHeaderFooter(cursor.sec, true, applyTo, 0, 0, text), "insertTextInHeaderFooter(header)");
+    log.push(`set_header ("${truncForLog(text)}")`);
+  },
+  set_footer(doc, op, cursor) {
+    const text = String(op.text ?? "");
+    const applyTo = Number.isFinite(op.apply_to) ? op.apply_to : 0;
+    unwrap(doc.createHeaderFooter(cursor.sec, false, applyTo), "createHeaderFooter(footer)");
+    if (text) unwrap(doc.insertTextInHeaderFooter(cursor.sec, false, applyTo, 0, 0, text), "insertTextInHeaderFooter(footer)");
+    log.push(`set_footer ("${truncForLog(text)}")`);
+  },
+
+  // Footnote (각주). Attaches a footnote to the END of the current paragraph
+  // (the cursor) — add it right after the append_paragraph it should annotate.
+  // rhwp insertFootnote + insertTextInFootnote, renders in Hancom (verified).
+  append_footnote(doc, op, cursor) {
+    const text = String(op.text ?? "");
+    if (!text) throw new Error("append_footnote: 'text' is required");
+    const r = unwrap(doc.insertFootnote(cursor.sec, cursor.para, cursor.charOffset), "insertFootnote");
+    const ctrl = (r && typeof r.controlIdx === "number") ? r.controlIdx : 0;
+    unwrap(doc.insertTextInFootnote(cursor.sec, cursor.para, ctrl, 0, 0, text), "insertTextInFootnote");
+    try { cursor.charOffset = doc.getParagraphLength(cursor.sec, cursor.para); } catch {}
+    log.push(`append_footnote ("${truncForLog(text)}")`);
+  },
+
+  // Bookmark (책갈피) at the cursor — invisible nav/reference mark. rhwp addBookmark.
+  add_bookmark(doc, op, cursor) {
+    const name = String(op.name ?? "");
+    if (!name) throw new Error("add_bookmark: 'name' is required");
+    unwrap(doc.addBookmark(cursor.sec, cursor.para, cursor.charOffset, name), "addBookmark");
+    log.push(`add_bookmark ("${name}")`);
   },
 
   append_heading(doc, op, cursor) {
@@ -1268,6 +1371,11 @@ const HANDLERS = {
     //   a page (next paragraphs evaluate separately). Diagnosed via
     //   getPageRenderTree y-positions on a 3-table doc — page 2 had ~570pt
     //   empty bottom while a 150pt table waited on page 3.
+    // The gap BELOW the table is NOT set here: Hancom-web ignores the host
+    // paragraph's spacingAfter when the paragraph holds a table (verified — 500
+    // landed in the bytes but the render didn't budge). It's governed by the
+    // table object's outer BOTTOM margin instead, which setTableInMarginInPlace()
+    // raw-patches post-export to match the HWPX track. So keep both 0 here.
     try {
       doc.applyParaFormat(
         cursor.sec, tableParaIdx,
@@ -1938,80 +2046,10 @@ function resolveCellIdx(doc, sec, para, ctrl, op) {
   return idx;
 }
 
-// Walk a table's cells via getCellInfo until rhwp errors (= past last cell).
-// Returns { rowCount, colCount, cells: [{idx,row,col,rowSpan,colSpan,text}],
-//           indexByRowCol(r,c) } or null if the control isn't a table.
-function describeTable(doc, sec, para, ctrl) {
-  const cells = [];
-  let rowCount = 0, colCount = 0;
-  for (let i = 0; i < 10000; i++) {
-    let info;
-    try {
-      info = JSON.parse(doc.getCellInfo(sec, para, ctrl, i));
-    } catch {
-      break;
-    }
-    if (!info || typeof info.row !== "number") break;
-    let text = "";
-    try { text = doc.getTextInCell(sec, para, ctrl, i, 0, 0, 100000); } catch {}
-    cells.push({
-      idx: i,
-      row: info.row,
-      col: info.col,
-      rowSpan: info.rowSpan ?? 1,
-      colSpan: info.colSpan ?? 1,
-      text,
-    });
-    rowCount = Math.max(rowCount, info.row + (info.rowSpan ?? 1));
-    colCount = Math.max(colCount, info.col + (info.colSpan ?? 1));
-  }
-  if (cells.length === 0) return null;
-  const byRowCol = new Map();
-  for (const c of cells) byRowCol.set(`${c.row},${c.col}`, c.idx);
-  return {
-    rowCount,
-    colCount,
-    cells,
-    indexByRowCol(r, c) {
-      return byRowCol.get(`${r},${c}`);
-    },
-  };
-}
-
-// Walk every paragraph in every section, asking rhwp for table cells at
-// each (sec, para, ctrl) tuple. Returns [{sec, para, ctrl}] for every
-// table control encountered.
-//
-// Why we don't break on the first failing control index: a paragraph can
-// hold non-table controls (textboxes, pictures, fields) interleaved with
-// tables — government forms in particular use cover paragraphs that pack
-// a logo (ctrl 0), a checkbox (ctrl 1), a textbox (ctrl 2), and only
-// THEN the actual table (ctrl 3). rhwp errors "지정된 컨트롤이 표가
-// 아닙니다" for those non-table indices, which is a "skip" signal, not a
-// "no more controls" signal. We keep scanning up to MAX_CONTROL_IDX —
-// well past anything seen in real forms — and only stop on a different
-// error class. The cost is ~64 cheap wasm calls per paragraph, negligible.
-const MAX_CONTROL_IDX = 64;
-function enumerateTables(doc) {
-  const out = [];
-  const sectionCount = (() => {
-    try { return doc.getSectionCount(); } catch { return 1; }
-  })();
-  for (let sec = 0; sec < sectionCount; sec++) {
-    const paraCount = (() => {
-      try { return doc.getParagraphCount(sec); } catch { return 0; }
-    })();
-    for (let p = 0; p < paraCount; p++) {
-      for (let c = 0; c < MAX_CONTROL_IDX; c++) {
-        let info;
-        try { info = JSON.parse(doc.getCellInfo(sec, p, c, 0)); } catch { continue; }
-        if (!info || typeof info.row !== "number") continue;
-        out.push({ sec, para: p, ctrl: c });
-      }
-    }
-  }
-  return out;
-}
+// describeTable / enumerateTables / MAX_CONTROL_IDX live in ./cell-inspect.js
+// (imported at the top). They were moved out so the table-cell read sweep has
+// a single source shared with extract_text.js — read and write must walk
+// tables identically or in-place edits would target the wrong cell.
 
 function applyCellText(doc, sec, para, ctrl, cellIdx, cellPara, text) {
   // Read current cell text, then delete + insert. We avoid `replaceText`
@@ -2052,17 +2090,19 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
     const out = [];
     for (const op of ops) {
       if (op.type === 'set_cell_text') {
-        const sec = requireInt(op, 'section');
+        const sec = op.section ?? 0; // default section 0 — consistent with set_cell_background/border/etc.
         const para = requireInt(op, 'para');
         const ctrl = requireInt(op, 'control');
         const text = op.text ?? '';
+        const cellPara = op.cell_para ?? 0; // which paragraph inside a multi-paragraph cell (default first)
+        const clearObjects = !!op.clear_objects; // with text:"" — also remove inline objects in that paragraph
         if (op.row != null && op.col != null) {
-          out.push({ section: sec, para, control: ctrl, row: op.row, col: op.col, text });
+          out.push({ section: sec, para, control: ctrl, row: op.row, col: op.col, text, cell_para: cellPara, clear_objects: clearObjects });
         } else if (op.cell != null) {
           // Convert flat cellIndex back to (row, col) via rhwp inspect.
           if (!doc) doc = new HwpDocument(new Uint8Array(fs.readFileSync(filePath)));
           const info = JSON.parse(doc.getCellInfo(sec, para, ctrl, op.cell));
-          out.push({ section: sec, para, control: ctrl, row: info.row, col: info.col, text });
+          out.push({ section: sec, para, control: ctrl, row: info.row, col: info.col, text, cell_para: cellPara, clear_objects: clearObjects });
         } else {
           throw new Error("set_cell_text: provide row+col or cell");
         }
@@ -2072,6 +2112,12 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
       if (typeof op.label !== 'string' || op.label.length === 0) {
         throw new Error("set_cell_text_by_label: 'label' is required");
       }
+      // When NO offset is given, auto-target the value cell right after the label
+      // (col + the label cell's colSpan) — so "set_cell_text_by_label(상호, …)"
+      // fills the empty cell next to 상호 instead of overwriting the label, and a
+      // label that spans 2 cols (대표자 c6-7) still lands on c8. Pass an explicit
+      // col_offset/row_offset (incl. 0 to overwrite the label cell) to override.
+      const autoTarget = (op.row_offset == null && op.col_offset == null);
       const rowOff = op.row_offset ?? 0;
       const colOff = op.col_offset ?? 0;
       const occurrence = op.occurrence ?? 0;
@@ -2080,26 +2126,45 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
 
       const scoped = (op.section != null || op.para != null || op.control != null);
       const candidates = scoped
-        ? [{ sec: requireInt(op, 'section'), para: requireInt(op, 'para'), ctrl: requireInt(op, 'control') }]
+        ? [{ sec: op.section ?? 0, para: requireInt(op, 'para'), ctrl: requireInt(op, 'control') }]
         : enumerateTables(doc);
 
       const hits = [];
       for (const { sec, para, ctrl } of candidates) {
         const grid = describeTable(doc, sec, para, ctrl);
         if (!grid) continue;
+        // Strip whitespace (incl. \r\n between a cell's paragraphs and the
+        // full-width spaces Korean forms pad labels with) from BOTH sides before
+        // matching — a label like "사업장소재지" is often stored as two cell
+        // paragraphs "사업장\r소재지", and "사업자등록번호" as "사 업 자등록번호".
+        const norm = (s) => s.replace(/[\s　]+/g, '');
         for (const cell of grid.cells) {
-          const txt = caseSensitive ? cell.text : cell.text.toLowerCase();
-          const needle = caseSensitive ? op.label : op.label.toLowerCase();
+          const txt = norm(caseSensitive ? cell.text : cell.text.toLowerCase());
+          const needle = norm(caseSensitive ? op.label : op.label.toLowerCase());
           if (txt.includes(needle)) hits.push({ sec, para, ctrl, cell });
         }
       }
       if (hits.length === 0) throw new Error(`set_cell_text_by_label: no cell containing "${op.label}" found`);
       if (occurrence >= hits.length) throw new Error(`set_cell_text_by_label: occurrence ${occurrence} out of range (${hits.length} hits)`);
       const hit = hits[occurrence];
-      out.push({
-        section: hit.sec, para: hit.para, control: hit.ctrl,
-        row: hit.cell.row + rowOff, col: hit.cell.col + colOff, text,
-      });
+      if (op.append) {
+        // The label cell ITSELF is the write area — "건 명 : ___" / underline /
+        // colon-style fields where the value is typed after the label in the same
+        // cell, not in an adjacent cell. Keep the label text and append the value.
+        const labelText = (hit.cell.text || '').replace(/[\r\n]+/g, ' ').replace(/\s+$/, '');
+        out.push({
+          section: hit.sec, para: hit.para, control: hit.ctrl,
+          row: hit.cell.row, col: hit.cell.col,
+          text: labelText ? `${labelText} ${text}` : text,
+        });
+      } else {
+        out.push({
+          section: hit.sec, para: hit.para, control: hit.ctrl,
+          row: hit.cell.row + (autoTarget ? 0 : rowOff),
+          col: hit.cell.col + (autoTarget ? (hit.cell.colSpan ?? 1) : colOff),
+          text,
+        });
+      }
     }
     return out;
   } finally {
@@ -3226,6 +3291,156 @@ function stripHwpLayoutCache(filePath) {
   return totalDropped;
 }
 
+// GT-confirmed table-spacing fix (see TABLE_DEFAULT_INNER_MARGIN +
+// TABLE_OUTER_BOTTOM_MARGIN). Two raw-patches per table: (1) the TABLE record's
+// default inner margin → `margin` on all 4 sides (cell roominess / HWPX-matched
+// padding); (2) the table CTRL_HEADER's outer BOTTOM margin → `outerBottom` (gap
+// below the table — Hancom-web ignores the host paragraph's spacingAfter, so this
+// table-object margin is the only lever, matching HWPX's <hp:outMargin bottom>).
+// True in-place raw-patch: parse the CFB ourselves and overwrite the compressed
+// Section stream within its existing sector chain — NEVER CFB.write (injects the
+// sheetjs Sh33tJ5 marker Hancom rejects, the reason stripHwpLayoutCache above is
+// disabled). Best-effort: any section that would grow past its allocated chain is
+// left untouched (the re-deflate delta is a few bytes, so this ~never happens).
+function setTableInMarginInPlace(filePath, margin, outerBottom) {
+  const buf = fs.readFileSync(filePath); // mutated in place, then written back
+  // --- minimal CFB structural parse (read-only; no sheetjs write path) ---
+  const ssz = 1 << buf.readUInt16LE(30);
+  const mssz = 1 << buf.readUInt16LE(32);
+  const miniCutoff = buf.readUInt32LE(56);
+  const dirStart = buf.readUInt32LE(48);
+  const miniFatStart = buf.readUInt32LE(60);
+  const sect = (n) => 512 + n * ssz;
+  const difat = [];
+  for (let i = 0; i < 109; i++) {
+    const v = buf.readUInt32LE(76 + i * 4);
+    if (v < 0xFFFFFFFE) difat.push(v);
+  }
+  const FAT = [];
+  for (const f of difat) {
+    const base = sect(f);
+    for (let i = 0; i < ssz / 4; i++) FAT.push(buf.readUInt32LE(base + i * 4));
+  }
+  const chain = (start) => {
+    const out = []; let s = start, g = 0;
+    while (s !== 0xFFFFFFFE && s < 0xFFFFFFF0 && g++ < 1e6) { out.push(s); s = FAT[s]; }
+    return out;
+  };
+  const dirSectors = chain(dirStart);
+  const perDir = ssz / 128;
+  const dirEntry = (i) => sect(dirSectors[Math.floor(i / perDir)]) + (i % perDir) * 128;
+  const entName = (o) => {
+    const len = buf.readUInt16LE(o + 64); let s = "";
+    for (let i = 0; i < len / 2 - 1; i++) s += String.fromCharCode(buf.readUInt16LE(o + i * 2));
+    return s;
+  };
+  let rootOff = null;
+  const sections = [];
+  for (let i = 0; i < dirSectors.length * perDir; i++) {
+    const o = dirEntry(i);
+    const t = buf[o + 66];
+    if (!t) continue;
+    if (t === 5) rootOff = o;
+    if (/^Section\d+$/.test(entName(o))) sections.push(o);
+  }
+  if (rootOff == null || sections.length === 0) return 0;
+  // Section compression follows the global FileHeader flag (byte 36, bit 0).
+  // CFB.read here is read-only — the banned path is CFB.write, not CFB.read.
+  let compressed = true;
+  try {
+    const fhc = CFB.find(CFB.read(buf, { type: "buffer" }), "/FileHeader");
+    if (fhc) compressed = (Buffer.from(fhc.content)[36] & 1) === 1;
+  } catch { /* default to compressed */ }
+  // mini-stream plumbing (only needed for streams below the mini cutoff)
+  let miniFat = [], rootChain = [], miniOff = null;
+  const buildMini = () => {
+    if (miniOff) return;
+    const mf = chain(miniFatStart);
+    const mb = Buffer.alloc(mf.length * ssz);
+    mf.forEach((x, i) => buf.copy(mb, i * ssz, sect(x), sect(x) + ssz));
+    for (let i = 0; i < mb.length / 4; i++) miniFat.push(mb.readUInt32LE(i * 4));
+    rootChain = chain(buf.readUInt32LE(rootOff + 116));
+    miniOff = (mi) => sect(rootChain[Math.floor(mi / (ssz / mssz))]) + (mi % (ssz / mssz)) * mssz;
+  };
+  const miniChain = (start) => {
+    const out = []; let s = start, g = 0;
+    while (s !== 0xFFFFFFFE && s < 0xFFFFFFF0 && g++ < 1e6) { out.push(s); s = miniFat[s]; }
+    return out;
+  };
+  const readChain = (offs, unit, size) => {
+    const o = Buffer.alloc(offs.length * unit);
+    offs.forEach((dst, i) => buf.copy(o, i * unit, dst, dst + unit));
+    return o.slice(0, size);
+  };
+  let patched = 0;
+  for (const secOff of sections) {
+    const secSize = buf.readUInt32LE(secOff + 120);
+    const secStart = buf.readUInt32LE(secOff + 116);
+    if (secSize === 0) continue;
+    const inMini = secSize < miniCutoff;
+    let sectorOffs;
+    if (inMini) { buildMini(); sectorOffs = miniChain(secStart).map(miniOff); }
+    else sectorOffs = chain(secStart).map(sect);
+    const unit = inMini ? mssz : ssz;
+    const comp = readChain(sectorOffs, unit, secSize);
+    let data;
+    try { data = compressed ? zlib.inflateRawSync(comp) : comp; }
+    catch { continue; }
+    // walk records; patch two things per table:
+    //  (1) TABLE (tag 0x4D) inMargin → `margin` on all 4 sides (left@10, right@12,
+    //      top@14, bottom@16, INT16) — the cell inner margin / row roominess.
+    //  (2) the table's CTRL_HEADER (tag 0x47, ctrlId "tbl ") outer BOTTOM margin
+    //      → `outerBottom`. The host paragraph's spacingAfter is IGNORED by
+    //      Hancom-web for a table-only paragraph, so the gap below a table is
+    //      governed by the table object's own outer margin (the .hwp analog of
+    //      HWPX's <hp:outMargin bottom="500">). rhwp emits the 4 outer margins
+    //      (left@28/right@30/top@32/bottom@34, INT16) as 283 (~1mm) → ~5px below
+    //      the table; HWPX uses 500 → ~10px. We bump ONLY the bottom (top already
+    //      matches via the preceding paragraph's spacingAfter), and only when all
+    //      four read the rhwp 283 default — that confirms the offset and skips any
+    //      non-default layout (e.g. treat-as-char tables) rather than risk a clobber.
+    let off = 0, tablesHit = 0, ctrlHit = 0;
+    while (off + 4 <= data.length) {
+      const h = data.readUInt32LE(off);
+      const tag = h & 0x3FF;
+      let size = (h >>> 20) & 0xFFF, hl = 4;
+      if (size === 0xFFF) { size = data.readUInt32LE(off + 4); hl = 8; }
+      if (tag === 0x4D && size >= 18) {
+        const d = off + hl;
+        let changed = false;
+        for (const o of [10, 12, 14, 16]) {
+          if (data.readInt16LE(d + o) !== margin) { data.writeInt16LE(margin, d + o); changed = true; }
+        }
+        if (changed) tablesHit++;
+      } else if (tag === 0x47 && size >= 36 && outerBottom != null) {
+        const d = off + hl;
+        // ctrlId is stored reversed: bytes ' lbt' == "tbl "
+        const isTbl = data[d] === 0x20 && data[d + 1] === 0x6C && data[d + 2] === 0x62 && data[d + 3] === 0x74;
+        const om = [28, 30, 32, 34];
+        if (isTbl && om.every((o) => data.readInt16LE(d + o) === 283)) {
+          if (data.readInt16LE(d + 34) !== outerBottom) { data.writeInt16LE(outerBottom, d + 34); ctrlHit++; }
+        }
+      }
+      off += hl + size;
+    }
+    if (tablesHit === 0 && ctrlHit === 0) continue;
+    const newComp = compressed ? zlib.deflateRawSync(data, { level: 9 }) : data;
+    const capacity = sectorOffs.length * unit;
+    if (newComp.length > capacity) continue; // would grow the chain — skip (best-effort)
+    for (let i = 0; i < sectorOffs.length; i++) {
+      const dst = sectorOffs[i];
+      for (let j = 0; j < unit; j++) {
+        const di = i * unit + j;
+        buf[dst + j] = di < newComp.length ? newComp[di] : 0;
+      }
+    }
+    buf.writeUInt32LE(newComp.length, secOff + 120);
+    patched += tablesHit + ctrlHit;
+  }
+  if (patched > 0) fs.writeFileSync(filePath, buf);
+  return patched;
+}
+
 async function readStdin() {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -3248,6 +3463,11 @@ async function readStdin() {
 
   const outPath = payload.path;
   const ops = payload.operations || [];
+  // Resolve the run's theme (heading colour + font) from the payload before the
+  // op loop. Defaults to government; unknown names fall back with a logged note.
+  // Applies to the from-scratch / rhwp-emit path (append_*); raw-patch ops keep
+  // the existing document's styling.
+  activeTheme = resolveTheme(payload, log);
   if (!outPath) {
     process.stdout.write(JSON.stringify({ status: "error", message: "'path' is required" }) + "\n");
     process.exit(1);
@@ -3305,6 +3525,107 @@ async function readStdin() {
   // for the PARA_SHAPE body, HWPTAG_ID_MAPPINGS counter bumps, and
   // PARA_HEADER paraShapeId handling.
   const APPLY_PARAGRAPH_STYLE_OPS = new Set(['apply_paragraph_style']);
+  // Cell styling via raw-patch — background shading, borders, diagonals.
+  // Each merges its change into the cell's EXISTING BorderFill (preserving the
+  // parts it doesn't touch) and repoints just that cell's LIST_HEADER
+  // borderFillId. See cell-patch.js applyCellStyleInPlace.
+  const CELL_STYLE_OPS = new Set(['set_cell_background', 'set_cell_border', 'set_cell_diagonal']);
+  // Paragraph list formatting via raw-patch — turns an existing paragraph into
+  // a numbered/bulleted item by setting its PARA_SHAPE heading kind + a
+  // NUMBERING/BULLET id ref (records appended to DocInfo). See cell-patch.js
+  // applyListInPlace.
+  const LIST_OPS = new Set(['set_numbered_list', 'set_bullet_list']);
+  // Table-cell properties (valign / size / margins) via raw-patch — patches the
+  // cell LIST_HEADER directly (no DocInfo change). See applyCellPropertyInPlace.
+  const CELL_PROP_OPS = new Set(['set_cell_property']);
+  // Table-level properties (outer margin) via raw-patch — patches the table
+  // CTRL_HEADER " lbt" directly (no DocInfo change). See applyTablePropertyInPlace.
+  const TABLE_PROP_OPS = new Set(['set_table_property']);
+  // Drawing-object (shape/image) properties (fill / border / outer margin) via
+  // raw-patch — patches the gso CTRL_HEADER + SHAPE_COMPONENT. See applyObjectPropertyInPlace.
+  const OBJECT_PROP_OPS = new Set(['set_object_property']);
+  // Table structure: merge a rectangular block of cells (raw-patch — sets the
+  // top-left cell's span, deletes the absorbed cell clusters, fixes the TABLE
+  // row-size array). See cell-patch.js mergeCellsInPlace.
+  const MERGE_OPS = new Set(['merge_cells']);
+  // Table structure: delete a whole row (raw-patch — TABLE rows−1 + row-size
+  // entry removed, the row's cells deleted, cells below renumbered). See
+  // cell-patch.js deleteTableRowInPlace.
+  const DELROW_OPS = new Set(['delete_table_row', 'delete_table_col']);
+  // Table structure: insert a blank row (raw-patch — TABLE rows+1, new row-size
+  // entry, blank cells cloned from empty cells, cells below renumbered). See
+  // cell-patch.js insertTableRowInPlace.
+  const INSROW_OPS = new Set(['insert_table_row', 'insert_table_col']);
+  // Table structure: split one cell into N stacked rows (raw-patch). See
+  // cell-patch.js splitCellInPlace.
+  const SPLIT_OPS = new Set(['split_cell']);
+  // 문단 띠 / horizontal divider line (raw-patch — inserts a new paragraph
+  // holding a gso rectangle the width of the text column). Self-contained in
+  // Section0; no DocInfo change. See cell-patch.js insertParaLineInPlace.
+  const PARALINE_OPS = new Set(['insert_para_line']);
+  // 누름틀 / form field (raw-patch — HWP field mechanism: inline field-begin/
+  // end chars + a '%clk' CTRL_HEADER command string). Self-contained in
+  // Section0; no DocInfo change. See cell-patch.js insertFieldInPlace.
+  const FIELD_OPS = new Set(['insert_field']);
+  // 하이퍼링크 (raw-patch — same HWP field mechanism, '%hlk', wraps existing
+  // anchor text). Functional link; not auto-styled blue/underline (layer
+  // apply_text_style for that). See cell-patch.js insertHyperlinkInPlace.
+  const HYPERLINK_OPS = new Set(['insert_hyperlink']);
+  // 책갈피 (raw-patch — invisible point-marker: inline char 0x16 + 'bokm' ctrl
+  // + 0x57 name data; byte-identical to Hancom's own bookmark). No DocInfo
+  // change. See cell-patch.js insertBookmarkInPlace.
+  const BOOKMARK_OPS = new Set(['insert_bookmark']);
+  // 글상자 (raw-patch — rect gso + inner text). See cell-patch.js insertTextboxInPlace.
+  const TEXTBOX_OPS = new Set(['insert_textbox']);
+  // 각주/미주 (raw-patch — inline note-ref char + a nested note-content
+  // cluster; resolves the doc's standard "Footnote"/"Endnote" style, no
+  // DocInfo write). See cell-patch.js insertFootnoteInPlace/insertEndnoteInPlace.
+  const FOOTNOTE_OPS = new Set(['insert_footnote']);
+  const ENDNOTE_OPS = new Set(['insert_endnote']);
+  // 쪽 번호 (raw-patch — footer control holding the page-number auto-field;
+  // alignment references an existing matching para_shape, no DocInfo write).
+  // See cell-patch.js insertPageNumberInPlace.
+  const PAGENUM_OPS = new Set(['insert_page_number']);
+  // 다단 (raw-patch — patch the section's 'cold' column-def control to N
+  // columns). For editing existing docs; new docs can use setup_columns on the
+  // rhwp create path. See cell-patch.js setColumnsInPlace.
+  const SET_COLUMNS_OPS = new Set(['set_columns']);
+  // 스타일 적용 (raw-patch — repoint a paragraph's style + para_shape to a
+  // named style; length-preserving, no DocInfo write). See cell-patch.js
+  // applyNamedStyleInPlace.
+  const STYLE_OPS = new Set(['apply_style']);
+  // 머리말/꼬리말 텍스트 (raw-patch — header/footer control holding a user-text
+  // paragraph; same infra as page-number, no DocInfo write). See cell-patch.js
+  // insertHeaderFooterTextInPlace.
+  const HEADERFOOTER_OPS = new Set(['insert_header_text', 'insert_footer_text']);
+  // 셀 너비/높이 같게 (raw-patch — make a whole table's columns/rows equal;
+  // length-preserving LIST_HEADER width/height edit, no DocInfo write).
+  // See cell-patch.js equalizeTableInPlace.
+  const EQUALIZE_OPS = new Set(['equalize_table_columns', 'equalize_table_rows']);
+  // 도형 (raw-patch — gso drawing object: rectangle / ellipse, floating, no
+  // DocInfo write). See cell-patch.js insertShapeInPlace.
+  const SHAPE_OPS = new Set(['insert_shape']);
+  // 그림/이미지 (raw-patch — Hancom-Docs compatible: creates the BinData
+  // storage folder + stream, DocInfo BIN_DATA def, and a gso "$pic" cluster
+  // reproduced from Hancom's own output). See cell-patch.js insertImageInPlace.
+  const IMAGE_RAWPATCH_OPS = new Set(['insert_image']);
+  // 차트 (raw-patch — gso "ole$" object + a deflated chart OLE stream, one of
+  // 20 GT'd per-type templates; Hancom re-renders from the OLE's embedded
+  // OOXMLChartContents). op fields: chart_type 0-19, anchor, optional
+  // rows/cols/categories/series/data (edit the chart's grid), float:true to
+  // keep it floating instead of the default like-char placement. Clean docs
+  // only for now. See cell-patch.js insertChartInPlace.
+  const CHART_OPS = new Set(['insert_chart']);
+  // 도장/서명 (seal) — anchor 어구에 PNG floating("front") 배치, 폰트메트릭 자동위치 (raw-patch). See cell-patch.js placeSealInPlace.
+  const PLACE_SEAL_OPS = new Set(['place_seal']);
+  // 객체 삭제 (그림·차트·도형) — gso 제거 + BinData 리넘버링 (raw-patch). See cell-patch.js deleteObjectInPlace.
+  const DELETE_OBJECT_OPS = new Set(['delete_object']);
+  // 수식 (equation) — raw-patch into an existing doc / table cell (EQEDIT "deqe"
+  // control). op fields: script (Hancom equation source), anchor, or
+  // cell:{row,col,para?,control?} to drop it inside a cell (centered). NOTE:
+  // distinct from append_equation, which is the from-scratch rhwp-emit path.
+  // See cell-patch.js insertEquationInPlace.
+  const EQUATION_OPS = new Set(['insert_equation']);
   // All paragraph-shaped append ops route through appendParagraphInPlace.
   // Some carry a break_val (page/column break); the rest just add text.
   //   append_paragraph                    → break_val 0
@@ -3334,7 +3655,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS, ...PLACE_SEAL_OPS, ...DELETE_OBJECT_OPS, ...EQUATION_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -3386,7 +3707,9 @@ async function readStdin() {
         if (!globalThis.__rhwp_loaded_for_template) {
           await rhwp.default({
             module_or_path: fs.readFileSync(
-              path.resolve(path.dirname(new URL(import.meta.url).pathname), "vendor/rhwp/rhwp_bg.wasm")
+              // __dirname (via fileURLToPath) — NOT new URL(...).pathname, which
+              // on Windows yields "/C:/…" and path.resolve doubles it to "C:\C:\…".
+              path.resolve(__dirname, "vendor/rhwp/rhwp_bg.wasm")
             ),
           });
           if (typeof globalThis.measureTextWidth !== "function") {
@@ -3473,7 +3796,9 @@ async function readStdin() {
               if (!globalThis.__rhwp_loaded_for_template) {
                 await rhwpForTable.default({
                   module_or_path: fs.readFileSync(
-                    path.resolve(path.dirname(new URL(import.meta.url).pathname), 'vendor/rhwp/rhwp_bg.wasm')
+                    // __dirname (fileURLToPath) — new URL(...).pathname gives
+                    // "/C:/…" on Windows, which path.resolve doubles to "C:\C:\…".
+                    path.resolve(__dirname, 'vendor/rhwp/rhwp_bg.wasm')
                   ),
                 });
                 if (typeof globalThis.measureTextWidth !== 'function') {
@@ -3513,6 +3838,227 @@ async function readStdin() {
         const psSummary = await applyParagraphStyleInPlace(outPath, paraStyleOps);
         subModes.push(`paragraph_style:${psSummary.mode || 'in-place'}`);
         for (const e of psSummary) allEdits.push({ kind: 'paragraph_style', ...e });
+      }
+      const cellStyleOps = ops.filter((o) => CELL_STYLE_OPS.has(o.type));
+      if (cellStyleOps.length > 0) {
+        const { applyCellStyleInPlace } = await import('./cell-patch.js');
+        const csSummary = await applyCellStyleInPlace(outPath, cellStyleOps);
+        subModes.push(`cell_style:${csSummary.mode || 'in-place'}`);
+        for (const e of csSummary) allEdits.push({ kind: 'cell_style', ...e });
+      }
+      const listOps = ops.filter((o) => LIST_OPS.has(o.type));
+      if (listOps.length > 0) {
+        const { applyListInPlace } = await import('./cell-patch.js');
+        const lsSummary = await applyListInPlace(outPath, listOps);
+        subModes.push(`list:${lsSummary.mode || 'in-place'}`);
+        for (const e of lsSummary) allEdits.push({ kind: 'list', ...e });
+      }
+      const cellPropOps = ops.filter((o) => CELL_PROP_OPS.has(o.type));
+      if (cellPropOps.length > 0) {
+        const { applyCellPropertyInPlace } = await import('./cell-patch.js');
+        const cpSummary = await applyCellPropertyInPlace(outPath, cellPropOps);
+        subModes.push(`cell_prop:${cpSummary.mode || 'in-place'}`);
+        for (const e of cpSummary) allEdits.push({ kind: 'cell_prop', ...e });
+      }
+      const tablePropOps = ops.filter((o) => TABLE_PROP_OPS.has(o.type));
+      if (tablePropOps.length > 0) {
+        const { applyTablePropertyInPlace } = await import('./cell-patch.js');
+        const tpSummary = await applyTablePropertyInPlace(outPath, tablePropOps);
+        subModes.push(`table_prop:${tpSummary.mode || 'in-place'}`);
+        for (const e of tpSummary) allEdits.push({ kind: 'table_prop', ...e });
+      }
+      // NOTE: set_object_property is dispatched LATER (after the object-insert
+      // blocks below) so a single batch can insert a shape/chart and then style
+      // it — object inserts must run before the property edit can find them.
+      const mergeOps = ops.filter((o) => MERGE_OPS.has(o.type));
+      if (mergeOps.length > 0) {
+        const { mergeCellsInPlace } = await import('./cell-patch.js');
+        const mgSummary = await mergeCellsInPlace(outPath, mergeOps);
+        subModes.push(`merge:${mgSummary.mode || 'in-place'}`);
+        for (const e of mgSummary) allEdits.push({ kind: 'merge', ...e });
+      }
+      const delRowOps = ops.filter((o) => o.type === 'delete_table_row');
+      if (delRowOps.length > 0) {
+        const { deleteTableRowInPlace } = await import('./cell-patch.js');
+        const drSummary = await deleteTableRowInPlace(outPath, delRowOps);
+        subModes.push(`delrow:${drSummary.mode || 'in-place'}`);
+        for (const e of drSummary) allEdits.push({ kind: 'delete_row', ...e });
+      }
+      const delColOps = ops.filter((o) => o.type === 'delete_table_col');
+      if (delColOps.length > 0) {
+        const { deleteTableColInPlace } = await import('./cell-patch.js');
+        const dcSummary = await deleteTableColInPlace(outPath, delColOps);
+        subModes.push(`delcol:${dcSummary.mode || 'in-place'}`);
+        for (const e of dcSummary) allEdits.push({ kind: 'delete_col', ...e });
+      }
+      const insRowOps = ops.filter((o) => o.type === 'insert_table_row');
+      if (insRowOps.length > 0) {
+        const { insertTableRowInPlace } = await import('./cell-patch.js');
+        const irSummary = await insertTableRowInPlace(outPath, insRowOps);
+        subModes.push(`insrow:${irSummary.mode || 'in-place'}`);
+        for (const e of irSummary) allEdits.push({ kind: 'insert_row', ...e });
+      }
+      const insColOps = ops.filter((o) => o.type === 'insert_table_col');
+      if (insColOps.length > 0) {
+        const { insertTableColInPlace } = await import('./cell-patch.js');
+        const icSummary = await insertTableColInPlace(outPath, insColOps);
+        subModes.push(`inscol:${icSummary.mode || 'in-place'}`);
+        for (const e of icSummary) allEdits.push({ kind: 'insert_col', ...e });
+      }
+      const splitOps = ops.filter((o) => SPLIT_OPS.has(o.type));
+      if (splitOps.length > 0) {
+        const { splitCellInPlace } = await import('./cell-patch.js');
+        const spSummary = await splitCellInPlace(outPath, splitOps);
+        subModes.push(`split:${spSummary.mode || 'in-place'}`);
+        for (const e of spSummary) allEdits.push({ kind: 'split', ...e });
+      }
+      // insert_para_line is dispatched LATER (after the object-insert + table
+      // ops) — it adds a new body paragraph, which would shift the absolute
+      // para indices that table-cell-targeting ops rely on if it ran first.
+      const fieldOps = ops.filter((o) => FIELD_OPS.has(o.type));
+      if (fieldOps.length > 0) {
+        const { insertFieldInPlace } = await import('./cell-patch.js');
+        const fSummary = await insertFieldInPlace(outPath, fieldOps);
+        subModes.push(`field:${fSummary.mode || 'in-place'}`);
+        for (const e of fSummary) allEdits.push({ kind: 'field', ...e });
+      }
+      const hyperlinkOps = ops.filter((o) => HYPERLINK_OPS.has(o.type));
+      if (hyperlinkOps.length > 0) {
+        const { insertHyperlinkInPlace } = await import('./cell-patch.js');
+        const hlSummary = await insertHyperlinkInPlace(outPath, hyperlinkOps);
+        subModes.push(`hyperlink:${hlSummary.mode || 'in-place'}`);
+        for (const e of hlSummary) allEdits.push({ kind: 'hyperlink', ...e });
+      }
+      const bookmarkOps = ops.filter((o) => BOOKMARK_OPS.has(o.type));
+      if (bookmarkOps.length > 0) {
+        const { insertBookmarkInPlace } = await import('./cell-patch.js');
+        const bmSummary = await insertBookmarkInPlace(outPath, bookmarkOps);
+        subModes.push(`bookmark:${bmSummary.mode || 'in-place'}`);
+        for (const e of bmSummary) allEdits.push({ kind: 'bookmark', ...e });
+      }
+      const textboxOps = ops.filter((o) => TEXTBOX_OPS.has(o.type));
+      if (textboxOps.length > 0) {
+        const { insertTextboxInPlace } = await import('./cell-patch.js');
+        const tbSummary = await insertTextboxInPlace(outPath, textboxOps);
+        subModes.push(`textbox:${tbSummary.mode || 'in-place'}`);
+        for (const e of tbSummary) allEdits.push({ kind: 'textbox', ...e });
+      }
+      const footnoteOps = ops.filter((o) => FOOTNOTE_OPS.has(o.type));
+      if (footnoteOps.length > 0) {
+        const { insertFootnoteInPlace } = await import('./cell-patch.js');
+        const fnSummary = await insertFootnoteInPlace(outPath, footnoteOps);
+        subModes.push(`footnote:${fnSummary.mode || 'in-place'}`);
+        for (const e of fnSummary) allEdits.push({ kind: 'footnote', ...e });
+      }
+      const endnoteOps = ops.filter((o) => ENDNOTE_OPS.has(o.type));
+      if (endnoteOps.length > 0) {
+        const { insertEndnoteInPlace } = await import('./cell-patch.js');
+        const enSummary = await insertEndnoteInPlace(outPath, endnoteOps);
+        subModes.push(`endnote:${enSummary.mode || 'in-place'}`);
+        for (const e of enSummary) allEdits.push({ kind: 'endnote', ...e });
+      }
+      const pageNumOps = ops.filter((o) => PAGENUM_OPS.has(o.type));
+      if (pageNumOps.length > 0) {
+        const { insertPageNumberInPlace } = await import('./cell-patch.js');
+        const pnSummary = await insertPageNumberInPlace(outPath, pageNumOps);
+        subModes.push(`page_number:${pnSummary.mode || 'in-place'}`);
+        for (const e of pnSummary) allEdits.push({ kind: 'page_number', ...e });
+      }
+      const setColumnsOps = ops.filter((o) => SET_COLUMNS_OPS.has(o.type));
+      if (setColumnsOps.length > 0) {
+        const { setColumnsInPlace } = await import('./cell-patch.js');
+        const scSummary = await setColumnsInPlace(outPath, setColumnsOps);
+        subModes.push(`set_columns:${scSummary.mode || 'in-place'}`);
+        for (const e of scSummary) allEdits.push({ kind: 'set_columns', ...e });
+      }
+      const styleOps = ops.filter((o) => STYLE_OPS.has(o.type));
+      if (styleOps.length > 0) {
+        const { applyNamedStyleInPlace } = await import('./cell-patch.js');
+        const stSummary = await applyNamedStyleInPlace(outPath, styleOps);
+        subModes.push(`apply_style:${stSummary.mode || 'in-place'}`);
+        for (const e of stSummary) allEdits.push({ kind: 'apply_style', ...e });
+      }
+      const hfOps = ops.filter((o) => HEADERFOOTER_OPS.has(o.type)).map((o) => ({
+        ...o, where: o.type === 'insert_header_text' ? 'header' : 'footer',
+      }));
+      if (hfOps.length > 0) {
+        const { insertHeaderFooterTextInPlace } = await import('./cell-patch.js');
+        const hfSummary = await insertHeaderFooterTextInPlace(outPath, hfOps);
+        subModes.push(`header_footer:${hfSummary.mode || 'in-place'}`);
+        for (const e of hfSummary) allEdits.push({ kind: 'header_footer', ...e });
+      }
+      const eqOps = ops.filter((o) => EQUALIZE_OPS.has(o.type)).map((o) => ({
+        ...o, dim: o.type === 'equalize_table_rows' ? 'height' : 'width',
+      }));
+      if (eqOps.length > 0) {
+        const { equalizeTableInPlace } = await import('./cell-patch.js');
+        const eqSummary = await equalizeTableInPlace(outPath, eqOps);
+        subModes.push(`equalize:${eqSummary.mode || 'in-place'}`);
+        for (const e of eqSummary) allEdits.push({ kind: 'equalize', ...e });
+      }
+      const shapeOps = ops.filter((o) => SHAPE_OPS.has(o.type));
+      if (shapeOps.length > 0) {
+        const { insertShapeInPlace } = await import('./cell-patch.js');
+        const shSummary = await insertShapeInPlace(outPath, shapeOps);
+        subModes.push(`shape:${shSummary.mode || 'in-place'}`);
+        for (const e of shSummary) allEdits.push({ kind: 'shape', ...e });
+      }
+      const imgRawOps = ops.filter((o) => IMAGE_RAWPATCH_OPS.has(o.type));
+      if (imgRawOps.length > 0) {
+        const { insertImageInPlace } = await import('./cell-patch.js');
+        const imSummary = await insertImageInPlace(outPath, imgRawOps);
+        subModes.push(`image:${imSummary.mode || 'in-place'}`);
+        for (const e of imSummary) allEdits.push({ kind: 'image', ...e });
+      }
+      const sealOps = ops.filter((o) => o.type === 'place_seal');
+      if (sealOps.length > 0) {
+        const { placeSealInPlace } = await import('./cell-patch.js');
+        const sealSummary = await placeSealInPlace(outPath, sealOps);
+        subModes.push(`place_seal:${sealSummary.mode || 'in-place'}`);
+        for (const e of sealSummary) allEdits.push({ kind: 'place_seal', ...e });
+      }
+      const chartOps = ops.filter((o) => CHART_OPS.has(o.type));
+      if (chartOps.length > 0) {
+        const { insertChartInPlace } = await import('./cell-patch.js');
+        const chSummary = await insertChartInPlace(outPath, chartOps);
+        subModes.push(`chart:${chSummary.mode || 'in-place'}`);
+        for (const e of chSummary) allEdits.push({ kind: 'chart', ...e });
+      }
+      const deleteObjOps = ops.filter((o) => DELETE_OBJECT_OPS.has(o.type));
+      if (deleteObjOps.length > 0) {
+        const { deleteObjectInPlace } = await import('./cell-patch.js');
+        // Delete highest index first so a delete never shifts a later target's index.
+        const ordered = [...deleteObjOps].sort((a, b) => (b.index ?? 0) - (a.index ?? 0));
+        const delSummary = await deleteObjectInPlace(outPath, ordered);
+        subModes.push(`delete_object:${delSummary.mode || 'in-place'}`);
+        for (const e of delSummary) allEdits.push({ kind: 'delete_object', ...e });
+      }
+      const equationOps = ops.filter((o) => EQUATION_OPS.has(o.type));
+      if (equationOps.length > 0) {
+        const { insertEquationInPlace } = await import('./cell-patch.js');
+        const eqSummary = await insertEquationInPlace(outPath, equationOps);
+        subModes.push(`equation:${eqSummary.mode || 'in-place'}`);
+        for (const e of eqSummary) allEdits.push({ kind: 'equation', ...e });
+      }
+      // set_object_property runs AFTER the object-insert blocks above so an
+      // insert-then-style batch (e.g. insert_shape + set_object_property) finds
+      // the just-inserted object instead of running before it exists.
+      const objectPropOps = ops.filter((o) => OBJECT_PROP_OPS.has(o.type));
+      if (objectPropOps.length > 0) {
+        const { applyObjectPropertyInPlace } = await import('./cell-patch.js');
+        const opSummary = await applyObjectPropertyInPlace(outPath, objectPropOps);
+        subModes.push(`object_prop:${opSummary.mode || 'in-place'}`);
+        for (const e of opSummary) allEdits.push({ kind: 'object_prop', ...e });
+      }
+      // Body-paragraph inserts that shift absolute para indices run LAST (after
+      // every table-cell-targeting op) so they don't move a table out from under
+      // an op that addresses it by para index.
+      const paraLineOps = ops.filter((o) => PARALINE_OPS.has(o.type));
+      if (paraLineOps.length > 0) {
+        const { insertParaLineInPlace } = await import('./cell-patch.js');
+        const plSummary = await insertParaLineInPlace(outPath, paraLineOps);
+        subModes.push(`para_line:${plSummary.mode || 'in-place'}`);
+        for (const e of plSummary) allEdits.push({ kind: 'para_line', ...e });
       }
       if (appendOps.length > 0) {
         const { appendParagraphInPlace } = await import('./cell-patch.js');
@@ -3900,6 +4446,20 @@ async function readStdin() {
       if (n > 0) log.push(`hwpx_patch: stripped ${n} linesegarray layout-cache block(s)`);
     } catch (err) {
       log.push(`hwpx_layoutcache_strip failed: ${err.message}`);
+    }
+  }
+
+  // .hwp table-spacing fix (raw-patch, no CFB.write): (1) every TABLE record's
+  // default inner margin → 400 on all 4 sides (cell roominess + HWPX-matched
+  // horizontal padding — Hancom-web lays out from the table default, not per-cell);
+  // (2) each table CTRL_HEADER's outer BOTTOM margin → 500 so the gap below the
+  // table matches the HWPX track (~10px). See setTableInMarginInPlace().
+  if (ext === ".hwp") {
+    try {
+      const n = setTableInMarginInPlace(outPath, TABLE_DEFAULT_INNER_MARGIN, TABLE_OUTER_BOTTOM_MARGIN);
+      if (n > 0) log.push(`hwp_patch: ${n} table margin field(s) → inMargin ${TABLE_DEFAULT_INNER_MARGIN} (4 sides) + outer-bottom ${TABLE_OUTER_BOTTOM_MARGIN} (HWPX-matched)`);
+    } catch (err) {
+      log.push(`hwp_table_margin_patch failed: ${err.message}`);
     }
   }
 

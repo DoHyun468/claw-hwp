@@ -50,3 +50,10 @@ VERIFIED_BEHAVIORS.md
 
 # verified hwpx samples — DO NOT DELETE. Local-only, never publish.
 _verified_hwpx_samples/
+
+# dev-internal: handoff docs (track-to-track / session continuity) + experiment
+# sandbox (secure-fill test harnesses). Not part of the shipped plugin, not
+# auto-loaded by the cold-start skill — keep out of the public repo. They recur
+# at the root during dev, so ignore the patterns.
+/*HANDOFF*.md
+experiment/

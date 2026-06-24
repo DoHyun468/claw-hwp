@@ -46,6 +46,16 @@ const wasmBytes = fs.readFileSync(wasmPath);
 const rhwp = await import('./vendor/rhwp/rhwp.js');
 await rhwp.default({ module_or_path: wasmBytes });
 
+// exportHwp()/exportHwpx() run rhwp's layout pass, which calls
+// globalThis.measureTextWidth. Without this stub it throws "measureTextWidth
+// is not a function" on any document whose content triggers layout (e.g.
+// table-heavy forms), so conversion crashed on exactly those files. Mirrors
+// the stub in extract_text.js / create.js / cell-patch.js.
+if (typeof globalThis.measureTextWidth !== 'function') {
+  globalThis.measureTextWidth = (font, text) =>
+    text.length * (parseFloat(font) || 10) * 0.55;
+}
+
 const doc = new rhwp.HwpDocument(new Uint8Array(inputBytes));
 let outBytes;
 try {
