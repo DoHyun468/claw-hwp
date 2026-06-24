@@ -1019,6 +1019,24 @@ function deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, bu
   }
 }
 
+// A regular-FAT stream whose re-compressed payload drops BELOW the 4096-byte
+// mini-stream cutoff would be silently re-classified as a mini-stream by CFB
+// readers (they infer storage class from the stored size), but its bytes still
+// live in the regular FAT chain — so Hancom reads the wrong sectors and rejects
+// the file (cannot_open). This bites when an edit grows a record yet level-9
+// re-deflate shrinks the stream past the boundary (e.g. DocInfo 4576→3801 after
+// a BinData def is appended). Raw-deflate is self-terminating, so pad the tail
+// with zero bytes to keep the stored size >= 4096 (stays regular); inflate stops
+// at the deflate end and ignores the padding. Only triggers when the stream was
+// already regular (originalSize >= 4096) — its chain therefore already has the
+// capacity to hold the padded bytes, so this never overflows the chain.
+function keepRegularIfDemoting(compressed, originalSize) {
+  if (originalSize >= 4096 && compressed.length < 4096) {
+    return Buffer.concat([compressed, Buffer.alloc(4096 - compressed.length)]);
+  }
+  return compressed;
+}
+
 // In-place sector patch. Throws when the patched payload doesn't fit in the
 // existing sector chain (the caller falls back to patchViaSheetjs). The file
 // on disk is only touched at the very end via writeFileSync, so a mid-edit
@@ -4240,7 +4258,10 @@ export async function insertImageInPlace(filePath, ops) {
     writeFileSync(filePath, buf);
 
     // ── Step 2: DocInfo BIN_DATA def (attr 0x0001) + ID_MAPPINGS count++ ───
-    await addBinDataDefToDocInfo(filePath, storageId, ext, 0x0001);
+    // binDataId = the def's ordinal (what the gso references), which differs
+    // from storageId (the BIN000N stream number) when the doc has orphaned
+    // BinData slots — see addBinDataDefToDocInfo's return note.
+    const binDataId = await addBinDataDefToDocInfo(filePath, storageId, ext, 0x0001);
 
     // ── Step 3: Section0 — insert the gso "$pic" cluster as a new paragraph ─
     {
@@ -4259,7 +4280,7 @@ export async function insertImageInPlace(filePath, ops) {
 
       const records = parseRecords(raw);
       const paraInst = pickFreshInstanceId(records, raw);
-      const cluster = buildImagePicCluster(storageId, paraInst, (paraInst + 0x100) >>> 0);
+      const cluster = buildImagePicCluster(binDataId, paraInst, (paraInst + 0x100) >>> 0);
       // size — aspect preserved from the image's NATIVE pixel ratio (give one
       // axis → the other follows; give both → explicit squeeze).
       const px = readImagePixelSize(imgBuf);
@@ -4424,8 +4445,13 @@ function sealAlignShift(buf, records, ptIdx, body, em, textAreaMm) {
   // available width: cell content width if the anchor lives in a table cell, else body text area
   let availMm = textAreaMm;
   if (ptRec.level >= 3) {
+    // The cell holding this paragraph is the LIST_HEADER one level above the
+    // PARA_TEXT (level-3 text → level-2 cell; doubly-nested level-5 text →
+    // level-4 inner cell). Hardcoding level 2 grabbed the OUTER cell for nested
+    // tables → wrong (too wide) availW → seal shoved off the line.
+    const cellLevel = ptRec.level - 1;
     let lh = -1;
-    for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_LIST_HEADER && records[i].level === 2) { lh = i; break; } }
+    for (let i = ptIdx - 1; i >= 0; i--) { if (records[i].tag === TAG_LIST_HEADER && records[i].level === cellLevel) { lh = i; break; } }
     if (lh !== -1) {
       const d = records[lh].dataOff;
       const w = raw.readUInt32LE(d + 16), mL = raw.readUInt16LE(d + 24), mR = raw.readUInt16LE(d + 26);
@@ -6411,13 +6437,21 @@ async function addBinDataDefToDocInfo(filePath, storageId, ext, attrOverride) {
     const capacity = chain.length * ssz;
     const ext2 = deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, false);
     buf = ext2.buf; fat = ext2.fat; chain = ext2.chain;
-    newCompressed = ext2.compressed;
+    newCompressed = keepRegularIfDemoting(ext2.compressed, dirEntry.size); // keep regular if it shrank < 4096
     writeChainBytes(buf, chain, ssz, newCompressed);
   }
   buf.writeUInt32LE(newCompressed.length, dirEntry.entryFileOffset + 0x78);
   buf.writeUInt32LE(0, dirEntry.entryFileOffset + 0x7C);
 
   writeFileSync(filePath, buf);
+  // The new def's 1-based ordinal among BinData defs. Hancom resolves a gso's
+  // binDataID by THIS position (not by the BIN000N stream number), so the gso
+  // must reference this — not the storage id. They coincide only when the
+  // BinData streams are contiguous; a doc with orphaned/empty BIN000N entries
+  // (deleted images) makes the next free stream number jump ahead of the def
+  // count, so a gso keyed on the stream number resolves to a missing def =
+  // broken-image box (real form 이용신청서: BIN0008 stream but only 2 defs).
+  return oldCount + 1;
   return { binDataCountBefore: oldCount, binDataCountAfter: oldCount + 1, storageId, ext };
 }
 
