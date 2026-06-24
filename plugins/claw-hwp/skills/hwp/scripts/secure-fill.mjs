@@ -23,6 +23,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CREATE = path.join(__dirname, 'create.js');
+const HWPX_EDIT = path.join(__dirname, 'hwpx-edit.js'); // HWPX fill engine (HWPX-track slice)
 const EXTRACT = path.join(__dirname, 'extract_text.js');
 const PERSIST_DIR = path.join(process.env.CLAW_HWP_HOME || os.homedir(), '.claw-hwp');
 const PERSIST_FILE = path.join(PERSIST_DIR, 'profile.txt');
@@ -224,15 +225,8 @@ function cmdTemplate(out, keys) {
 function cmdFill(args) {
   // Default to the saved profile so Claude never needs to handle the PII path at all.
   const profilePath = args.profile || PERSIST_FILE, mapPath = args.map, out = args.out;
-  // The SECURITY model (boundary/ephemeral/format/env/injection) is format-agnostic,
-  // but the fill ENGINE differs: .hwp uses create.js raw-patch (set_cell_text_by_label);
-  // .hwpx editing is hwpx-edit.js's job (HWPX team's slice) — set_cell_text (positional)
-  // or fill_template. Don't silently raw-patch a .hwpx. See handoff/HWPX_SECURE_FILL.md.
-  if (path.extname(String(out)).toLowerCase() === '.hwpx') {
-    console.log(JSON.stringify({ status: 'hwpx_engine_not_wired_here', out,
-      note: 'secure-fill 보안 모델은 .hwpx에도 그대로 적용됨. 단 채우기 엔진은 hwpx-edit.js로 라우팅해야 함(HWPX 팀). set_cell_text(위치) 또는 fill_template 사용. 자세히: handoff/HWPX_SECURE_FILL.md' }, null, 2));
-    process.exit(4);
-  }
+  // The SECURITY model (boundary/ephemeral/format/env/injection) is format-agnostic
+  // and runs HERE for both engines; only the fill ENGINE branches below.
   assertProfileInput(profilePath, 'profile');
   const profile = loadProfile(profilePath);            // values — never printed
   const mapping = JSON.parse(readFileSync(mapPath, 'utf8'));
@@ -245,11 +239,46 @@ function cmdFill(args) {
   const rel = path.relative(baseDir, template);
   if (rel.startsWith('..') || path.isAbsolute(rel)) refuse(`mapping.template escapes the mapping folder (got '${mapping.template}')`);
   if (!/\.hwpx?$/i.test(template) || !existsSync(template)) refuse(`mapping.template must be an existing .hwp/.hwpx beside the mapping (got '${mapping.template}')`);
-  copyFileSync(template, out);
 
-  const operations = [];
   const attempted = [];
   const missing = [];
+
+  // ── HWPX engine (HWPX-track slice): hwpx-edit.js ─────────────────────────
+  // Values stay out of the model exactly like the .hwp path: built in-tool,
+  // piped to hwpx-edit.js stdin, and only counts (never values) come back.
+  // Two field styles: `placeholder` → fill_template (control/run-aware replace,
+  // so a blank split by <hp:fwSpace/>/runs still fills); `table`+`row`+`col` →
+  // set_cell_text (positional). label+offset is .hwp-only (no by-label in HWPX).
+  if (path.extname(String(out)).toLowerCase() === '.hwpx') {
+    const values = {};
+    const operations = [];
+    for (const f of mapping.fields) {
+      const name = f.placeholder ?? (f.table != null ? `cell[${f.table},${f.row},${f.col}]` : (f.label ?? f.key));
+      const raw = profile[f.key];
+      if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: name, key: f.key, status: 'EMPTY_KEY' }); continue; }
+      const val = formatValue(String(raw), f.format); // reshape in-tool (date/phone/rrn/…)
+      if (f.placeholder != null) values[f.placeholder] = val;
+      else if (f.table != null && f.row != null && f.col != null) operations.push({ type: 'set_cell_text', table: f.table, row: f.row, col: f.col, text: val });
+      else refuse(`.hwpx field '${f.key}' needs 'placeholder' OR 'table'+'row'+'col' (label+offset is .hwp-only)`);
+      attempted.push({ field: name, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
+    }
+    if (Object.keys(values).length) operations.unshift({ type: 'fill_template', values });
+    const res = spawnSync('node', [HWPX_EDIT], { input: JSON.stringify({ path: template, output: out, operations }), encoding: 'utf8', maxBuffer: 1 << 26 });
+    let ok = false, message = null;
+    try { const o = JSON.parse(res.stdout) || {}; ok = o.ok === true; message = o.error ?? null; } catch {}
+    console.log(JSON.stringify({
+      out, engine: 'hwpx-edit.js', engine_ok: ok,
+      ...(ok ? { filled: attempted } : { engine_message: message, attempted: attempted.map((a) => a.field) }),
+      missing_keys: missing,
+      note: 'values never printed; hwpx-edit stdout result body (counts only) dropped',
+    }, null, 2));
+    if (!ok) process.exit(2);
+    return;
+  }
+
+  // ── HWP engine: create.js raw-patch (set_cell_text_by_label) ─────────────
+  copyFileSync(template, out);
+  const operations = [];
   for (const f of mapping.fields) {
     const raw = profile[f.key];
     if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: f.label, key: f.key, status: 'EMPTY_KEY' }); continue; }
@@ -272,6 +301,21 @@ function cmdFill(args) {
 
 function cmdVerify(args) {
   const mapping = JSON.parse(readFileSync(args.map, 'utf8'));
+  // ── HWPX verify (HWPX-track slice) ───────────────────────────────────────
+  // --with-cell-text is .hwp-only (rhwp getCellInfo sweep), so for .hwpx we read
+  // the rendered text once and report masked FILLED/EMPTY: a `placeholder` field
+  // is FILLED when its blank text is gone; a positional field is checked by the
+  // value never being shown (only presence). Values stay masked.
+  if (path.extname(String(args.out)).toLowerCase() === '.hwpx') {
+    const res = spawnSync('node', [EXTRACT, '--format', 'markdown', args.out], { encoding: 'utf8', maxBuffer: 1 << 26 });
+    const text = res.stdout || '';
+    const verified = mapping.fields.map((f) => {
+      if (f.placeholder != null) return { field: f.placeholder, status: text.includes(f.placeholder) ? 'EMPTY' : 'FILLED' };
+      return { field: `cell[${f.table},${f.row},${f.col}]`, status: 'POSITIONAL', note: 'positional cell — open in 한컴 to confirm' };
+    });
+    console.log(JSON.stringify({ verified, note: 'values masked; .hwpx placeholder presence check' }, null, 2));
+    return;
+  }
   const res = spawnSync('node', [EXTRACT, '--inspect', '--with-cell-text', args.out], { encoding: 'utf8', maxBuffer: 1 << 26 });
   const root = JSON.parse(res.stdout);
   const tables = Array.isArray(root) ? root : (root.tables || []);

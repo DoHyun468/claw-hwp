@@ -1,0 +1,9 @@
+{
+  "template": "experiment/labor_template.hwp",
+  "_comment": "표준근로계약서 — 근로자(Employee) 개인정보 블록. 라벨에 영문이 같이 있어 '성명'은 employer/employee 중복 → 영문 needle로 구분. 값 없음.",
+  "fields": [
+    { "label": "Name of the employee", "key": "name",      "col_offset": 1 },
+    { "label": "생년월일",             "key": "birthdate", "col_offset": 1 },
+    { "label": "본국주소",             "key": "address",   "col_offset": 1 }
+  ]
+}
