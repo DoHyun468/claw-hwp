@@ -190,8 +190,6 @@ Fine-tune without defining a whole theme via the top-level `theme_overrides` obj
 
 All five themes use only render-confirmed fonts (see the **`font_family`** note below for which fonts render where). Theme colours/fonts take effect when **building a new document** (payload starts with `setup_document`); for in-place edits of an existing form, append ops stay plain text (same as the heading-styling limitation noted below).
 
-> **표 머리행 색 (새 문서 빌드 전용)** — 표를 만들면 **첫 행이 자동으로 머리행**이 되어 테마색 연한 틴트 + 굵게로 칠해진다(정부=회색, 그 외=헤딩색에서 파생한 연한 톤; 연한 배경 + 검은 글자가 한컴에 잘 맞는다 — docx식 진한 배경+흰 글자가 아님). 머리글은 `headers`로 넘기는 게 정석이고, `rows`에만 넣어도 `rows[0]`이 자동으로 머리행 승격된다. 색을 바꾸려면 `header_fill:"#RRGGBB"`(연한 톤 권장, 검은 글자 가독). 머리글이 없는 순수 데이터/레이아웃 표만 `no_header:true`로 끈다. ⚠️ 이 자동 틴트는 **새 문서 빌드**(payload가 `setup_document`로 시작)에만 적용된다 — 사용자가 준 **기존 양식/템플릿을 편집**할 땐 원본 표 스타일을 그대로 보존하고 머리행 색을 강제하지 않는다.
-
 **Op vocabulary** (grouped by purpose):
 
 *Creation / appending content (used while building a doc top-down):*
@@ -465,33 +463,7 @@ Filling a blank form (the user gives a `.hwp`/`.hwpx` template and wants the fie
 - Engine = `hwpx-edit.js` (unpack → edit XML → repack): **surgical and 한컴-safe at any document size** (no round-trip serialization).
 - `replace_text` is **control- and run-aware**: it matches a placeholder even when Hancom split it with inline controls (`<hp:fwSpace/>` full-width space, `<hp:tab/>`, line break — extremely common in Korean form titles/dates/author lines) **and** when it's split across differently-formatted runs. The fill keeps the first run's look; controls inside the matched span are dropped. So a natural `find` like `"2017. 3. 28(금)"` or a full author line fills even though it's stored `"2017.<hp:fwSpace/> 3. 28(금)"` across runs. It also reaches **table-cell** text, including **nested** tables.
 - **No `set_cell_text_by_label`** here — address cells by index: `set_cell_text {table, row, col, text}`. ⚠️ The op `table` index counts **top-level tables only** (a table nested inside another table's cell is NOT separately indexed) — this differs from `--inspect`'s `tableCount` and a raw `<hp:tbl>` count. So `set_cell_text` can't reach a **nested** cell; fill those with `replace_text` (now control/run-aware). Find top-level indices with `--format markdown`. `fill_template {values:{ "{{key}}": "값", … }}` batch-replaces `{{token}}` placeholders in one op.
-
-#### `.hwp` form notes
-- Engine = `create.js` raw-patch (`cell-patch.js`), byte-level in place: **text/cell fills are 한컴-safe at any size.**
-- **`set_cell_text_by_label`** is the easiest tool — finds a cell by its label text and writes the adjacent cell (`col_offset`/`row_offset`), no coordinates needed.
-- ⚠️ **`replace_text` does NOT enter table cells** here (rhwp's `searchText` skips `<hp:tbl>`). If it reports 0 matches on an anchor you can see, it's in a table → switch to `set_cell_text_by_label`.
-- ⚠️ **Adding new objects** (images, etc.) to a **large** form (50+ pages) via the rhwp round-trip isn't 한컴-safe — on big forms, fill text/cells only.
-
-### "Fill in this form / 서식 / 양식 / 템플릿" — filling a template
-
-Filling a blank form (the user gives a `.hwp`/`.hwpx` template and wants the fields populated) is just in-place editing, but the failure modes are specific enough to call out. **The workflow is the same for both formats; only the engine caveats differ — so: common workflow first, then per-format notes.**
-
-#### Common (both `.hwp` and `.hwpx`)
-
-1. **Never start the payload with `setup_document`** on an existing file — that builds a brand-new blank doc and destroys the form (`create.js` refuses it unless `allow_overwrite:true`). Load the file and use fill ops.
-2. **Map the fields first.** Run `extract_text.js --format markdown <file>` (shows tables + text in document order) and `--inspect` (table / cell counts). For each value the user wants, decide: is the placeholder a **body paragraph** or a **table cell**, and what is its exact text?
-3. **Pick the tool by field type:** `replace_text {find, replace}` for inline placeholder text; cell ops for table cells (see per-format below).
-4. **Plain text only.** No markdown — `**bold**` lands as literal asterisks. Styling an existing form's cells is limited; if a styling op errors, report it as a limitation rather than faking it.
-5. **Verify** with `extract_text.js --format markdown` (did the values land?) **and a real 한컴 open** — placeholders are very often split mid-string, so always eyeball the render.
-
-**`replace_text` gotchas (both formats):**
-- **It's global** — replaces *every* occurrence of `find`. Boilerplate placeholder text that repeats (a font-name note, `○○○`, `_____`) changes everywhere. Use a **distinctive/unique** substring, or target the specific cell/index.
-- **Escaped characters.** `<`, `>`, `&` are stored as `&lt; &gt; &amp;`, so a `find` that literally contains them won't match — search the text without the brackets. (Full-width-space / tab / line-break controls that split a placeholder mid-string, and placeholders split across differently-formatted runs, are handled automatically in `.hwpx` — see below; on `.hwp` they are not.)
-
-#### `.hwpx` form notes
-- Engine = `hwpx-edit.js` (unpack → edit XML → repack): **surgical and 한컴-safe at any document size** (no round-trip serialization).
-- `replace_text` is **control- and run-aware**: it matches a placeholder even when Hancom split it with inline controls (`<hp:fwSpace/>` full-width space, `<hp:tab/>`, line break — extremely common in Korean form titles/dates/author lines) **and** when it's split across differently-formatted runs. The fill keeps the first run's look; controls inside the matched span are dropped. So a natural `find` like `"2017. 3. 28(금)"` or a full author line fills even though it's stored `"2017.<hp:fwSpace/> 3. 28(금)"` across runs. It also reaches **table-cell** text, including **nested** tables.
-- **No `set_cell_text_by_label`** here — address cells by index: `set_cell_text {table, row, col, text}`. ⚠️ The op `table` index counts **top-level tables only** (a table nested inside another table's cell is NOT separately indexed) — this differs from `--inspect`'s `tableCount` and a raw `<hp:tbl>` count. So `set_cell_text` can't reach a **nested** cell; fill those with `replace_text` (now control/run-aware). Find top-level indices with `--format markdown`. `fill_template {values:{ "{{key}}": "값", … }}` batch-replaces `{{token}}` placeholders in one op.
+- ⚠️ **`set_cell_text` overwrites the WHOLE cell paragraph — keep the visual length.** It replaces the cell's entire text with your string. When the cell is a **positioning layout** — a label + padding spaces or an underline run with a marker pinned at a fixed column (`성명 ____________ (서명)`, `홍길동          (인)`, a `____________` 서명선) — your new string must have the **same character count** as the original: read the cell first (`--format markdown`/`--inspect`), then delete exactly as many underline/padding chars as the characters you add (이름 3글자 넣으면 밑줄/공백 3개 삭제). If you guess by eye and end up longer, **the line wraps, the row grows taller, or the trailing `(서명)`/`(인)` marker shifts out of place** — and replacing with just the bare value drops the underline + marker entirely. A plain empty cell carries no layout, so a short value just drops in. (`.hwp` `set_cell_text` behaves the same — both overwrite the whole cell paragraph.)
 
 #### `.hwp` form notes
 - Engine = `create.js` raw-patch (`cell-patch.js`), byte-level in place: **text/cell fills are 한컴-safe at any size.**
