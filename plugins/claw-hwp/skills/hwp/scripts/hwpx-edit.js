@@ -3140,6 +3140,95 @@ function sealTableAdvanceMm(doc, tblInner) {
   return top + h + bot;
 }
 
+// Locate the (possibly NESTED) table cell whose own text contains `anchor`, and
+// return the seal origin (mm) measured from the TOP-LEVEL table's top-left,
+// accumulated down the nesting path (a table inside a cell sits at that cell's
+// content corner). Floating offsets are relative to the top-level table anchor,
+// so a deep cell is just the path sum — and the seal run can be spliced into the
+// top-level cell (its render position is offset-driven, not run-location-driven).
+// Without this, a signature cell inside a nested table matched the OUTER cell and
+// the stamp landed on the wrong (outer) row — the nested-cell-width bug.
+function sealDescend(doc, tblInner, anchor, accX, accY, H) {
+  const ptxt = (inner) => (inner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((s) => s.replace(/<\/?hp:t>/g, '')).join('');
+  // A cell's OWN cellAddr/cellSpan/cellSz/cellMargin come AFTER its <hp:subList>.
+  // If the cell holds a NESTED table, that table's cellAddr/Sz/... sit inside the
+  // subList and would be matched first by a plain .match() — reading the inner
+  // cell's attrs instead of this cell's. So read own attrs from the tail after
+  // the cell's last </hp:subList>. (This was the nested-cell-width bug.)
+  const own = (ti) => { const k = ti.lastIndexOf('</hp:subList>'); return k >= 0 ? ti.slice(k) : ti; };
+  const rows = scanTopLevel(tblInner, 'hp:tr');
+  if (!rows.length) return null;
+  const tblW = Number((tblInner.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
+  const om = tblInner.match(/<hp:outMargin\b[^>]*\bleft="(\d+)"[^>]*\btop="(\d+)"/);
+  const outL = om ? Number(om[1]) / H : 0;
+  const outT = om ? Number(om[2]) / H : 0;
+  let colCnt = 1; const colW = {};
+  for (const r of rows) for (const c of scanTopLevel(r.inner, 'hp:tc')) {
+    const o = own(c.inner);
+    const ca = Number((o.match(/\bcolAddr="(\d+)"/) || [, -1])[1]);
+    if (ca + 1 > colCnt) colCnt = ca + 1;
+    const w = Number((o.match(/<hp:cellSz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
+    if (ca >= 0 && w > 100 && colW[ca] == null) colW[ca] = w;
+  }
+  const colWmm = (c) => (colW[c] != null ? colW[c] : (tblW ? tblW / colCnt : 0)) / H;
+  const rowHmm = (rEl) => {
+    let h = 0;
+    for (const c of scanTopLevel(rEl.inner, 'hp:tc')) {
+      const o = own(c.inner);
+      const csH = Number((o.match(/<hp:cellSz\b[^>]*\bheight="(\d+)"/) || [, 0])[1]);
+      const rs = Math.max(1, Number((o.match(/\browSpan="(\d+)"/) || [, 1])[1]));
+      let hi;
+      if (csH > 300) {
+        hi = (csH / rs) / H;
+      } else {
+        const sub = scanTopLevel(c.inner, 'hp:subList')[0];
+        const lines = sub ? Math.max(1, scanTopLevel(sub.inner, 'hp:p').filter((pp) => /<hp:t>/.test(pp.inner)).length) : 1;
+        const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+        const cm = o.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
+        const mv = cm ? (Number(cm[1]) + Number(cm[2])) / H : 2.8;
+        hi = lines * (ptc * PT2MM * 1.3) + mv;
+      }
+      h = Math.max(h, hi);
+    }
+    return h || 7;
+  };
+  for (let ri = rows.length - 1; ri >= 0; ri--) {
+    const tcs = scanTopLevel(rows[ri].inner, 'hp:tc');
+    for (let ci = tcs.length - 1; ci >= 0; ci--) {
+      const tc = tcs[ci];
+      if (!ptxt(tc.inner).includes(anchor)) continue;
+      const o = own(tc.inner);
+      const tcCol = Number((o.match(/\bcolAddr="(\d+)"/) || [, ci])[1]);
+      const tcRow = Number((o.match(/\browAddr="(\d+)"/) || [, ri])[1]);
+      let colX = 0; for (let c = 0; c < tcCol; c++) colX += colWmm(c);
+      let rowY = 0; for (let r = 0; r < tcRow; r++) rowY += rowHmm(rows[r]);
+      const cm = o.match(/<hp:cellMargin\b[^>]*\bleft="(\d+)"[^>]*\bright="(\d+)"[^>]*\btop="(\d+)"/);
+      const cmL = cm ? Number(cm[1]) / H : 1.41, cmR = cm ? Number(cm[2]) / H : 1.41, cmT = cm ? Number(cm[3]) / H : 1.41;
+      const cellX = accX + outL + colX + cmL;     // content-left from top-level table top-left
+      const cellTopY = accY + outT + rowY + cmT;   // content-top
+      // A table nested inside this cell that also carries the anchor → recurse.
+      const nested = scanTopLevel(tc.inner, 'hp:tbl').find((nt) => ptxt(nt.inner).includes(anchor));
+      if (nested) {
+        const deep = sealDescend(doc, nested.inner, anchor, cellX, cellTopY, H);
+        if (deep) return deep;
+      }
+      const sub = scanTopLevel(tc.inner, 'hp:subList')[0];
+      if (!sub) continue;
+      const p = scanTopLevel(sub.inner, 'hp:p')[0];
+      if (!p) continue;
+      const tcH = Number((o.match(/<hp:cellSz\b[^>]*\bheight="(\d+)"/) || [, 0])[1]);
+      const tcRs = Math.max(1, Number((o.match(/\browSpan="(\d+)"/) || [, 1])[1]));
+      const vAlign = (sub.attrs.match(/vertAlign="([^"]*)"/) || [, 'CENTER'])[1].toUpperCase();
+      const centred = tcH > 300 && vAlign !== 'TOP';
+      const originYMm = centred ? (accY + outT + rowY + (tcH / tcRs) / H / 2) : cellTopY;
+      const alignH = sealParaAlign(doc, (p.attrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
+      const boxWidthMm = Math.max(2, colWmm(tcCol) - cmL - cmR);
+      return { pInner: p.inner, originXMm: cellX, originYMm, boxWidthMm, vFactor: centred ? 0 : -0.08, alignH };
+    }
+  }
+  return null;
+}
+
 function opPlaceSeal(doc, op) {
   const anchor = op.anchor;
   if (!anchor) throw new Error('place_seal: "anchor" text is required (e.g. "서명 또는 인")');
@@ -3284,58 +3373,30 @@ function opPlaceSeal(doc, op) {
     doc.write(name, dropLinesegs(spliceEl(xml, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, frm)}</hp:p>`)));
     return { placed: true, anchor, mode, frame: frm.toLowerCase(), where: 'paragraph', size_mm: sealMm, width_mm: r1(wMm), dx_mm: r1(dx), dy_mm: r1(dy) };
   }
-  // 2) table cells — a fixed floating object placed in a cell positions itself
-  // relative to the table's anchor (text-area-left, table-top), so add the
-  // cell's content corner: preceding column widths + preceding row heights +
-  // table outMargin + this cell's 안여백. Column widths come from cellSz (rhwp
-  // ships garbage ≤100 → fall back to equal split of the table width); row
-  // heights are estimated from each row's tallest cell (line count × line height
-  // + 안여백), since cellSz height is unreliable. dx_mm/dy_mm override if a
-  // caller needs to nudge.
+  // 2) table cells. sealDescend() finds the cell whose own text holds the anchor
+  // — recursing through NESTED tables — and returns the seal origin summed down
+  // the nesting path (relative to the top-level table's top-left). The seal run
+  // is then spliced into the TOP-LEVEL cell that contains the anchor: because the
+  // object is floating, its render position is the offset, not where the run
+  // lives, so we never have to rebuild deeply-nested XML.
   for (const name of doc.sectionNames()) {
     let xml = doc.read(name);
     const tbls = scanTopLevel(xml, 'hp:tbl');
     for (let ti = tbls.length - 1; ti >= 0; ti--) {
       const tbl = tbls[ti];
+      if (!paraText(tbl.inner).includes(anchor)) continue;
+      const geom = sealDescend(doc, tbl.inner, anchor, 0, 0, H);
+      if (!geom) continue;
+      const { sealMm, wMm, dx, dy, mode } = calc(geom.pInner, {
+        originXMm: geom.originXMm,
+        originYMm: geom.originYMm,
+        boxWidthMm: geom.boxWidthMm,
+        roomWidthMm: geom.boxWidthMm,
+        vFactor: geom.vFactor,
+        alignH: geom.alignH,
+      });
+      // Splice the seal run into the top-level cell that contains the anchor.
       const rows = scanTopLevel(tbl.inner, 'hp:tr');
-      const colCnt = Math.max(1, Number((tbl.attrs.match(/colCnt="(\d+)"/) || [, 1])[1]));
-      const tblInner = Number((tbl.inner.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
-      const om = tbl.inner.match(/<hp:outMargin\b[^>]*\bleft="(\d+)"[^>]*\btop="(\d+)"/);
-      const outLMm = om ? Number(om[1]) / H : 0;
-      const outTMm = om ? Number(om[2]) / H : 0;
-      // Per-column width (HWPUNIT) from any non-garbage cellSz; else equal split.
-      const colW = {};
-      for (const r of rows) for (const c of scanTopLevel(r.inner, 'hp:tc')) {
-        const ca = Number((c.inner.match(/\bcolAddr="(\d+)"/) || [, -1])[1]);
-        const w = Number((c.inner.match(/<hp:cellSz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
-        if (ca >= 0 && w > 100 && colW[ca] == null) colW[ca] = w;
-      }
-      const colWmm = (c) => (colW[c] != null ? colW[c] : (tblInner ? tblInner / colCnt : 0)) / H;
-      // Estimated height (mm) of a row = tallest cell's (lines × lineH + 안여백).
-      const rowHmm = (rEl) => {
-        let h = 0;
-        for (const c of scanTopLevel(rEl.inner, 'hp:tc')) {
-          // Real Hancom-authored tables ship a trustworthy cellSz height — use
-          // it directly (divide a vertically-merged cell by its rowSpan so it
-          // counts as one row). rhwp-synthesised tables ship garbage (≤300) →
-          // fall back to the line-count estimate.
-          const csH = Number((c.inner.match(/<hp:cellSz\b[^>]*\bheight="(\d+)"/) || [, 0])[1]);
-          const rs = Math.max(1, Number((c.inner.match(/\browSpan="(\d+)"/) || [, 1])[1]));
-          let hi;
-          if (csH > 300) {
-            hi = (csH / rs) / H;
-          } else {
-            const sub = scanTopLevel(c.inner, 'hp:subList')[0];
-            const lines = sub ? Math.max(1, scanTopLevel(sub.inner, 'hp:p').filter((pp) => /<hp:t>/.test(pp.inner)).length) : 1;
-            const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
-            const cm = c.inner.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
-            const mv = cm ? (Number(cm[1]) + Number(cm[2])) / H : 2.8;
-            hi = lines * (ptc * PT2MM * 1.3) + mv;
-          }
-          h = Math.max(h, hi);
-        }
-        return h || 7;
-      };
       for (let ri = rows.length - 1; ri >= 0; ri--) {
         const tcs = scanTopLevel(rows[ri].inner, 'hp:tc');
         for (let ci = tcs.length - 1; ci >= 0; ci--) {
@@ -3343,34 +3404,6 @@ function opPlaceSeal(doc, op) {
           if (!paraText(tc.inner).includes(anchor)) continue;
           const sub = scanTopLevel(tc.inner, 'hp:subList')[0];
           const p = scanTopLevel(sub.inner, 'hp:p')[0];
-          const tcCol = Number((tc.inner.match(/\bcolAddr="(\d+)"/) || [, ci])[1]);
-          const tcRow = Number((tc.inner.match(/\browAddr="(\d+)"/) || [, ri])[1]);
-          let colX = 0; for (let c = 0; c < tcCol; c++) colX += colWmm(c);
-          let rowY = 0; for (let r = 0; r < tcRow; r++) rowY += rowHmm(rows[r]);
-          const cm = tc.inner.match(/<hp:cellMargin\b[^>]*\bleft="(\d+)"[^>]*\bright="(\d+)"[^>]*\btop="(\d+)"/);
-          const cmL = cm ? Number(cm[1]) / H : 1.41;
-          const cmR = cm ? Number(cm[2]) / H : 1.41;
-          const cmT = cm ? Number(cm[3]) / H : 1.41;
-          const boxWidthMm = Math.max(2, colWmm(tcCol) - cmL - cmR);
-          // Vertical anchor inside the cell. Hancom cells default to vertical
-          // CENTER, so in a tall cell the text sits at the cell's middle, not its
-          // top. When the cell ships a real height (Hancom-authored tables),
-          // centre the seal on cellHeight/2; otherwise (synthesised garbage
-          // height) fall back to the cell-top + line estimate.
-          const tcH = Number((tc.inner.match(/<hp:cellSz\b[^>]*\bheight="(\d+)"/) || [, 0])[1]);
-          const tcRs = Math.max(1, Number((tc.inner.match(/\browSpan="(\d+)"/) || [, 1])[1]));
-          const vAlign = (sub.attrs.match(/vertAlign="([^"]*)"/) || [, 'CENTER'])[1].toUpperCase();
-          const centred = tcH > 300 && vAlign !== 'TOP';
-          const originYMm = centred ? (outTMm + rowY + (tcH / tcRs) / H / 2) : (outTMm + rowY + cmT);
-          const alignH = sealParaAlign(doc, (p.attrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
-          const { sealMm, wMm, dx, dy, mode } = calc(p.inner, {
-            originXMm: outLMm + colX + cmL,
-            originYMm,
-            boxWidthMm,
-            roomWidthMm: boxWidthMm,
-            vFactor: centred ? 0 : -0.08,
-            alignH,
-          });
           const newSub = `<hp:subList${sub.attrs}>${spliceEl(sub.inner, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, 'PARA')}</hp:p>`)}</hp:subList>`;
           const newTc = `<hp:tc${tc.attrs}>${spliceEl(tc.inner, sub, newSub)}</hp:tc>`;
           const newRow = `<hp:tr${rows[ri].attrs}>${spliceEl(rows[ri].inner, tc, newTc)}</hp:tr>`;
