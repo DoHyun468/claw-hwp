@@ -258,7 +258,7 @@ function cmdFill(args) {
       if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: name, key: f.key, status: 'EMPTY_KEY' }); continue; }
       const val = formatValue(String(raw), f.format); // reshape in-tool (date/phone/rrn/…)
       if (f.placeholder != null) values[f.placeholder] = val;
-      else if (f.table != null && f.row != null && f.col != null) operations.push({ type: 'set_cell_text', table: f.table, row: f.row, col: f.col, text: val });
+      else if (f.table != null && f.row != null && f.col != null) operations.push({ type: 'set_cell_text', table: f.table, row: f.row, col: f.col, text: val, fit: f.fit ?? true });
       else refuse(`.hwpx field '${f.key}' needs 'placeholder' OR 'table'+'row'+'col' (label+offset is .hwp-only)`);
       attempted.push({ field: name, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
     }
@@ -283,7 +283,7 @@ function cmdFill(args) {
     const raw = profile[f.key];
     if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: f.label, key: f.key, status: 'EMPTY_KEY' }); continue; }
     const val = formatValue(String(raw), f.format); // reshape per-field (date/phone/rrn/…), in-tool
-    operations.push({ type: 'set_cell_text_by_label', label: f.label, text: val, col_offset: f.col_offset ?? 0, row_offset: f.row_offset ?? 0 });
+    operations.push({ type: 'set_cell_text_by_label', label: f.label, text: val, col_offset: f.col_offset ?? 0, row_offset: f.row_offset ?? 0, fit: f.fit ?? true }); // fit: 길이보존(에이전트가 PII 값을 못 세므로 in-tool 자동); no-op when no padding run
     attempted.push({ field: f.label, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
   }
   const res = spawnSync('node', [CREATE], { input: JSON.stringify({ path: out, operations }), encoding: 'utf8', maxBuffer: 1 << 26 });

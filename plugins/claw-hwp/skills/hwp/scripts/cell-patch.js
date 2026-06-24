@@ -208,8 +208,40 @@ function makeParaTextRecord(text) {
   return Buffer.concat([head, body]);
 }
 
-function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0, removeObjects = false) {
+// Length-preserving fill ("fit"): a positioning-layout cell is a label + a run of
+// padding spaces + (optionally) a trailing marker like "(직인)"/"(인)" parked at a fixed
+// column. Overwriting the whole paragraph with a bare value would drop the label/marker
+// and change the width — so the row wraps or the marker shifts. fitValueIntoLayout keeps
+// the ORIGINAL text and drops the value into its longest space run, deleting exactly as
+// many padding spaces as the value's length, so the total char count + label + marker are
+// preserved. This is the in-tool form of the agent-driven "read the cell, count, delete
+// padding" rule (SKILL set_cell_text) — needed by secure-fill, where the agent never sees
+// the PII value and so cannot count it. Falls back to the bare value when there is no
+// padding run that can absorb it (then the caller's normal overwrite applies).
+function fitValueIntoLayout(orig, value) {
+  if (!value) return value;
+  let bestIdx = -1, bestLen = 0;
+  const re = / {2,}/g; let m;
+  while ((m = re.exec(orig))) { if (m[0].length > bestLen) { bestLen = m[0].length; bestIdx = m.index; } }
+  if (bestLen < value.length) return value; // no padding run long enough → can't preserve, write as-is
+  // Drop the value into the padding run (keep one leading space when the run has room so it
+  // doesn't glue to the label), deleting exactly value.length spaces; total length unchanged.
+  const keep = bestLen > value.length ? 1 : 0;
+  return orig.slice(0, bestIdx + keep) + value + orig.slice(bestIdx + keep + value.length);
+}
+
+function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0, removeObjects = false, fit = false) {
   const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara);
+  // Length-preserving fill: rebuild `text` from the cell's current layout so the row
+  // width / trailing marker survive. Only for pure-text paragraphs — if the original
+  // carries inline controls (a field-wrapped marker, etc.) we skip it to avoid corrupting
+  // them (the bare overwrite then applies, same as before — no regression).
+  if (fit && text && loc.paraTextRec !== null) {
+    const ptr = records[loc.paraTextRec];
+    let orig = raw.slice(ptr.dataOff, ptr.dataOff + ptr.size).toString('utf16le');
+    if (orig.endsWith(PARA_TEXT_EOP)) orig = orig.slice(0, -1);
+    if (![...orig].some((ch) => ch.codePointAt(0) < 0x20)) text = fitValueIntoLayout(orig, text);
+  }
   if (loc.hasInlineObject && !(text === '' && removeObjects)) {
     // The paragraph hosts an inline object (e.g. an embedded 그림/figure). Rewriting
     // its PARA_TEXT drops the object's anchor char and orphans the control, which
@@ -1102,7 +1134,7 @@ function patchInPlaceSectors(filePath, resolved) {
     );
     for (const e of editsSorted) {
       const records = parseRecords(raw);
-      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects);
+      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',
@@ -1189,7 +1221,7 @@ async function patchViaSheetjs(filePath, resolved) {
     );
     for (const e of editsSorted) {
       const records = parseRecords(raw);
-      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '');
+      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',
@@ -4323,10 +4355,15 @@ export async function insertImageInPlace(filePath, ops) {
           const ab = Buffer.from(op.anchor, 'utf16le');
           // Find the anchor PARA_TEXT at ANY depth — body (level 1) OR a table cell
           // (level 3). The gso attaches to that paragraph wherever it lives.
-          let ptIdx = -1;
+          // Honour anchor_occurrence (set by place_seal) so the gso attaches to the
+          // SAME Nth "(서명)" the caller measured against — not just the first match.
+          let ptIdx = -1, seenAnchor = 0; const wantOcc = op.anchor_occurrence ?? 0;
           for (let i = 0; i < records.length; i++) {
             const r = records[i];
-            if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { ptIdx = i; break; }
+            if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) {
+              if (seenAnchor === wantOcc) { ptIdx = i; break; }
+              seenAnchor++;
+            }
           }
           if (ptIdx !== -1) {
             const ptRec = records[ptIdx];
@@ -4493,14 +4530,25 @@ export async function placeSealInPlace(filePath, ops) {
     const raw = readDecodedStreamFromCfb(buf, ['BodyText', 'Section0']);
     const records = parseRecords(raw);
     const ab = Buffer.from(op.anchor, 'utf16le');
-    let ptRec = null, ptIdx = -1, anchorByteInBody = -1;
+    // A form can repeat the same signature marker (e.g. a 확인서 that carries BOTH a
+    // main signature line AND a 개인정보 동의서 signature, each reading "(서명)" on a
+    // different page). First-match would always grab the earlier one. `occurrence`
+    // (0-based, default 0) selects the Nth match so the seal lands on the intended line.
+    const occ = op.occurrence ?? 0;
+    let ptRec = null, ptIdx = -1, anchorByteInBody = -1, seen = 0;
     for (let i = 0; i < records.length; i++) {
       const r = records[i];
       if (r.tag !== TAG_PARA_TEXT || r.size <= 0) continue;
       const idx = raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab);
-      if (idx !== -1) { ptRec = r; ptIdx = i; anchorByteInBody = idx; break; }
+      if (idx !== -1) {
+        if (seen === occ) { ptRec = r; ptIdx = i; anchorByteInBody = idx; break; }
+        seen++;
+      }
     }
-    if (!ptRec) throw new Error(`place_seal: anchor "${op.anchor}" not found in body text`);
+    if (!ptRec) {
+      const total = records.filter((r) => r.tag === TAG_PARA_TEXT && r.size > 0 && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1).length;
+      throw new Error(`place_seal: anchor "${op.anchor}" occurrence ${occ} not found (${total} occurrence(s) of this anchor in body — use occurrence 0..${Math.max(0, total - 1)})`);
+    }
     const body = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
 
     const fontPt = op.font_pt || 10;
@@ -4529,7 +4577,7 @@ export async function placeSealInPlace(filePath, ops) {
     let posY = -(size - lineH) / 2 + (op.dy_mm || 0);
 
     const imgOp = {
-      type: 'insert_image', path: source, anchor: op.anchor, wrap: 'front', frame,
+      type: 'insert_image', path: source, anchor: op.anchor, anchor_occurrence: occ, wrap: 'front', frame,
       pos_x_mm: posX, pos_y_mm: posY, width_mm: size, height_mm: size,
     };
     const r = await insertImageInPlace(filePath, [imgOp]);
