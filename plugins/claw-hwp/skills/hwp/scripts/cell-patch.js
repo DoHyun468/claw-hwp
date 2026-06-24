@@ -4259,6 +4259,12 @@ export async function insertImageInPlace(filePath, ops) {
       // axis → the other follows; give both → explicit squeeze).
       const px = readImagePixelSize(imgBuf);
       applyGsoSize(cluster, resolveAspectSize(op, px && px.w > 0 && px.h > 0 ? px.w / px.h : gsoCtrlRatio(cluster)));
+      // Placement: inline (글자처럼, default — back-compat) or a floating wrap
+      // (front/behind/square/topbottom) + optional pos_x_mm/pos_y_mm. Lets an image
+      // float "앞으로" at an absolute position (seal/도장 placement) — same gso
+      // CTRL wrap+offset path that insert_shape/set_object_property use. Default
+      // resolves to inline, so existing insert_image stays byte-identical.
+      applyGsoPlacement(cluster, op, resolveWrapMode(op));
       if (op.cell && (Number.isInteger(op.cell.row) || Number.isInteger(op.cell.col))) {
         // ── Insert into a table CELL — the image becomes a new (treat-as-char)
         // paragraph inside the cell. The body-built gso cluster is dropped two
@@ -4278,22 +4284,60 @@ export async function insertImageInPlace(filePath, ops) {
         raw.writeUInt16LE((raw.readUInt16LE(lhDataOff) + 1) & 0xFFFF, lhDataOff); // nParagraphs++
         normalizeCellLastParaFlag(raw, t2.startByte, t2.endByte, 2);
       } else {
-        // ── Insert into the body (after the anchor paragraph, else last simple). ──
-        let insertAt = raw.length;
+        const wrapMode = resolveWrapMode(op);
         const clusters = findClusterBoundaries(records);
-        if (op.anchor && typeof op.anchor === 'string') {
+        // FLOATING image with an anchor → attach the gso to the anchor paragraph itself
+        // (like insert_shape) instead of opening a NEW paragraph after it. The gso's PARA
+        // frame origin is then the anchor's OWN line, so pos_x/pos_y place the image on
+        // that line; a new paragraph below sits under the anchor and the PARA frame clamps
+        // the image down (can't lift above its para top). Inline keeps the new-paragraph
+        // path (byte-identical, back-compat).
+        let attached = false;
+        if (wrapMode !== 'inline' && op.anchor && typeof op.anchor === 'string') {
           const ab = Buffer.from(op.anchor, 'utf16le');
+          let cl = null, ptRec = null;
           for (const c of clusters) {
-            let hit = false;
-            for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } }
-            if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; }
+            for (let i = c.startIdx + 1; i < c.endIdx; i++) {
+              const r = records[i];
+              if (r.tag === TAG_PARA_TEXT && r.level === 1 && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { cl = c; ptRec = r; break; }
+            }
+            if (ptRec) break;
           }
-        } else {
-          const t = findLastSimpleBodyParagraph(records);
-          insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+          if (ptRec) {
+            const cr = parseRecords(cluster);                       // the full-para image cluster
+            const ctrlR = cr.find((r) => r.tag === TAG_CTRL_HEADER);
+            const gsoPart = Buffer.from(cluster.slice(ctrlR.headOff)); // CTRL_HEADER + SHAPE_COMPONENT + CTRL_DATA (size/wrap/pos already applied)
+            const gsoChar = Buffer.from('0b00206f736700000000000000000b00', 'hex'); // inline gso anchor (8 wchars), before EOP
+            const oldBody = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+            const insAt = oldBody.length >= 2 ? oldBody.length - 2 : oldBody.length;
+            const newPtRec = Buffer.concat([buildRecordHeader(TAG_PARA_TEXT, 1, oldBody.length + gsoChar.length), oldBody.slice(0, insAt), gsoChar, oldBody.slice(insAt)]);
+            const phOff = records[cl.startIdx].dataOff;             // anchor PARA_HEADER: char_count += 8, control_mask |= 0x800
+            const curCount = raw.readUInt32LE(phOff);
+            raw.writeUInt32LE((((curCount & 0x80000000) >>> 0) | ((curCount & 0x7FFFFFFF) + 8)) >>> 0, phOff);
+            raw.writeUInt32LE((raw.readUInt32LE(phOff + 4) | 0x800) >>> 0, phOff + 4);
+            const clusterEndOff = cl.endIdx < records.length ? records[cl.endIdx].headOff : raw.length;
+            raw = Buffer.concat([raw.slice(0, clusterEndOff), gsoPart, raw.slice(clusterEndOff)]); // gso at para end (after PARA_TEXT → ptRec offsets stay valid)
+            raw = Buffer.concat([raw.slice(0, ptRec.headOff), newPtRec, raw.slice(ptRec.dataOff + ptRec.size)]);
+            attached = true;
+          }
         }
-        raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
-        normalizeLastParaFlag(raw);
+        if (!attached) {
+          // ── Inline (or floating w/ no anchor match): open a new paragraph. ──
+          let insertAt = raw.length;
+          if (op.anchor && typeof op.anchor === 'string') {
+            const ab = Buffer.from(op.anchor, 'utf16le');
+            for (const c of clusters) {
+              let hit = false;
+              for (let i = c.startIdx + 1; i < c.endIdx; i++) { const r = records[i]; if (r.tag === TAG_PARA_TEXT && raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab) !== -1) { hit = true; break; } }
+              if (hit) { insertAt = c.endIdx < records.length ? records[c.endIdx].headOff : raw.length; break; }
+            }
+          } else {
+            const t = findLastSimpleBodyParagraph(records);
+            insertAt = t.endIdx < records.length ? records[t.endIdx].headOff : raw.length;
+          }
+          raw = Buffer.concat([raw.slice(0, insertAt), cluster, raw.slice(insertAt)]);
+          normalizeLastParaFlag(raw);
+        }
       }
 
       let newComp;
@@ -4315,6 +4359,104 @@ export async function insertImageInPlace(filePath, ops) {
     summary.push({ section: 0, image: op.path, storage_id: storageId, stream: `BinData/${newName}` });
   }
 
+  const result = Object.assign([], summary);
+  result.mode = 'in-place';
+  result.inserted_count = summary.length;
+  return result;
+}
+
+
+// ── place_seal: font-metric seal/signature placement ──────────────────────
+// HWP PARA_TEXT mixes glyphs with inline control chars. A control char occupies
+// either 1 wchar ("char" controls: 0,10,13,24-31) or 8 wchars (inline/extended
+// controls: everything else < 0x20 — the char + 6 param wchars + a closing copy).
+// We need both to walk to the anchor's byte offset AND to add zero width for them.
+function sealCtrlWcharLen(code) {
+  if (code >= 0x20) return 1;
+  if (code === 0 || code === 10 || code === 13 || (code >= 24 && code <= 31)) return 1;
+  return 8;
+}
+// Visual advance of one code unit, in ems. CJK/Hangul/fullwidth = 1 em; ASCII and
+// halfwidth (incl. space) = 0.5 em; control chars = 0. (handoff §2 metric.)
+function sealGlyphEm(code) {
+  if (code < 0x20) return 0;
+  if (code <= 0x7e) return 0.5;
+  if (code >= 0xff61 && code <= 0xffdc) return 0.5; // halfwidth forms
+  return 1.0;
+}
+// Sum the glyph advance (mm) of the PARA_TEXT body up to `uptoByteOff`, skipping
+// inline-control runs by their wchar length so the offset walk stays aligned.
+function sealMeasureWidthMM(body, uptoByteOff, em_mm) {
+  let off = 0, w = 0;
+  while (off < uptoByteOff && off + 2 <= body.length) {
+    const code = body.readUInt16LE(off);
+    if (code >= 0x20) w += sealGlyphEm(code) * em_mm;
+    off += sealCtrlWcharLen(code) * 2;
+  }
+  return w;
+}
+
+// Place a seal/signature PNG floating ("front") onto an anchor phrase, positioned
+// by FONT METRICS — no render needed to find the spot (render is verify/calibrate
+// only, handoff §2). overlap → seal centred on the phrase; right → seal just past
+// the phrase. Auto-size = line × 1.6 clamped [7,18]mm. Frame: 'para' anchors to the
+// line (cells have headroom above → true vertical centre, rule D; a free body line
+// near the page top clamps the seal ~2.6mm low — rule C — so pass frame:'page' for
+// those, with dy_mm to fine-tune). Delegates to insertImageInPlace's GT-verified
+// floating-attach path, so the produced gso is byte-equivalent to insert_image.
+export async function placeSealInPlace(filePath, ops) {
+  const summary = [];
+  for (const op of ops) {
+    if (!op.anchor || typeof op.anchor !== 'string') throw new Error('place_seal: anchor (text) required');
+    const source = op.source || op.path;
+    if (!source) throw new Error('place_seal: source (seal PNG path) required');
+    if (!existsSync(source)) throw new Error(`place_seal: source not found: ${source}`);
+
+    const buf = readFileSync(filePath);
+    const raw = readDecodedStreamFromCfb(buf, ['BodyText', 'Section0']);
+    const records = parseRecords(raw);
+    const ab = Buffer.from(op.anchor, 'utf16le');
+    let ptRec = null, anchorByteInBody = -1;
+    for (const r of records) {
+      if (r.tag !== TAG_PARA_TEXT || r.size <= 0) continue;
+      const idx = raw.slice(r.dataOff, r.dataOff + r.size).indexOf(ab);
+      if (idx !== -1) { ptRec = r; anchorByteInBody = idx; break; }
+    }
+    if (!ptRec) throw new Error(`place_seal: anchor "${op.anchor}" not found in body text`);
+    const body = raw.slice(ptRec.dataOff, ptRec.dataOff + ptRec.size);
+
+    const fontPt = op.font_pt || 10;
+    const em = (fontPt * 25.4) / 72;          // 1 em in mm at this point size
+    const lineH = em;                          // body line ≈ 1 em tall
+    const startX = sealMeasureWidthMM(body, anchorByteInBody, em);
+    let aw = 0;
+    for (const ch of op.anchor) aw += sealGlyphEm(ch.codePointAt(0)) * em;
+
+    let size = op.size_mm != null ? op.size_mm : Math.max(7, Math.min(18, lineH * 1.6));
+    // mode auto: sit beside the phrase when there's ≥ seal+2mm of room, else overlap.
+    const TEXT_AREA_W = op.text_area_mm || 150; // typical A4 body width
+    let mode = String(op.mode || 'auto').toLowerCase();
+    if (mode === 'auto') mode = (TEXT_AREA_W - (startX + aw) >= size + 2) ? 'right' : 'overlap';
+    if (mode !== 'overlap' && mode !== 'right') throw new Error('place_seal: mode must be overlap / right / auto');
+
+    let posX = mode === 'right' ? startX + aw + 2 : startX + aw / 2 - size / 2;
+    posX += (op.dx_mm || 0);
+    const frame = String(op.frame || 'para').toLowerCase();
+    // Centre the seal on the line: lift it by half the overhang. PARA clamps this to
+    // 0 on a free top line (→ top-aligned, GT-equivalent); cells & PAGE frame honour it.
+    let posY = -(size - lineH) / 2 + (op.dy_mm || 0);
+
+    const imgOp = {
+      type: 'insert_image', path: source, anchor: op.anchor, wrap: 'front', frame,
+      pos_x_mm: posX, pos_y_mm: posY, width_mm: size, height_mm: size,
+    };
+    const r = await insertImageInPlace(filePath, [imgOp]);
+    summary.push({
+      anchor: op.anchor, mode, frame,
+      pos_x_mm: +posX.toFixed(2), pos_y_mm: +posY.toFixed(2), size_mm: +size.toFixed(2),
+      ...(r[0] || {}),
+    });
+  }
   const result = Object.assign([], summary);
   result.mode = 'in-place';
   result.inserted_count = summary.length;
@@ -4668,9 +4810,27 @@ function applyGsoPlacement(cluster, op, mode) {
     if (sz === 0xFFF) { sz = cluster.readUInt32LE(p); p += 4; }
     if (tag === 0x47 && cluster.slice(p, p + 4).toString('latin1') === ' osg') {
       const d = p; // CTRL_HEADER data start (' osg' id at d, attribute at d+4)
-      const attr = cluster.readUInt32LE(d + 4);
-      cluster.writeUInt32LE(((attr & ~TABLE_WRAP_MASK) | TABLE_WRAP[mode]) >>> 0, d + 4);
-      // Floating position (paper-relative). Meaningful for square/behind/front;
+      let attr = cluster.readUInt32LE(d + 4);
+      attr = ((attr & ~TABLE_WRAP_MASK) | TABLE_WRAP[mode]) >>> 0;
+      // Position-reference frame (the "개체 위치 기준" enum). GT-confirmed from the
+      // gso common-attribute bit field (vert=bits3-4, horz=bits8-9): a PARA-relative
+      // gso decodes vert=2/horz=3, matching the HWPX `vertRelTo="PARA"/horzRelTo="PARA"`
+      // ground-truth — so the standard enum holds (vert {0:paper,1:page,2:para};
+      // horz {0:paper,1:page,2:column,3:para}). The default template is PARA, which
+      // clamps the object to its anchor-paragraph top (rule C) → can't vertically
+      // centre a tall seal on a one-line body run. `frame:"page"`/`"paper"` lifts that
+      // clamp so pos_y can place the object's centre on the text line. X origin is the
+      // same left-margin line for para/page, so switching keeps pos_x meaning.
+      if (op.frame != null) {
+        const f = String(op.frame).toLowerCase();
+        const VERT = { paper: 0, page: 1, para: 2 };
+        const HORZ = { paper: 0, page: 1, column: 2, para: 3 };
+        if (!(f in VERT)) throw new Error('frame must be para / page / paper');
+        attr = ((attr & ~0x18 & ~0x300) | (VERT[f] << 3) | ((HORZ[f] ?? 3) << 8)) >>> 0;
+      }
+      cluster.writeUInt32LE(attr, d + 4);
+      // Floating position (frame-relative; default paper/para per `op.frame`).
+      // Meaningful for square/behind/front;
       // inline ignores it. Only written when the caller supplies it.
       if (op.pos_x_mm != null && d + GSO_POS_X_OFF + 4 <= cluster.length) {
         cluster.writeUInt32LE(Math.round(op.pos_x_mm * HWPUNIT_PER_MM) >>> 0, d + GSO_POS_X_OFF);
