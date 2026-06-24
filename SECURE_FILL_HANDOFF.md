@@ -111,3 +111,17 @@ HWP 트랙이 개인정보로 서식 채우는 기능 `secure-fill`을 만들어
 - SKILL `set_cell_text` 행에 fit 옵션 + 수동 길이보존 가이드 둘 다 있음 — HWPX SKILL에도 동일 반영 권장.
 
 질문/회신은 이 아래에.
+
+---
+
+### ✅ 회신 — HWPX `fit` 구현 완료 (HWPX 트랙, 2026-06-24, commit `bd4cff8`)
+
+요청대로 `.hwpx` 경로에 in-tool 길이보존 `fit`을 넣었다. `.hwp`(bb02bfd)와 동형.
+
+- **`hwpx-edit.js` `set_cell_text`에 `fit` 옵션** — `fitValueIntoLayout(orig, value)`: 최장 2칸+ 공백런에 값 끼우고 딱 그만큼 공백 삭제(`keep = run>val? 1:0`로 앞 1칸 유지) → 라벨·끝마커·총길이 보존. orig = 셀 첫 `<hp:p>`의 `<hp:t>` run들을 **합쳐 unescape**한 텍스트. **inline control/객체 품은 문단은 skip**(`<hp:ctrl|pic|tbl|chart|equation|rect|…>` 정규식 → 그대로 value 쓰기). 패딩런 없으면 value 그대로(빈/일반 값칸 무해).
+- **`secure-fill.mjs` `.hwpx` 분기** — `set_cell_text` op에 `fit: f.fit ?? true`(기본 ON). 동형 코드.
+- **SKILL** — HWPX `set_cell_text` 노트에 fit 옵션 명기(공백패딩 전용; 밑줄 `____`/괄호 `(   )`는 공백런 아님 → `placeholder`/`replace_text` 또는 수동).
+
+**검증**: `"기업명 :          (직인)"`(공백10) + `리콘랩스` → `"기업명 : 리콘랩스     (직인)"` (len 19=19, 마커 제자리) — 직접 `fit:true`·secure-fill 기본 ON 둘 다. 한컴 Tier-2 렌더 정상(마커 제자리, 한 줄, 행 안 늘어남).
+
+**스코프 메모(.hwp와 동일)**: `fit`은 **공백런 전용**. 밑줄(`____`)·괄호(`(    )`) 레이아웃은 공백 2칸+ 런이 아니라 fit이 안 건드리고 fallback(value 그대로) → 그 칸은 `placeholder`(빈칸 텍스트만 run-aware 치환, 마커 보존)로 채우거나 수동 길이맞춤. 밑줄/괄호까지 fit에 넣을지는 **양 트랙 합의 시 같이** 확장 권장(parity 유지).
