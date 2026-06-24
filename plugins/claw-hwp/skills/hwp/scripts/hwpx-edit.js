@@ -3095,6 +3095,22 @@ function sealParaPrMetrics(doc, paraPrId) {
   }
   return out;
 }
+// Horizontal alignment of a paragraph (LEFT/CENTER/RIGHT/JUSTIFY/...) from its
+// paraPr — cells in real Korean forms are usually CENTER, so a seal anchored to
+// such a line must account for the line being centred in its box, not left-hugged.
+function sealParaAlign(doc, paraPrId) {
+  if (paraPrId == null) return 'LEFT';
+  for (const n of Object.keys(doc.files)) {
+    if (!/header\.xml$/i.test(n)) continue;
+    const h = doc.read(n);
+    const i = h.indexOf(`<hh:paraPr id="${paraPrId}"`);
+    if (i < 0) continue;
+    const blk = h.slice(i, h.indexOf('</hh:paraPr>', i) + 12);
+    const m = blk.match(/<hh:align\b[^>]*\bhorizontal="([^"]*)"/);
+    return m ? m[1].toUpperCase() : 'LEFT';
+  }
+  return 'LEFT';
+}
 // Vertical advance (mm) from a paragraph's top to the next block's top.
 function sealParaAdvanceMm(doc, pInner, pAttrs, pageTextWmm) {
   const pt = charPrFontPt(doc, (pInner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
@@ -3199,13 +3215,22 @@ function opPlaceSeal(doc, op) {
   // and 0/0 for free body text. boxWidthMm = the box's usable inner width (mm);
   // roomWidthMm = the width within which "room to the right" is measured.
   const calc = (inner, o) => {
-    const { originXMm = 0, originYMm = 0, boxWidthMm = null, roomWidthMm = null, vFactor = -0.08 } = o || {};
+    const { originXMm = 0, originYMm = 0, boxWidthMm = null, roomWidthMm = null, vFactor = -0.08, alignH = 'LEFT' } = o || {};
     const txt = paraText(inner);
     const pt = op.font_pt != null ? Number(op.font_pt) : charPrFontPt(doc, (inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
     const idx = txt.indexOf(anchor);
     const startX = estTextWidthMm(idx >= 0 ? txt.slice(0, idx) : txt, pt);
     const aw = estTextWidthMm(anchor, pt);
-    const roomRight = roomWidthMm != null ? Math.max(0, roomWidthMm - (startX + aw)) : null;
+    // The whole line may be centred/right-aligned in its box (default for cells),
+    // so the anchor doesn't start at the content left — shift by where the line
+    // actually begins.
+    const fullW = estTextWidthMm(txt, pt);
+    let lineLeft = 0;
+    if (boxWidthMm != null && fullW < boxWidthMm) {
+      if (alignH === 'CENTER' || alignH === 'DISTRIBUTE') lineLeft = (boxWidthMm - fullW) / 2;
+      else if (alignH === 'RIGHT') lineLeft = boxWidthMm - fullW;
+    }
+    const roomRight = roomWidthMm != null ? Math.max(0, roomWidthMm - (lineLeft + startX + aw)) : null;
     // Auto mode: park it to the right when there's comfortably room beside the
     // anchor (the object's WIDTH must fit), otherwise sit on top (overlap).
     const prov = fixedMm != null ? fixedMm : senseMm(pt, false, null, null);
@@ -3218,7 +3243,7 @@ function opPlaceSeal(doc, op) {
     // ≈ +0.2 when the origin is the page/content top and originYMm carried the
     // line's distance down to it (free-text PAGE frame). dy_mm overrides.
     const lineMidMm = pt * PT2MM * vFactor;
-    let dx = originXMm + (ov ? (startX + aw / 2 - wMm / 2) : (startX + aw + 2));
+    let dx = originXMm + lineLeft + (ov ? (startX + aw / 2 - wMm / 2) : (startX + aw + 2));
     let dy = originYMm + (lineMidMm - sealMm / 2);
     if (op.dx_mm != null) dx = Number(op.dx_mm);
     if (op.dy_mm != null) dy = Number(op.dy_mm);
@@ -3290,12 +3315,24 @@ function opPlaceSeal(doc, op) {
       const rowHmm = (rEl) => {
         let h = 0;
         for (const c of scanTopLevel(rEl.inner, 'hp:tc')) {
-          const sub = scanTopLevel(c.inner, 'hp:subList')[0];
-          const lines = sub ? Math.max(1, scanTopLevel(sub.inner, 'hp:p').filter((pp) => /<hp:t>/.test(pp.inner)).length) : 1;
-          const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
-          const cm = c.inner.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
-          const mv = cm ? (Number(cm[1]) + Number(cm[2])) / H : 2.8;
-          h = Math.max(h, lines * (ptc * PT2MM * 1.3) + mv);
+          // Real Hancom-authored tables ship a trustworthy cellSz height — use
+          // it directly (divide a vertically-merged cell by its rowSpan so it
+          // counts as one row). rhwp-synthesised tables ship garbage (≤300) →
+          // fall back to the line-count estimate.
+          const csH = Number((c.inner.match(/<hp:cellSz\b[^>]*\bheight="(\d+)"/) || [, 0])[1]);
+          const rs = Math.max(1, Number((c.inner.match(/\browSpan="(\d+)"/) || [, 1])[1]));
+          let hi;
+          if (csH > 300) {
+            hi = (csH / rs) / H;
+          } else {
+            const sub = scanTopLevel(c.inner, 'hp:subList')[0];
+            const lines = sub ? Math.max(1, scanTopLevel(sub.inner, 'hp:p').filter((pp) => /<hp:t>/.test(pp.inner)).length) : 1;
+            const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+            const cm = c.inner.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
+            const mv = cm ? (Number(cm[1]) + Number(cm[2])) / H : 2.8;
+            hi = lines * (ptc * PT2MM * 1.3) + mv;
+          }
+          h = Math.max(h, hi);
         }
         return h || 7;
       };
@@ -3315,11 +3352,24 @@ function opPlaceSeal(doc, op) {
           const cmR = cm ? Number(cm[2]) / H : 1.41;
           const cmT = cm ? Number(cm[3]) / H : 1.41;
           const boxWidthMm = Math.max(2, colWmm(tcCol) - cmL - cmR);
+          // Vertical anchor inside the cell. Hancom cells default to vertical
+          // CENTER, so in a tall cell the text sits at the cell's middle, not its
+          // top. When the cell ships a real height (Hancom-authored tables),
+          // centre the seal on cellHeight/2; otherwise (synthesised garbage
+          // height) fall back to the cell-top + line estimate.
+          const tcH = Number((tc.inner.match(/<hp:cellSz\b[^>]*\bheight="(\d+)"/) || [, 0])[1]);
+          const tcRs = Math.max(1, Number((tc.inner.match(/\browSpan="(\d+)"/) || [, 1])[1]));
+          const vAlign = (sub.attrs.match(/vertAlign="([^"]*)"/) || [, 'CENTER'])[1].toUpperCase();
+          const centred = tcH > 300 && vAlign !== 'TOP';
+          const originYMm = centred ? (outTMm + rowY + (tcH / tcRs) / H / 2) : (outTMm + rowY + cmT);
+          const alignH = sealParaAlign(doc, (p.attrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
           const { sealMm, wMm, dx, dy, mode } = calc(p.inner, {
             originXMm: outLMm + colX + cmL,
-            originYMm: outTMm + rowY + cmT,
+            originYMm,
             boxWidthMm,
             roomWidthMm: boxWidthMm,
+            vFactor: centred ? 0 : -0.08,
+            alignH,
           });
           const newSub = `<hp:subList${sub.attrs}>${spliceEl(sub.inner, p, `<hp:p${p.attrs}>${p.inner}${sealRun(sealMm, dx, dy, 'PARA')}</hp:p>`)}</hp:subList>`;
           const newTc = `<hp:tc${tc.attrs}>${spliceEl(tc.inner, sub, newSub)}</hp:tc>`;
