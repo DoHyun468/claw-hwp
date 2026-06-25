@@ -108,7 +108,7 @@ function parseRecords(raw) {
 // rhwp's WASM parses them correctly, so we let it tell us the index and
 // then count LIST_HEADERs at the raw level.
 
-function locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara = 0) {
+function locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara = 0, nested = null) {
   // Find the target paragraph header (level 0)
   let para = -1;
   let paraStart = -1;
@@ -149,18 +149,50 @@ function locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara = 0
   }
   if (cellStartRec < 0) throw new Error(`cell index ${cellIndex} not found in table at paragraph ${sectionParaIdx} control ${controlIdx} (only ${listCount} cells seen)`);
 
-  // Inside this cell: the cellPara-th PARA_HEADER (level 2). A cell's paragraphs
-  // are level-2 PARA_HEADERs between this LIST_HEADER and the next cell's
-  // LIST_HEADER (or table end at level < 2); their text/shape children are level
-  // 3. cellPara 0 = the first paragraph (the common case). Higher indices target
-  // later paragraphs of a multi-paragraph cell (e.g. clearing each line of a form
-  // cell that holds several paragraphs of content).
+  // Optional descent into nested tables (표-안-표). A top-level cell's text is
+  // level 3; a table nested inside it puts its CTRL_HEADER at level 3, its cells
+  // (LIST_HEADER) at level 4, and that cell's text at level 5 — +2 per nesting.
+  // `nested` is a path of {control?, cell} steps: for each, drop into the current
+  // cell, find its `control`-th nested table (default 0) and that table's `cell`-th
+  // LIST_HEADER. With no `nested` the cell stays the top-level one (cellLevel 2)
+  // and every loop below behaves exactly as before.
+  let cellLevel = 2;
+  for (const step of (nested || [])) {
+    const ctrlWant = step.control ?? 0;
+    const cellWant = step.cell;
+    if (cellWant == null) throw new Error('set_cell_text: a nested step needs a "cell" index');
+    let cellEnd = records.length;                          // current cell's record-range end
+    for (let i = cellStartRec + 1; i < records.length; i++) {
+      const rr = records[i];
+      if (rr.tag === TAG_LIST_HEADER && rr.level === cellLevel) { cellEnd = i; break; } // next sibling cell
+      if (rr.level < cellLevel) { cellEnd = i; break; }                                  // table / section boundary
+      // (the cell's OWN paragraphs are PARA_HEADERs at cellLevel — they must NOT end the range)
+    }
+    let nestedCtrl = -1, cSeen = -1;                        // the nested table CTRL_HEADER (level cellLevel+1)
+    for (let i = cellStartRec + 1; i < cellEnd; i++) {
+      if (records[i].tag === TAG_CTRL_HEADER && records[i].level === cellLevel + 1) { cSeen++; if (cSeen === ctrlWant) { nestedCtrl = i; break; } }
+    }
+    if (nestedCtrl < 0) throw new Error(`set_cell_text: nested table (control ${ctrlWant}) not found inside the cell`);
+    let nestedCell = -1, lSeen = -1;                       // its cellWant-th LIST_HEADER (level cellLevel+2)
+    for (let i = nestedCtrl + 1; i < cellEnd; i++) {
+      if (records[i].level <= cellLevel + 1) break;        // out of the nested table
+      if (records[i].tag === TAG_LIST_HEADER && records[i].level === cellLevel + 2) { lSeen++; if (lSeen === cellWant) { nestedCell = i; break; } }
+    }
+    if (nestedCell < 0) throw new Error(`set_cell_text: nested cell ${cellWant} not found (nested table has ${lSeen + 1} cell(s))`);
+    cellStartRec = nestedCell;
+    cellLevel += 2;
+  }
+
+  // Inside the (possibly nested) cell: the cellPara-th PARA_HEADER at cellLevel.
+  // A cell's paragraphs are PARA_HEADERs at cellLevel between this LIST_HEADER and
+  // the next cell's (or table end at level < cellLevel); their text/shape children
+  // are at cellLevel+1. cellPara 0 = the first paragraph (the common case).
   let paraHeaderRec = -1, paraSeen = -1;
   for (let i = cellStartRec + 1; i < records.length; i++) {
     const r = records[i];
-    if (r.tag === TAG_LIST_HEADER && r.level === 2) break; // next cell
-    if (r.level < 2) break;                                  // back to table/section level
-    if (r.tag === TAG_PARA_HEADER && r.level === 2) {
+    if (r.tag === TAG_LIST_HEADER && r.level === cellLevel) break; // next cell
+    if (r.level < cellLevel) break;                                // back to table/section level
+    if (r.tag === TAG_PARA_HEADER && r.level === cellLevel) {
       paraSeen++;
       if (paraSeen === cellPara) { paraHeaderRec = i; break; }
     }
@@ -230,8 +262,8 @@ function fitValueIntoLayout(orig, value) {
   return orig.slice(0, bestIdx + keep) + value + orig.slice(bestIdx + keep + value.length);
 }
 
-function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0, removeObjects = false, fit = false) {
-  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara);
+function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0, removeObjects = false, fit = false, nested = null) {
+  const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara, nested);
   // Length-preserving fill: rebuild `text` from the cell's current layout so the row
   // width / trailing marker survive. Only for pure-text paragraphs — if the original
   // carries inline controls (a field-wrapped marker, etc.) we skip it to avoid corrupting
@@ -1134,7 +1166,7 @@ function patchInPlaceSectors(filePath, resolved) {
     );
     for (const e of editsSorted) {
       const records = parseRecords(raw);
-      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit);
+      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit, e.nested ?? null);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',
@@ -1221,7 +1253,7 @@ async function patchViaSheetjs(filePath, resolved) {
     );
     for (const e of editsSorted) {
       const records = parseRecords(raw);
-      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit);
+      raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit, e.nested ?? null);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',
