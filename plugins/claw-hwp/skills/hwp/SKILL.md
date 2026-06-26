@@ -75,6 +75,15 @@ Treat the following user phrasings as **"show me a HWP file"** or **"edit a HWP 
 
 Do **not** run `npm install`, create new plugin/skill folders, or fetch dependencies — every script the user needs is already in `scripts/` (rhwp WASM and fflate are vendored under `scripts/vendor/`).
 
+### Updating
+
+Only when the user **asks to update**, OR when an op is missing / errors in a way that suggests an outdated version — **never proactively, never on a schedule** (it would derail the user's actual task). Then run the update for the current surface and tell the user to **open a new session** to apply it (the running session keeps the old version until then):
+
+- **Claude Code** (CLI / Desktop app / IDE — they share `~/.claude/plugins/`): `claude plugin update claw-hwp@claw-hwp`
+- **Codex**: `codex plugin marketplace upgrade claw-hwp` then `codex plugin add claw-hwp@claw-hwp`
+
+Use the `@claw-hwp` qualifier — the bare name `claw-hwp` returns "not found". (claude.ai web / Cowork plugins are org-managed, not user self-service — there's nothing to run.)
+
 ### Two "preview" terms that collide
 
 - **Claude Code app's Preview side pane** (the side panel in the Code Desktop UI). This is a **host feature** of Claude Code itself. You don't install or configure it — it auto-discovers a process serving on `localhost:3737`. **Only available when the Code workspace is a local folder on this machine; disappears for server/remote folders.**
@@ -469,7 +478,7 @@ Filling a blank form (the user gives a `.hwp`/`.hwpx` template and wants the fie
 
 > ⚠️ **Preview is feedback, not verification.** This is our own lightweight renderer (rhwp WASM canvas) — fast and convenient for showing edits visually, but **NOT** a 한컴 compatibility check. It can show a file as fine that 한컴독스 silently rejects (round-trip strips, fingerprint issues, web-only mis-renders, silent attribute drops). **Real verification = 한컴독스 (web) or 한컴오피스 (desktop) only** — see the "Verifying in 한컴독스" section for the companion skill (`hancomdocs-capture`).
 
-The skill ships a tiny Node HTTP server (`scripts/preview-server.js`) that serves a vanilla-JS canvas-based viewer; rhwp WASM does the actual rendering in the browser. The result matches Hancom Office closely **for layout preview purposes**, but does not exercise 한컴 round-trip parsing — that's what the companion verification skill is for. No LibreOffice, no external browser plugin.
+The skill ships a tiny Node HTTP server (`scripts/preview-server.js`) that serves a vanilla-JS canvas-based viewer; rhwp WASM does the actual rendering in the browser. It's good for eyeballing content and layout, but **its rendering can diverge from 한컴 and it never exercises 한컴 round-trip parsing** — opening the preview only proves *the preview* opened it, not that 한컴 will. That's what the companion verification skill is for. No LibreOffice, no external browser plugin.
 
 **The preview path depends on which Claude surface you're running in.** The decision rule, applied first thing every time the user wants to view a file:
 
