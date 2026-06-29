@@ -108,6 +108,8 @@ When the user says "preview", they almost always mean "show me the file" — sta
 | Validate output | `python scripts/validate.py <file.hwpx>` |
 | Preview file (Desktop = inline pane, CLI = browser link, cowork = drop-in viewer URL) | See Preview section for the surface decision rule |
 
+> **⚡ Batch every edit into ONE call.** Put *all* operations for a document in a single `operations:[…]` array — one `create.js` (`.hwp`) / `hwpx-edit.js` (`.hwpx`) run — and **never invoke it once per cell or per op.** Every separate run re-reads the whole file, reloads the rhwp WASM, and re-deflates the body (~100 ms+ of fixed cost *each*) **and** spends a full agent round-trip; filling a form one cell at a time takes *minutes*, while the same edits batched finish in ~1 s (measured: 60 cell edits — batched 47 ms vs one-at-a-time 315 ms, before per-process and round-trip overhead). The multi-op examples in this skill are each a **single** call. Read the cells you need first (`extract_text --with-cell-text`), decide every edit, then send them all at once.
+
 > Conversion to PDF / DOCX is **out of scope for v0**. Will be added in a later release via LibreOffice headless.
 
 ## Format primer
