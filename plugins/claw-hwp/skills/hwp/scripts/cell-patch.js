@@ -959,6 +959,43 @@ async function resolveCellIndexes(filePath, edits) {
   }
 }
 
+// Free the tail of a regular-FAT stream chain so it holds exactly
+// ceil(byteLen/ssz) sectors. A shrunk in-place edit (e.g. a loosely-compressed
+// original re-deflated at level 9 — 13905→8912 B) otherwise keeps the stream's
+// original, now-too-long chain while only the directory size field shrinks; the
+// resulting `chain.length > ceil(size/ssz)` is a CFB inconsistency that strict
+// readers (Hancom) reject as cannot_open, while lenient ones (rhwp/olefile) read
+// `size` bytes and ignore the slack. Freed sectors become FREESECT; the kept
+// tail is terminated with ENDOFCHAIN. Returns the trimmed chain (or the original
+// when no trim is needed). GT: a Hancom-native .hwp always has
+// chain.length === ceil(size/ssz) for every stream.
+function shrinkFatChainToFit(buf, ssz, fatAddrs, fat, chain, byteLen) {
+  const need = Math.max(1, Math.ceil(byteLen / ssz));
+  if (need >= chain.length) return chain;
+  for (let i = need; i < chain.length; i++) {
+    writeFatEntry(buf, ssz, fatAddrs, chain[i], FREESECT);
+    fat[chain[i]] = FREESECT;
+  }
+  writeFatEntry(buf, ssz, fatAddrs, chain[need - 1], ENDOFCHAIN);
+  fat[chain[need - 1]] = ENDOFCHAIN;
+  return chain.slice(0, need);
+}
+
+// Mini-stream analogue of shrinkFatChainToFit: trim a mini-FAT chain to
+// ceil(byteLen/mssz) mini-sectors, freeing the tail. Same over-long-chain
+// hazard, in the mini-stream.
+function shrinkMiniChainToFit(buf, ssz, mssz, fat, minifatStart, minifat, miniChain, byteLen) {
+  const need = Math.max(1, Math.ceil(byteLen / mssz));
+  if (need >= miniChain.length) return miniChain;
+  for (let i = need; i < miniChain.length; i++) {
+    writeMinifatEntry(buf, ssz, mssz, fat, minifatStart, miniChain[i], FREESECT);
+    minifat[miniChain[i]] = FREESECT;
+  }
+  writeMinifatEntry(buf, ssz, mssz, fat, minifatStart, miniChain[need - 1], ENDOFCHAIN);
+  minifat[miniChain[need - 1]] = ENDOFCHAIN;
+  return miniChain.slice(0, need);
+}
+
 // Try deflating at successively higher levels to find one that fits within
 // `capacity` bytes. We start at the default (6) because for typical HWP
 // content it matches the original size well; if the patched content grew,
@@ -1024,7 +1061,11 @@ function deflateMiniChainWithExpansion(ctx, raw, miniChain) {
   const capacity = miniChain.length * mssz;
   try {
     const compressed = deflateToFit(raw, capacity);
-    return { ...ctx, miniChain, compressed, promoted: false };
+    // Trim the mini-chain to ceil(size/mssz) when a shrunk re-deflate now needs
+    // fewer mini-sectors — leaving it over-long is the same CFB inconsistency
+    // strict readers reject (see shrinkMiniChainToFit).
+    const fitChain = shrinkMiniChainToFit(buf, ssz, mssz, fat, minifatStart, minifat, miniChain, compressed.length);
+    return { ...ctx, miniChain: fitChain, compressed, promoted: false };
   } catch (err) {
     if (!/exceeds sector chain capacity/.test(err.message)) throw err;
     const minimal = deflateRawSync(raw, { level: 9 });
@@ -1063,7 +1104,21 @@ function deflateMiniChainWithExpansion(ctx, raw, miniChain) {
 // For mini-stream chains, use deflateMiniChainWithExpansion above.
 function deflateAndFitWithExpansion(raw, capacity, ssz, fat, fatAddrs, chain, buf, inMiniStream) {
   try {
-    const compressed = deflateToFit(raw, capacity);
+    let compressed = deflateToFit(raw, capacity);
+    if (!inMiniStream) {
+      // (a) Keep a regular stream regular: if the level-9 re-deflate dropped the
+      //     payload below the 4096-byte mini-stream cutoff, pad with trailing
+      //     zeros (raw deflate self-terminates; inflate ignores the pad) so CFB
+      //     readers keep reading it from the regular FAT (a regular stream's
+      //     chain always has capacity >= 4096). Folds keepRegularIfDemoting in
+      //     so the trim below always sees the final stored length.
+      if (capacity >= 4096 && compressed.length < 4096) {
+        compressed = Buffer.concat([compressed, Buffer.alloc(4096 - compressed.length)]);
+      }
+      // (b) Trim the now-over-long chain to ceil(size/ssz), freeing the slack.
+      const fitChain = shrinkFatChainToFit(buf, ssz, fatAddrs, fat, chain, compressed.length);
+      return { buf, fat, chain: fitChain, capacity: fitChain.length * ssz, compressed };
+    }
     return { buf, fat, chain, capacity, compressed };
   } catch (err) {
     if (!/exceeds sector chain capacity/.test(err.message)) throw err;
@@ -9433,8 +9488,13 @@ function emptyCellClusterFromClone(clusterBytes, newRow, newCol) {
     const recBytes = Buffer.from(clusterBytes.slice(r.headOff, r.dataOff + r.size));
     const bodyOff = r.dataOff - r.headOff;
     if (r.tag === TAG_PARA_HEADER) {
-      const flag = recBytes.readUInt32LE(bodyOff) & 0x80000000;
-      recBytes.writeUInt32LE((flag | 1) >>> 0, bodyOff); // char_count = 1 (keep last-para flag)
+      // char_count = 1, and SET the 0x80000000 "last paragraph in the cell"
+      // marker: we reduce a multi-paragraph source cell to this single kept
+      // paragraph, so it is now the cell's last one. The source's FIRST paragraph
+      // carries no marker (a later sibling did), and leaving it unset produces a
+      // cell whose last paragraph lacks the flag — Hancom rejects it (cannot_open)
+      // while rhwp tolerates. (GT: a Hancom cell's last paragraph always sets it.)
+      recBytes.writeUInt32LE((0x80000000 | 1) >>> 0, bodyOff);
       out.push(recBytes);
     } else {
       out.push(recBytes);                                 // PARA_CHAR_SHAPE / PARA_LINE_SEG as-is
@@ -9520,14 +9580,52 @@ export async function insertTableRowInPlace(filePath, ops) {
     const insertRow = (op.position ?? 'below') === 'below' ? op.row + 1 : op.row;
     const cells = tableCellRecords(records, secRaw, para, ctrl);
 
-    // synthesize the new row's blank cells (clone an empty 1×1 cell per column)
+    // A cell from ABOVE that spans ACROSS the new row keeps covering the same
+    // cells, so extend its rowSpan by 1 and DON'T add a new cell in the columns
+    // it covers (mirror of delete_table_row's "spans across → rowSpan−1", and of
+    // insert_table_col's column-span handling). Otherwise the new cell overlaps
+    // the span → grid double-cover → Hancom mis-renders the merge / can reject.
+    const coveredCols = new Set();
+    for (const c of cells) {
+      if (c.row < insertRow && c.row + c.rowSpan > insertRow) {
+        secRaw.writeUInt16LE((c.rowSpan + 1) & 0xFFFF, c.lhDataOff + 14);
+        for (let cc = c.col; cc < c.col + c.colSpan; cc++) coveredCols.add(cc);
+      }
+    }
+    // synthesize the new row's blank cells (clone an empty 1×1 cell per uncovered column)
     const newClusters = [];
     for (let c = 0; c < cols; c++) {
+      if (coveredCols.has(c)) continue;
       const make = cellCloner(cells, secRaw, c);
       if (!make) throw new Error(`insert_table_row: no plain 1×1 cell in the table to clone as the new cell`);
       newClusters.push(make(insertRow, c));
     }
     const newCellsBuf = Buffer.concat(newClusters);
+
+    // The table's CTRL_HEADER (" lbt") declares the object's box width/height. A
+    // row insert grows the table, so bump the declared height by the new row's
+    // height — Hancom rejects a table whose cell content exceeds its declared box
+    // ("손상/형식 오류" cannot_open) while rhwp recomputes layout and tolerates the
+    // stale value (GT: Hancom never leaves the box too small). The width/height
+    // field offset varies with the object's attribute flags (treat-as-char drops
+    // a position field), so locate the width by matching the table width
+    // (= sum of row-0 cell widths) and take height as the next u32.
+    {
+      let ctrlRec = null;
+      for (const r of records) { if (r.headOff >= tableRec.headOff) break; if (r.tag === TAG_CTRL_HEADER && r.level === 1) ctrlRec = r; }
+      const tableWidth = cells.filter((c) => c.row === 0).reduce((s, c) => s + secRaw.readUInt32LE(c.lhDataOff + 16), 0);
+      const lh0 = newClusters.length ? parseRecords(newClusters[0]).find((r) => r.tag === TAG_LIST_HEADER && r.level === 2) : null;
+      const newRowHeight = lh0 ? newClusters[0].readUInt32LE(lh0.dataOff + 20) : 0;
+      if (ctrlRec && tableWidth > 0 && newRowHeight > 0) {
+        for (let o = 8; o + 8 <= ctrlRec.size; o += 4) {
+          if (secRaw.readUInt32LE(ctrlRec.dataOff + o) === tableWidth) {
+            const hOff = ctrlRec.dataOff + o + 4;
+            secRaw.writeUInt32LE((secRaw.readUInt32LE(hOff) + newRowHeight) >>> 0, hOff);
+            break;
+          }
+        }
+      }
+    }
 
     // document insertion point: before the first cell at/after the new row.
     let insOff = null;
@@ -9537,10 +9635,11 @@ export async function insertTableRowInPlace(filePath, ops) {
     // renumber cells at/after the new row (in-place, before splicing)
     for (const cc of cells) if (cc.row >= insertRow) secRaw.writeUInt16LE((cc.row + 1) & 0xFFFF, cc.lhDataOff + 10);
 
-    // TABLE record: rows+1 and a new row-size entry (cols) at index insertRow.
+    // TABLE record: rows+1 and a new row-size entry (the new row's cell count,
+    // = uncovered columns) at index insertRow.
     const oldBody = secRaw.slice(tableRec.dataOff, tableRec.dataOff + tableRec.size);
     const insAt = 18 + insertRow * 2;
-    const entry = Buffer.alloc(2); entry.writeUInt16LE(cols, 0);
+    const entry = Buffer.alloc(2); entry.writeUInt16LE(newClusters.length, 0);
     const newBody = Buffer.concat([oldBody.slice(0, insAt), entry, oldBody.slice(insAt)]);
     newBody.writeUInt16LE((rows + 1) & 0xFFFF, 4);
     const newTableRec = Buffer.concat([buildRecordHeader(TAG_TABLE, 2, newBody.length), newBody]);
