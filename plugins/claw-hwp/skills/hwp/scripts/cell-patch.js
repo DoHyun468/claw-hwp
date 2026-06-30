@@ -263,6 +263,14 @@ function fitValueIntoLayout(orig, value) {
 }
 
 function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text, cellPara = 0, removeObjects = false, fit = false, nested = null) {
+  // Line breaks in the value: an embedded "\n" stays in PARA_TEXT as U+000A, which
+  // Hancom renders as a 강제 줄나눔 (forced line break, same paragraph) — the cell wraps
+  // to the next line and the row grows, but the table grid/column width are untouched
+  // (Hancom-Docs render verified). Normalize first: collapse CRLF/CR → LF (CR is the
+  // paragraph EOP appended by makeParaTextRecord and must never sit inside the value),
+  // and strip leading/trailing breaks so a value carrying a stray trailing newline
+  // (common when it comes straight from a spreadsheet cell) doesn't leave a blank line.
+  if (text) text = text.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
   const loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, cellPara, nested);
   // Length-preserving fill: rebuild `text` from the cell's current layout so the row
   // width / trailing marker survive. Only for pure-text paragraphs — if the original
@@ -365,6 +373,66 @@ function applyCellText(raw, records, sectionParaIdx, controlIdx, cellIndex, text
     newRecord,
     raw.slice(insertAt),
   ]);
+}
+
+// Collapse a table cell by removing its TRAILING EMPTY paragraphs (the residue left
+// when a form template's "label\n(placeholder)" cell is filled into the first paragraph
+// and the placeholder paragraph is cleared — set_cell_text can empty a paragraph but not
+// delete it, so the empty one lingers as a stray blank line). A paragraph counts as empty
+// only when it has NO PARA_TEXT and NO inline-object CTRL_HEADER child; an object-bearing
+// paragraph (글자처럼 취급/treat-as-char image, seal, …) or any text paragraph stops the
+// walk and is preserved. Decrements the cell's LIST_HEADER nParagraphs and moves the
+// last-paragraph flag onto the new last paragraph (Hancom rejects a cell whose flag is
+// missing/duplicated). The cell's first paragraph is never removed. Returns the new `raw`.
+function collapseTrailingEmptyCellParas(raw, sectionParaIdx, controlIdx, cellIndex, nested) {
+  let records = parseRecords(raw);
+  let loc;
+  try { loc = locateCell(records, sectionParaIdx, controlIdx, cellIndex, 0, nested); }
+  catch { return raw; }
+  const lh = records[loc.listHeaderRec];
+  const cellLevel = lh.level;
+  // Cell record range: up to the next sibling LIST_HEADER (same level) or any record
+  // shallower than the cell (table / section boundary).
+  let endByte = raw.length, endRec = records.length;
+  for (let i = loc.listHeaderRec + 1; i < records.length; i++) {
+    const r = records[i];
+    if ((r.tag === TAG_LIST_HEADER && r.level === cellLevel) || r.level < cellLevel) { endByte = r.headOff; endRec = i; break; }
+  }
+  const paraIdxs = [];
+  for (let i = loc.listHeaderRec + 1; i < endRec; i++) {
+    if (records[i].tag === TAG_PARA_HEADER && records[i].level === cellLevel) paraIdxs.push(i);
+  }
+  if (paraIdxs.length <= 1) return raw;                       // nothing to collapse
+  const hasContent = (k) => {
+    const stop = (k + 1 < paraIdxs.length) ? paraIdxs[k + 1] : endRec;
+    for (let i = paraIdxs[k] + 1; i < stop; i++) {
+      if (records[i].tag === TAG_PARA_TEXT || records[i].tag === TAG_CTRL_HEADER) return true;
+    }
+    return false;
+  };
+  let removeFromByte = -1, removed = 0;
+  for (let k = paraIdxs.length - 1; k >= 1; k--) {            // never the first paragraph
+    if (hasContent(k)) break;                                 // text or inline object → stop
+    removeFromByte = records[paraIdxs[k]].headOff;
+    removed++;
+  }
+  if (!removed) return raw;
+  raw = Buffer.concat([raw.slice(0, removeFromByte), raw.slice(endByte)]);
+  const lhDataOff = lh.headOff + 4;                           // LIST_HEADER body (non-extended size)
+  raw.writeUInt16LE(((raw.readUInt16LE(lhDataOff) - removed) & 0xFFFF) >>> 0, lhDataOff); // nParagraphs -= removed
+  // Re-find the (now shorter) cell range and move the last-para flag to the new last para.
+  records = parseRecords(raw);
+  let nl;
+  try { nl = locateCell(records, sectionParaIdx, controlIdx, cellIndex, 0, nested); }
+  catch { return raw; }
+  const nlh = records[nl.listHeaderRec];
+  let newEnd = raw.length;
+  for (let i = nl.listHeaderRec + 1; i < records.length; i++) {
+    const r = records[i];
+    if ((r.tag === TAG_LIST_HEADER && r.level === nlh.level) || r.level < nlh.level) { newEnd = r.headOff; break; }
+  }
+  normalizeCellLastParaFlag(raw, nlh.headOff, newEnd, nlh.level);
+  return raw;
 }
 
 // ── CFB layout (minimal, in-place) ────────────────────────────────────────
@@ -1222,6 +1290,7 @@ function patchInPlaceSectors(filePath, resolved) {
     for (const e of editsSorted) {
       const records = parseRecords(raw);
       raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit, e.nested ?? null);
+      if (e.collapse) raw = collapseTrailingEmptyCellParas(raw, e.para ?? 0, e.control ?? 0, e.cellIndex, e.nested ?? null);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',
@@ -1309,6 +1378,7 @@ async function patchViaSheetjs(filePath, resolved) {
     for (const e of editsSorted) {
       const records = parseRecords(raw);
       raw = applyCellText(raw, records, e.para ?? 0, e.control ?? 0, e.cellIndex, e.text ?? '', e.cell_para ?? 0, !!e.clear_objects, !!e.fit, e.nested ?? null);
+      if (e.collapse) raw = collapseTrailingEmptyCellParas(raw, e.para ?? 0, e.control ?? 0, e.cellIndex, e.nested ?? null);
       summary.push({
         section: secIdx, para: e.para, control: e.control,
         row: e.row, col: e.col, cellIndex: e.cellIndex, text: e.text ?? '',

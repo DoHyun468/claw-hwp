@@ -2097,12 +2097,12 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
         const cellPara = op.cell_para ?? 0; // which paragraph inside a multi-paragraph cell (default first)
         const clearObjects = !!op.clear_objects; // with text:"" — also remove inline objects in that paragraph
         if (op.row != null && op.col != null) {
-          out.push({ section: sec, para, control: ctrl, row: op.row, col: op.col, text, cell_para: cellPara, clear_objects: clearObjects, fit: !!op.fit, nested: op.nested ?? null });
+          out.push({ section: sec, para, control: ctrl, row: op.row, col: op.col, text, cell_para: cellPara, clear_objects: clearObjects, fit: !!op.fit, nested: op.nested ?? null, collapse: !!op.collapse });
         } else if (op.cell != null) {
           // Convert flat cellIndex back to (row, col) via rhwp inspect.
           if (!doc) doc = new HwpDocument(new Uint8Array(fs.readFileSync(filePath)));
           const info = JSON.parse(doc.getCellInfo(sec, para, ctrl, op.cell));
-          out.push({ section: sec, para, control: ctrl, row: info.row, col: info.col, text, cell_para: cellPara, clear_objects: clearObjects, fit: !!op.fit, nested: op.nested ?? null });
+          out.push({ section: sec, para, control: ctrl, row: info.row, col: info.col, text, cell_para: cellPara, clear_objects: clearObjects, fit: !!op.fit, nested: op.nested ?? null, collapse: !!op.collapse });
         } else {
           throw new Error("set_cell_text: provide row+col or cell");
         }
