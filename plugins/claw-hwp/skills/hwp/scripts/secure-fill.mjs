@@ -308,7 +308,12 @@ function cmdFill(args) {
       //    instead of silently overwriting the first block (e.g. the 대표이사 row). ──
       operations.push({
         type: 'set_cell_text_by_label', label: f.label, text: val,
-        col_offset: f.col_offset ?? 0, row_offset: f.row_offset ?? 0,
+        // Do NOT default the offsets to 0 — the engine reads a *missing* col_offset as
+        // "the cell after the label (colSpan-aware)", but col_offset:0 as "overwrite the
+        // label cell itself". Forcing 0 clobbered the label instead of filling the value
+        // cell. Pass offsets through only when the mapping actually sets them.
+        ...(f.col_offset != null ? { col_offset: f.col_offset } : {}),
+        ...(f.row_offset != null ? { row_offset: f.row_offset } : {}),
         fit: f.fit ?? true, // 길이보존(에이전트가 PII 값을 못 세므로 in-tool 자동); no-op when no padding run
         require_occurrence: true,
         ...(f.occurrence != null ? { occurrence: f.occurrence } : {}),
