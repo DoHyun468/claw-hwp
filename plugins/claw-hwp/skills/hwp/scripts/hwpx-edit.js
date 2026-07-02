@@ -366,7 +366,7 @@ function opReplaceText(doc, find, replace) {
   return { replaced: total };
 }
 
-function opFillTemplate(doc, values) {
+function opFillTemplate(doc, values, requireUnique) {
   if (!values || typeof values !== 'object') throw new Error('fill_template: "values" object required');
   const perKey = {};
   let total = 0;
@@ -374,6 +374,19 @@ function opFillTemplate(doc, values) {
     const r = opReplaceText(doc, k, v);
     perKey[k] = r.replaced;
     total += r.replaced;
+  }
+  // Ambiguity guard (opt-in — secure-fill sets it for PII safety). fill_template's replace is
+  // GLOBAL, so a placeholder that matches MORE THAN ONE spot fills several cells with the same
+  // value; in a multi-person / parallel form (참여인력 5명, 비영리·기업 병렬표) that silently
+  // writes one person's data into another's block. Refuse so the caller retargets the exact
+  // cell with {table,row,col}. Thrown before main()'s save() and the batch is atomic, so the
+  // in-memory edits are discarded and nothing is written. (Mirrors the .hwp track's
+  // set_cell_text_by_label require_occurrence guard.)
+  if (requireUnique) {
+    const ambiguous = Object.entries(perKey).filter(([, n]) => n > 1);
+    if (ambiguous.length) {
+      throw new Error(`fill_template: require_unique — ${ambiguous.map(([k, n]) => `"${k}" matched ${n} spots`).join(', ')}. A repeated placeholder fills multiple cells (multi-person / parallel form), which would cross-contaminate blocks. Target the exact cell with {table,row,col} instead.`);
+    }
   }
   return { total, perKey };
 }
@@ -4564,7 +4577,7 @@ function opInsertTextbox(doc, op) {
 function applyOp(doc, op) {
   switch (op.type) {
     case 'replace_text': return opReplaceText(doc, op.find, op.replace);
-    case 'fill_template': return opFillTemplate(doc, op.values);
+    case 'fill_template': return opFillTemplate(doc, op.values, op.require_unique);
     case 'set_paragraph_text': return opSetParagraphText(doc, op.index, op.text);
     case 'append_paragraph': return opAppendParagraph(doc, op.text);
     case 'delete_paragraph': return opDeleteParagraph(doc, op.index);
