@@ -9,7 +9,6 @@ End-to-end create + edit pipeline working, **zero-config** (deps vendored).
 | Script | Status | Notes |
 |--------|--------|-------|
 | `extract_text.js` | ✅ v0 | Default plaintext, `--format markdown` (skips empty layout tables), `--inspect` for JSON metadata. Handles both `.hwp` and `.hwpx` (in-memory rhwp conversion for binary) |
-| `convert.js` | ✅ v0 | `.hwp ↔ .hwpx` via rhwp WASM. Output format from extension |
 | `unpack.py` | ✅ v0 | `zipfile` + `xml.dom.minidom` pretty-print. `--no-pretty` flag for raw mode |
 | `pack.py` | ✅ v0 | mimetype-first uncompressed entry per OPF spec. Sorted file order for reproducibility |
 | `validate.py` | ✅ v0 | Zip integrity + mimetype + required files + XML well-formedness |
@@ -20,13 +19,12 @@ End-to-end create + edit pipeline working, **zero-config** (deps vendored).
 
 End-to-end round-trip tested against rhwp's `samples/`:
 
-1. `convert.js report.hwp report.hwpx` — convert HWP 5.0 binary to HWPX
-2. `validate.py report.hwpx` — sanity check
-3. `unpack.py report.hwpx /tmp/u/` — extract pretty-printed XML
-4. *Edit XML files in `/tmp/u/Contents/section*.xml` using your `Edit` tool*
-5. `pack.py /tmp/u/ output.hwpx` — repackage
-6. `validate.py output.hwpx` — confirm structural integrity
-7. `extract_text.js output.hwpx` — verify edits propagate
+1. `validate.py report.hwpx` — sanity check
+2. `unpack.py report.hwpx /tmp/u/` — extract pretty-printed XML
+3. *Edit XML files in `/tmp/u/Contents/section*.xml` using your `Edit` tool*
+4. `pack.py /tmp/u/ output.hwpx` — repackage
+5. `validate.py output.hwpx` — confirm structural integrity
+6. `extract_text.js output.hwpx` — verify edits propagate
 
 437-paragraph document survives round-trip with edit applied; structural counts preserved.
 

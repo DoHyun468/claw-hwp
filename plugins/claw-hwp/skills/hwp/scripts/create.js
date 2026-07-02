@@ -1722,6 +1722,12 @@ const HANDLERS = {
     if (hits.length === 0) {
       throw new Error(`set_cell_text_by_label: no cell containing "${op.label}" found`);
     }
+    // Ambiguity guard (opt-in via require_occurrence, used by secure-fill): a label repeated
+    // across multi-person blocks / parallel tables matches many cells; filling the first
+    // silently overwrites someone else's data. Refuse unless disambiguated.
+    if (op.require_occurrence && hits.length > 1 && op.occurrence == null) {
+      throw new Error(`set_cell_text_by_label: "${op.label}" matched ${hits.length} cells — pass occurrence (0-based, document order) or scope with section+para+control to pick one`);
+    }
     if (occurrence >= hits.length) {
       throw new Error(`set_cell_text_by_label: occurrence ${occurrence} out of range (${hits.length} hits)`);
     }
@@ -2145,6 +2151,13 @@ async function resolveLabelEditsViaRhwp(filePath, ops) {
         }
       }
       if (hits.length === 0) throw new Error(`set_cell_text_by_label: no cell containing "${op.label}" found`);
+      // Ambiguity guard (secure-fill / any caller that opts in): a label repeated across
+      // multi-person blocks or parallel tables (참여인력 5명, 비영리/기업 병렬표) matches
+      // many cells; filling the first silently overwrites someone else's data. Refuse
+      // unless the caller picked one via `occurrence` or scoped with section+para+control.
+      if (op.require_occurrence && hits.length > 1 && op.occurrence == null) {
+        throw new Error(`set_cell_text_by_label: "${op.label}" matched ${hits.length} cells — pass occurrence (0-based, document order) or scope with section+para+control to pick one`);
+      }
       if (occurrence >= hits.length) throw new Error(`set_cell_text_by_label: occurrence ${occurrence} out of range (${hits.length} hits)`);
       const hit = hits[occurrence];
       if (op.append) {
