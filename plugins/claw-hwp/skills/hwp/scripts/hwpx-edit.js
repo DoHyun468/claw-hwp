@@ -4660,7 +4660,7 @@ async function main() {
   try { payload = JSON.parse(raw); } catch (e) { fail(`invalid JSON on stdin: ${e.message}`); }
   const inputPath = payload.path;
   if (!inputPath) fail('payload.path is required');
-  if (!/\.hwpx$/i.test(inputPath)) fail(`hwpx-edit.js is .hwpx only — got ${path.extname(inputPath)} (use cell-patch.js / convert.js for .hwp)`);
+  if (!/\.hwpx$/i.test(inputPath)) fail(`hwpx-edit.js is .hwpx only — got ${path.extname(inputPath)} (use create.js for .hwp)`);
   if (!fs.existsSync(inputPath)) fail(`file not found: ${inputPath}`);
   const bytes = fs.readFileSync(inputPath);
   if (!(bytes[0] === 0x50 && bytes[1] === 0x4b)) fail('not a ZIP-based .hwpx (first bytes are not "PK")');
