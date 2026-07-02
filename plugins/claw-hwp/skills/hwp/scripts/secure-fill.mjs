@@ -279,12 +279,46 @@ function cmdFill(args) {
   // ── HWP engine: create.js raw-patch (set_cell_text_by_label) ─────────────
   copyFileSync(template, out);
   const operations = [];
+  // Position-based fields address a cell the same way the .hwpx branch does — by
+  // {table,row,col} (or native {section,para,control,row,col}). A `table` index is
+  // resolved once to the .hwp (section,para,control) triple via --inspect. This gives
+  // the .hwp branch the same targeting the engine's set_cell_text has, so duplicate-label
+  // forms (참여인력 5명 블록, 비영리/기업 병렬표) don't have to go through label matching
+  // at all — no 변환 needed.
+  const needsTableMap = mapping.fields.some((f) => f.table != null && f.row != null && f.col != null);
+  let tableMap = null;
+  if (needsTableMap) {
+    tableMap = inspectTables(out).map((t) => ({ section: t.sec ?? 0, para: t.para, control: t.ctrl }));
+  }
   for (const f of mapping.fields) {
+    const name = f.label ?? (f.table != null ? `cell[t${f.table},${f.row},${f.col}]` : `cell[${f.para},${f.control},${f.row},${f.col}]`);
     const raw = profile[f.key];
-    if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: f.label, key: f.key, status: 'EMPTY_KEY' }); continue; }
+    if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: name, key: f.key, status: 'EMPTY_KEY' }); continue; }
     const val = formatValue(String(raw), f.format); // reshape per-field (date/phone/rrn/…), in-tool
-    operations.push({ type: 'set_cell_text_by_label', label: f.label, text: val, col_offset: f.col_offset ?? 0, row_offset: f.row_offset ?? 0, fit: f.fit ?? true }); // fit: 길이보존(에이전트가 PII 값을 못 세므로 in-tool 자동); no-op when no padding run
-    attempted.push({ field: f.label, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
+    if (f.label == null && f.row != null && f.col != null) {
+      // ── position-based (no label) — exact cell, no ambiguity ──
+      let addr = null;
+      if (f.para != null && f.control != null) addr = { section: f.section ?? 0, para: f.para, control: f.control };
+      else if (f.table != null && tableMap && tableMap[f.table] != null) addr = tableMap[f.table];
+      else { refuse(`.hwp positional field '${f.key}' needs a 'table' index (or 'para'+'control')`); }
+      operations.push({ type: 'set_cell_text', ...addr, row: f.row, col: f.col, text: val, fit: f.fit ?? true, ...(f.cell_para != null ? { cell_para: f.cell_para } : {}) });
+    } else if (f.label != null) {
+      // ── label-based — pass through the engine's full targeting (occurrence / table scope /
+      //    case / cell_para / append). require_occurrence makes an ambiguous multi-match REFUSE
+      //    instead of silently overwriting the first block (e.g. the 대표이사 row). ──
+      operations.push({
+        type: 'set_cell_text_by_label', label: f.label, text: val,
+        col_offset: f.col_offset ?? 0, row_offset: f.row_offset ?? 0,
+        fit: f.fit ?? true, // 길이보존(에이전트가 PII 값을 못 세므로 in-tool 자동); no-op when no padding run
+        require_occurrence: true,
+        ...(f.occurrence != null ? { occurrence: f.occurrence } : {}),
+        ...(f.section != null ? { section: f.section, para: f.para, control: f.control } : {}),
+        ...(f.case_sensitive ? { case_sensitive: true } : {}),
+        ...(f.cell_para != null ? { cell_para: f.cell_para } : {}),
+        ...(f.append ? { append: true } : {}),
+      });
+    } else { refuse(`.hwp field '${f.key}' needs 'label' (with optional occurrence/section/para/control) or 'row'+'col' (with 'table' or 'para'+'control')`); }
+    attempted.push({ field: name, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
   }
   const res = spawnSync('node', [CREATE], { input: JSON.stringify({ path: out, operations }), encoding: 'utf8', maxBuffer: 1 << 26 });
   let status = 'parse_error', message = null;
@@ -297,6 +331,22 @@ function cmdFill(args) {
     note: 'values never printed; create.js stdout .log array (not a file) dropped',
   }, null, 2));
   if (!ok) process.exit(2);
+}
+
+// The big-form truncation (async process.stdout.write + process.exit) is fixed in
+// extract_text via synchronous writeOut, but rhwp's getCellInfo sweep is itself
+// non-deterministic and can still return an unusable dump on a bad run — one JSON.parse
+// then throws and secure-fill dies. Retry a few times (a re-run almost always succeeds)
+// so cell targeting / verify parse reliably.
+function inspectTables(file, tries = 4) {
+  let last = '';
+  for (let i = 0; i < tries; i++) {
+    const r = spawnSync('node', [EXTRACT, '--inspect', '--with-cell-text', file], { encoding: 'utf8', maxBuffer: 1 << 26 });
+    last = r.stderr || '';
+    try { const root = JSON.parse(r.stdout); return Array.isArray(root) ? root : (root.tables || []); }
+    catch { /* truncated/invalid this run — retry */ }
+  }
+  throw new Error(`extract_text --inspect returned invalid JSON after ${tries} tries (rhwp sweep flake)${last ? ': ' + last.slice(0, 120) : ''}`);
 }
 
 function cmdVerify(args) {
@@ -316,18 +366,26 @@ function cmdVerify(args) {
     console.log(JSON.stringify({ verified, note: 'values masked; .hwpx placeholder presence check' }, null, 2));
     return;
   }
-  const res = spawnSync('node', [EXTRACT, '--inspect', '--with-cell-text', args.out], { encoding: 'utf8', maxBuffer: 1 << 26 });
-  const root = JSON.parse(res.stdout);
-  const tables = Array.isArray(root) ? root : (root.tables || []);
-  const findLabel = (s) => { for (const t of tables) for (const c of t.cells) if ((c.text || '').includes(s)) return c; return null; };
-  const findCell = (r, c2) => { for (const t of tables) for (const c of t.cells) if (c.row === r && c.col === c2) return c; return null; };
+  const tables = inspectTables(args.out);                          // retry-hardened (rhwp sweep can flake)
+  const norm = (x) => (x || '').replace(/[\s　]+/g, '');            // whitespace-insensitive, like the engine's label match
+  const labelHits = (s) => { const hits = [], n = norm(s); for (const t of tables) for (const c of t.cells) if (norm(c.text).includes(n)) hits.push({ t, c }); return hits; };
+  const cellAt = (t, r, c2) => (t ? t.cells.find((c) => c.row === r && c.col === c2) : null) || null;
   const verified = [];
   for (const f of mapping.fields) {
-    const lab = findLabel(f.label);
-    if (!lab) { verified.push({ field: f.label, status: 'LABEL_NOT_FOUND' }); continue; }
-    const cell = findCell(lab.row + (f.row_offset ?? 0), lab.col + (f.col_offset ?? 0));
+    const name = f.label ?? (f.table != null ? `cell[t${f.table},${f.row},${f.col}]` : `cell[${f.para},${f.control},${f.row},${f.col}]`);
+    let cell = null;
+    if (f.label == null && f.row != null && f.col != null) {
+      // positional — resolve the exact table the fill used (table index OR para+control)
+      const t = f.table != null ? tables[f.table] : tables.find((tb) => tb.para === f.para && tb.ctrl === f.control);
+      cell = cellAt(t, f.row, f.col);
+    } else if (f.label != null) {
+      const hit = labelHits(f.label)[f.occurrence ?? 0];             // the SAME occurrence-th match the fill wrote to
+      if (!hit) { verified.push({ field: name, status: 'LABEL_NOT_FOUND' }); continue; }
+      const dCol = f.col_offset ?? (f.append ? 0 : (hit.c.colSpan ?? 1)); // fill's default = the cell after the label (colSpan-aware)
+      cell = cellAt(hit.t, hit.c.row + (f.row_offset ?? 0), hit.c.col + dCol); // stay WITHIN the matched label's table
+    }
     const txt = cell ? (cell.text || '') : '';
-    verified.push({ field: f.label, status: txt.length ? 'FILLED' : 'EMPTY', chars: txt.length, masked: '•'.repeat(Math.min(txt.length, 16)) });
+    verified.push({ field: name, status: txt.length ? 'FILLED' : 'EMPTY', chars: txt.length, masked: '•'.repeat(Math.min(txt.length, 16)) });
   }
   console.log(JSON.stringify({ verified, note: 'values masked' }, null, 2));
 }

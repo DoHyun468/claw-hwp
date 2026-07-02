@@ -56,6 +56,20 @@ function parseArgs(argv) {
   return opts;
 }
 
+// process.stdout.write() is ASYNC for pipes — a large payload (a 100 KB+ --inspect
+// JSON dump of a many-table form) followed immediately by process.exit(0) is truncated
+// mid-buffer, so a downstream JSON.parse fails intermittently (only on big forms; small
+// ones fit one buffer and slip through). Write synchronously to fd 1, looping on partial
+// pipe writes and retrying EAGAIN, so the whole payload lands before we exit.
+function writeOut(str) {
+  const buf = Buffer.from(str, 'utf8');
+  let off = 0;
+  while (off < buf.length) {
+    try { off += fs.writeSync(1, buf, off, buf.length - off); }
+    catch (e) { if (e.code === 'EAGAIN') continue; throw e; }
+  }
+}
+
 let opts;
 try {
   opts = parseArgs(process.argv.slice(2));
@@ -85,7 +99,7 @@ if (opts.withCellText && !opts.inspect) {
 // convinced past sessions that table-heavy forms were empty; rhwp 0.7.x
 // preserves tables, but the direct sweep is still what gives cell-level data.)
 if (opts.inspect && !isHwpxZip) {
-  process.stdout.write(JSON.stringify(await inspectHwpViaRhwp(inputBytes, opts.withCellText), null, 2) + '\n');
+  writeOut(JSON.stringify(await inspectHwpViaRhwp(inputBytes, opts.withCellText), null, 2) + '\n');
   process.exit(0);
 }
 
@@ -109,7 +123,7 @@ if (opts.inspect) {
       'table cell text is included via --format markdown.\n'
     );
   }
-  process.stdout.write(JSON.stringify(inspect(sectionXmls, isHwpxZip), null, 2) + '\n');
+  writeOut(JSON.stringify(inspect(sectionXmls, isHwpxZip), null, 2) + '\n');
   process.exit(0);
 }
 
@@ -122,7 +136,7 @@ for (let i = 0; i < sectionXmls.length; i++) {
     extractParagraphs(sectionXmls[i], lines);
   }
 }
-process.stdout.write(lines.join('\n') + '\n');
+writeOut(lines.join('\n') + '\n');
 
 // ---
 
