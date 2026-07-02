@@ -290,7 +290,7 @@ To **add a row**: clone an existing `<hp:tr>` block, increment `cellAddr` `rowAd
 - **Encoding.** All HWPX XML is UTF-8. Korean text is written directly (`한글` not `&#54620;&#44544;`). XML escape only `&`, `<`, `>` (and `"` / `'` inside attribute values).
 - **Whitespace in `<hp:t>`.** Leading/trailing spaces are preserved. If you need a newline within a paragraph, use a separate `<hp:lineBreak/>` element (not `\n` inside `<hp:t>`).
 - **`content.hpf` manifest sync.** When you **add** a file to the package (e.g. a new image in `BinData/`), add a matching `<opf:item href="…" media-type="…"/>` to `Contents/content.hpf` yourself — `pack.py` does not invent entries for new files. When you **remove** a file (image or section), `pack.py` auto-prunes its `<opf:item>` and the matching `<opf:spine><opf:itemref>` on repack, so no hand-editing is needed. `validate.py` flags any manifest entry whose href points at a missing file.
-- **Misnamed extension as binary.** If `unpack.py` reports "not a zip", the file is HWP 5.0 binary, not HWPX. Convert via `node scripts/convert.js file.hwp /tmp/file.hwpx` first.
+- **Misnamed extension as binary.** If `unpack.py` reports "not a zip", the file is HWP 5.0 binary, not HWPX — read it with `extract_text.js` and edit it in place with `create.js` (`.hwp` raw-patch). Don't convert `.hwp`↔`.hwpx`; edit each in its own format (a round-trip is lossy and large forms are rejected by Hancom).
 
 ---
 
