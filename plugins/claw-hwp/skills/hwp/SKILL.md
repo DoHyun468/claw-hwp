@@ -30,7 +30,8 @@ This skill helps Claude work with Korean Hangul Word Processor documents — rea
 6. 영구 저장은 사용자가 **명시**할 때만 `secure-fill stash`(→ `~/.claw-hwp/`, 600, 평문·중고판매 경고). git 커밋/푸시·repo 보관 금지. **`stash`/`shred`로 기존 영구 프로필을 덮어쓰거나 지울 땐 사용자 확인 먼저** — 실제 사용자 데이터일 수 있다.
 
 **포맷별 매핑 (`fill`의 채우기 엔진):**
-- **`.hwp`** → `create.js` raw-patch. 매핑 필드 = `{key, label, col_offset?, row_offset?, format?}` (라벨 셀 찾아 인접 칸 채움).
+- **`.hwp`** → `create.js` raw-patch. 매핑 필드 = `{key, label, col_offset?, row_offset?, occurrence?, section?, para?, control?, case_sensitive?, cell_para?, append?, format?}` (라벨 셀 찾아 인접 칸 채움). **중복 라벨(다인 이력서 5명 블록·비영리/기업 병렬표)은 `occurrence`(0-based, 문서순) 또는 `section`+`para`+`control`(그 표 하나만)로 지목한다.** 안 주고 라벨이 2개+ 매칭이면 **채우지 않고 거부**(첫 매칭=대표이사 등 남의 실데이터를 조용히 덮어쓰는 사고 방지). **라벨 매칭 없이 위치로 바로** 꽂을 수도 있다: `{key, table, row, col, format?}`(표 인덱스, `--inspect` 순서) 또는 `{key, para, control, row, col, format?}`(native) — `.hwpx`의 `{table,row,col}`과 대칭.
+  - ⚠️ **이미 PII가 든 폼**에서 특정 블록을 겨냥할 땐 `--with-cell-text`로 셀 텍스트를 통째 덤프하지 마라 — 기존 이름 등 PII가 네 컨텍스트로 유입된다. **블록 순서만 알면** `occurrence`/`{table,row,col}`로 충분히 겨냥된다. 부득이 직접 마스킹한다면 한글·영문·숫자뿐 아니라 **한자(CJK)**도 가려라(한국 서식 성명은 한자 표기가 흔함).
 - **`.hwpx`** → `hwpx-edit.js`. 매핑 필드 = `{key, placeholder, format?}`(서식의 빈칸 텍스트를 control/run-aware로 치환 — 권장) **또는** `{key, table, row, col, format?}`(위치). **label+offset은 .hwp 전용**(HWPX엔 by-label 없음). 값은 동일하게 도구가 in-tool로 읽어 stdin에만 흘림.
   - ⚠️ **형식 있는 칸(밑줄·괄호·뒤에 (서명)/(인) 마커)엔 `placeholder`를 써라** — 그 빈칸 텍스트(예: `placeholder:"____________"`, `"(    )"`)만 run-aware로 바꿔 주변 라벨·마커를 **보존**한다. `table/row/col`은 **셀 전체를 값으로 덮어써** 밑줄·마커가 사라지고(실측: `"____ (서명)"` → `"홍길동"`), 게다가 secure-fill은 값이 마스킹돼 에이전트가 길이를 미리 못 맞춘다. → **`table/row/col`은 빈 값칸(라벨 옆 빈 셀)에만**, 형식 칸은 `placeholder`로.
 
@@ -63,7 +64,7 @@ This skill helps Claude work with Korean Hangul Word Processor documents — rea
 
 ## Already installed — don't re-scaffold
 
-If you're reading this SKILL.md, the `claw-hwp:hwp` skill is **already loaded** in this session. Everything below — read / create / edit / convert / preview for `.hwp` and `.hwpx` — is provided by this skill. You don't need to install, scaffold, or set anything up.
+If you're reading this SKILL.md, the `claw-hwp:hwp` skill is **already loaded** in this session. Everything below — read / create / edit / preview for `.hwp` and `.hwpx` — is provided by this skill. You don't need to install, scaffold, or set anything up.
 
 Treat the following user phrasings as **"show me a HWP file"** or **"edit a HWP file"** intent, not as setup requests:
 
@@ -104,7 +105,6 @@ When the user says "preview", they almost always mean "show me the file" — sta
 | Create new document from scratch | `echo '{"path":"out.hwp","operations":[...]}' \| node scripts/create.js` |
 | Edit existing `.hwpx` | `echo '{"path":"f.hwpx","operations":[...]}' \| node scripts/hwpx-edit.js` (op vocab in `references/hwpx-edit-ops.md`) |
 | Edit existing `.hwp` | `echo '{"path":"f.hwp","operations":[...]}' \| node scripts/create.js` (raw-patch via `cell-patch.js` — byte-level in-place, preserves tables, Hancom-Docs compatible) |
-| Convert `.hwp` ↔ `.hwpx` | `node scripts/convert.js <input> <output>` |
 | Validate output | `python scripts/validate.py <file.hwpx>` |
 | Preview file (Desktop = inline pane, CLI = browser link, cowork = drop-in viewer URL) | See Preview section for the surface decision rule |
 
@@ -371,7 +371,7 @@ exist yet.
 
 **Known limitations** (rhwp serializer constraints — applies to anything emitted via this skill):
 
-- **`.hwp ↔ .hwpx` conversion keeps tables but isn't pixel-faithful.** `convert.js` (and a from-scratch `.hwpx` built with tables) preserves table **structure and cell content** — the tables open and render in Hancom Docs (verified: a 70-table form converted with all 70 intact). What conversion does NOT fully preserve is **visual fidelity**: cell background colors/shading can partially drop, spacing and page breaks can shift, and **images do not render after conversion** (verified — the picture bytes survive in the `.hwpx` but Hancom Docs doesn't draw them; complex shapes untested). So edit in the input's original format when fidelity matters (`.hwp` raw-patch / `.hwpx` XML edit keep everything intact in place); only run `convert.js` when the user explicitly asks for a format change. **Editing an existing `.hwpx` (or `.hwp`) in place involves no conversion and preserves everything.**
+- **There is no `.hwp ↔ .hwpx` conversion — it was removed.** Editing always stays in the **input's original format**: `.hwp` → `create.js` raw-patch in place, `.hwpx` → `hwpx-edit.js` XML edit in place (reading via `extract_text` for both). In-place editing involves no conversion and preserves everything — tables, images, shading, spacing all stay intact.
 - **`replace_text` doesn't see table cells** (see op table above). For table-cell edits on an existing file, the `set_cell_text*` ops are the only path.
 - **In-place `apply_text_style` and `apply_paragraph_style` on large multi-page `.hwp` files (50+ pages)** are both supported via raw-patch (CharShape, and ParaShape + BorderFill respectively) and produce Hancom-Docs-compatible output.
 
@@ -388,7 +388,7 @@ exist yet.
 
 Detect format by reading the first two bytes — `PK` = HWPX (treat as `.hwpx` regardless of extension).
 
-Conversion between formats (`.hwp ↔ .hwpx`) is a **separate** tool — only use when the user explicitly requests a format change. It goes through rhwp's serializer, which keeps tables but isn't pixel-faithful (cell shading, spacing, and page breaks can shift).
+There is no `.hwp ↔ .hwpx` conversion — it was removed. Editing always stays in the input's original format (`.hwp` → `create.js` in place, `.hwpx` → `hwpx-edit.js` in place).
 
 #### `.hwpx` editing — `hwpx-edit.js`
 
@@ -446,7 +446,7 @@ For `.hwp` input, route through `create.js`. When the path already exists and th
 
 4. **Auto-preview after writes.** Per the trigger guidance below, fire `preview_start` / `preview_eval` immediately after the write so the user sees the edit visually right away. (Preview = quick visual feedback, **not** a 한컴 compatibility check — see the Preview and "Verifying in 한컴독스" sections.)
 
-**Output format default**: **keep the input's original format**. `.hwp` in → `.hwp` out (raw-patch via `cell-patch.js`, tables preserved). `.hwpx` in → `.hwpx` out (XML edit via `hwpx-edit.js`, tables preserved). Use `convert.js` only when the user explicitly requests a `.hwp ↔ .hwpx` format change — it routes through rhwp's serializer, which keeps tables but can shift visual fidelity (cell shading, spacing, page breaks).
+**Output format default**: **keep the input's original format**. `.hwp` in → `.hwp` out (raw-patch via `cell-patch.js`, tables preserved). `.hwpx` in → `.hwpx` out (XML edit via `hwpx-edit.js`, tables preserved). There is no `.hwp ↔ .hwpx` conversion — it was removed; editing always stays in the input format.
 
 ### "Fill in this form / 서식 / 양식 / 템플릿" — filling a template
 
@@ -590,7 +590,7 @@ Auto-detection: if no file argument is passed, the launcher picks the most recen
 
 Don't ask, just do it. **Showing the user a quick visual is your job** — but flag that this preview is feedback only, NOT a 한컴 compatibility verification (real verification = 한컴독스 / 한컴오피스 — see "Verifying in 한컴독스" section).
 
-1. Right after `create.js` / `convert.js` writes a new file or finishes a format conversion.
+1. Right after `create.js` writes a new file.
 2. Right after the user uploads a `.hwp` / `.hwpx` or mentions one by path.
 3. Right after edits (`replace_text`, unpack-edit-pack round-trip).
 
@@ -622,7 +622,6 @@ For these operations, **proactively suggest** verification via `hancomdocs-captu
 3. **Paragraph styling beyond text** — `apply_paragraph_style` (HWPX XML / HWP raw-patch), HWPX `set_page_break` — paraPr sanitize concerns
 4. **Header / footer / notes** — HWPX `set_header`, `set_footer`, `insert_footnote`, `insert_endnote` — control envelope verification gaps
 5. **Image insertion** — HWPX `insert_image`, HWP `append_image` on existing files (large forms 50+ pages can reject through the engine's full-serialize round-trip)
-6. **Format conversion** — `convert.js` (`.hwp ↔ .hwpx`) — tables survive but visual fidelity can shift (cell shading, spacing, page breaks); large forms round-trip reject
 
 Otherwise: don't push verification — user can invoke the companion skill themselves if needed.
 
@@ -641,7 +640,6 @@ Otherwise: don't push verification — user can invoke the companion skill thems
 | `scripts/extract_text.js` | Node | Read text, markdown, or metadata from .hwp/.hwpx via rhwp WASM |
 | `scripts/create.js` | Node | Generate a new .hwp / .hwpx from a stdin JSON op script via rhwp |
 | `scripts/hwpx-edit.js` | Node | Edit an existing **.hwpx** via stdin JSON ops (text/table/style/image) — direct OWPML XML, no rhwp. See `references/hwpx-edit-ops.md` |
-| `scripts/convert.js` | Node | Convert `.hwp ↔ .hwpx` via rhwp WASM (no LibreOffice required) |
 | `scripts/unpack.py` | Python | Unzip .hwpx → directory of pretty-printed XML |
 | `scripts/pack.py` | Python | Repack directory → .hwpx with auto-repair |
 | `scripts/validate.py` | Python | HWPX schema and structural validation |
@@ -651,11 +649,11 @@ Otherwise: don't push verification — user can invoke the companion skill thems
 ## Dependencies
 
 - **Python 3.9+** — `unpack.py`, `pack.py`, `validate.py` (standard library only)
-- **Node.js 18+** — `extract_text.js`, `create.js`, `convert.js`. `@rhwp/core` (WASM parser, ~5 MB), `fflate` (zip, ~80 KB), and `cfb` (Compound File Binary, ~62 KB) are bundled in `scripts/vendor/` — **no `npm install` step required**.
+- **Node.js 18+** — `extract_text.js`, `create.js`. `@rhwp/core` (WASM parser, ~5 MB), `fflate` (zip, ~80 KB), and `cfb` (Compound File Binary, ~62 KB) are bundled in `scripts/vendor/` — **no `npm install` step required**.
 
 ## References
 
 - `references/hwpx-format.md` — HWPX file structure, XML schema cheatsheet, common edit patterns
 - `references/hwpx-edit-ops.md` — `hwpx-edit.js` operation vocabulary (every op, its args, and examples)
-- `references/rhwp-api.md` — `@rhwp/core` API surface for create/convert operations
+- `references/rhwp-api.md` — `@rhwp/core` API surface for create operations
 - `references/equation-syntax.md` — Hangul equation script tokens for the `append_equation` op (structures + symbols)

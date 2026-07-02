@@ -62,7 +62,8 @@ def main() -> None:
         ap.error(
             f"not a valid HWPX (zip): {args.input}\n"
             "  Hint: HWP 5.0 binary files are not zips. "
-            "Run `node convert.js <input.hwp> <output.hwpx>` first."
+            "This is an HWP 5.0 binary, not HWPX — use the .hwp tools "
+            "(create.js / extract_text.js) directly."
         )
 
     n = unpack(args.input, args.output, pretty=not args.no_pretty)
