@@ -262,7 +262,10 @@ function cmdFill(args) {
       else refuse(`.hwpx field '${f.key}' needs 'placeholder' OR 'table'+'row'+'col' (label+offset is .hwp-only)`);
       attempted.push({ field: name, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
     }
-    if (Object.keys(values).length) operations.unshift({ type: 'fill_template', values });
+    // require_unique: PII safety — a placeholder that matches >1 spot (multi-person / parallel
+    // form) would fill several people's blocks with the same value. Refuse so the agent
+    // retargets with {table,row,col}. Mirrors the .hwp branch's require_occurrence guard.
+    if (Object.keys(values).length) operations.unshift({ type: 'fill_template', values, require_unique: true });
     const res = spawnSync('node', [HWPX_EDIT], { input: JSON.stringify({ path: template, output: out, operations }), encoding: 'utf8', maxBuffer: 1 << 26 });
     let ok = false, message = null;
     try { const o = JSON.parse(res.stdout) || {}; ok = o.ok === true; message = o.error ?? null; } catch {}
