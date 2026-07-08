@@ -1,0 +1,10 @@
+{
+  "template": "form_template.hwp",
+  "_comment": "증거조사 신청서 — 친근한 한글 키. txt 프로필의 '키: 값'과 매칭. 값 없음.",
+  "fields": [
+    { "label": "①성",         "key": "성명",         "col_offset": 1 },
+    { "label": "주민등록번호", "key": "주민등록번호", "col_offset": 1 },
+    { "label": "③주",         "key": "주소",         "col_offset": 1 },
+    { "label": "전화번호",     "key": "전화번호",     "col_offset": 1 }
+  ]
+}

@@ -9500,6 +9500,135 @@ export async function splitCellInPlace(filePath, ops) {
   return Object.assign(summary, { mode: 'in-place', split_count: summary.length });
 }
 
+/**
+ * Unmerge a merged table cell (`unmerge_cells`) in an existing `.hwp` via
+ * raw-patch. Op: `{ section?, para?, control?, row, col }` — target the merged
+ * cell's TOP-LEFT (row,col). GT-confirmed against Hancom's own 셀 병합해제
+ * (upload → table-op split on a rowSpan-2 cell → download): the merged cell's
+ * span drops to 1×1 (keeping its content in the top-left), and a fresh BLANK
+ * cell appears at every grid position the merge used to cover. Row/column COUNTS
+ * are unchanged (those slots already exist — only the cell that filled them was
+ * missing). The blank cells are cloned from the merged cell itself, so they
+ * inherit its column's width/borderFill and render as genuine Hancom empty
+ * cells. Section 0 only.
+ */
+export async function unmergeCellsInPlace(filePath, ops) {
+  if (!Array.isArray(ops) || ops.length === 0) return Object.assign([], { mode: 'in-place', unmerge_count: 0 });
+  for (const op of ops) {
+    if ((op.section ?? 0) !== 0) throw new Error(`unmerge_cells: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row) || !Number.isInteger(op.col)) throw new Error("unmerge_cells: 'row' and 'col' (integers) are required");
+  }
+  const summary = [];
+  for (const op of ops) {
+    const para = op.para ?? 0, ctrl = op.control ?? 0, R = op.row, C = op.col;
+    let buf = readFileSync(filePath);
+    let { ssz, mssz, dirStart, fatAddrs, minifatStart } = parseCfbHeader(buf);
+    let fat = readFat(buf, fatAddrs, ssz);
+    const { entries } = readDirectory(buf, fat, ssz, dirStart);
+    let minifat = readMinifat(buf, fat, ssz, minifatStart);
+    let rootChain = null;
+    const ensureRootChain = () => {
+      if (rootChain) return rootChain;
+      if (entries[0].start < 0 || entries[0].start === ENDOFCHAIN) throw new Error('mini-stream needed but root entry has no chain');
+      rootChain = walkChain(fat, entries[0].start);
+      return rootChain;
+    };
+    const secEntry = findStreamEntry(entries, ['BodyText', 'Section0']);
+    const secInMini = secEntry.size < 4096;
+    let secChain, secCompressed;
+    if (secInMini) {
+      const rc = ensureRootChain();
+      secChain = walkChain(minifat, secEntry.start);
+      secCompressed = readMiniChainBytes(buf, secChain, rc, ssz, mssz, secEntry.size);
+    } else {
+      secChain = walkChain(fat, secEntry.start);
+      secCompressed = readChainBytes(buf, secChain, ssz, secEntry.size);
+    }
+    let secRaw = Buffer.from(inflateRawSync(secCompressed));
+
+    const records = parseRecords(secRaw);
+    const tableRec = findTableRecord(records, para, ctrl);
+    const cells = tableCellRecords(records, secRaw, para, ctrl);
+    const target = cells.find((c) => c.row === R && c.col === C);
+    if (!target) throw new Error(`unmerge_cells: cell (${R},${C}) not found (target the merged cell's top-left)`);
+    const RS = target.rowSpan, CS = target.colSpan;
+    if (RS <= 1 && CS <= 1) throw new Error(`unmerge_cells: cell (${R},${C}) is already 1×1 (not merged)`);
+
+    // Clone source = the merged cell itself (before we shrink it) — matches the column.
+    const targetCluster = Buffer.from(secRaw.slice(target.startByte, target.endByte));
+    // Drop the merged cell to 1×1 (colSpan@12, rowSpan@14 of its LIST_HEADER).
+    secRaw.writeUInt16LE(1, target.lhDataOff + 12);
+    secRaw.writeUInt16LE(1, target.lhDataOff + 14);
+
+    // TABLE rowSizes (cells-per-row UINT16 array at body+18): every covered row
+    // gains the cell the merge used to hide. Same-size in-place bump (no record
+    // rebuild) — the array sits BEFORE the cell records, so splice offsets below
+    // are untouched. Skipping this = a cell-count mismatch → Hancom cannot_open.
+    for (let r = R; r < R + RS; r++) {
+      let added = 0;
+      for (let c = C; c < C + CS; c++) if (!(r === R && c === C)) added++;
+      if (added > 0) {
+        const rsOff = tableRec.dataOff + 18 + r * 2;
+        secRaw.writeUInt16LE((secRaw.readUInt16LE(rsOff) + added) & 0xFFFF, rsOff);
+      }
+    }
+
+    // Blank cell at every covered grid slot except the kept top-left.
+    const findInsOff = (r, c) => {
+      for (const cc of cells) if (cc.row > r || (cc.row === r && cc.col > c)) return cc.startByte;
+      return cells.length ? cells[cells.length - 1].endByte : (tableRec.dataOff + tableRec.size);
+    };
+    const splices = [];
+    for (let r = R; r < R + RS; r++) for (let c = C; c < C + CS; c++) {
+      if (r === R && c === C) continue;
+      const off = findInsOff(r, c);
+      const repl = emptyCellClusterFromClone(targetCluster, r, c);
+      // Clone source is the merged cell, so it still carries the merge's span —
+      // reset each freed slot to a plain 1×1 (colSpan@12, rowSpan@14 of its LIST_HEADER).
+      const rlh = parseRecords(repl).find((x) => x.tag === TAG_LIST_HEADER && x.level === 2);
+      repl.writeUInt16LE(1, rlh.dataOff + 12);
+      repl.writeUInt16LE(1, rlh.dataOff + 14);
+      splices.push({ start: off, end: off, r, c, repl });
+    }
+    // Apply high offset first; within one offset, higher (r,c) first so the lower
+    // (r,c) — spliced last — lands to its LEFT (correct row-major order).
+    splices.sort((a, b) => (b.start - a.start) || (b.r - a.r) || (b.c - a.c));
+    for (const s of splices) secRaw = Buffer.concat([secRaw.slice(0, s.start), s.repl, secRaw.slice(s.end)]);
+
+    {
+      const inMini = secInMini;
+      const capacity = inMini ? secChain.length * mssz : secChain.length * ssz;
+      if (inMini) {
+        const ext = deflateMiniChainWithExpansion(
+          { buf, ssz, mssz, fat, fatAddrs, minifat, minifatStart, rootChain: ensureRootChain(), rootEntry: entries[0] },
+          secRaw, secChain,
+        );
+        buf = ext.buf; fat = ext.fat; minifat = ext.minifat; minifatStart = ext.minifatStart;
+        if (ext.promoted) {
+          secChain = ext.newRegularChain;
+          writeChainBytes(buf, secChain, ssz, ext.compressed);
+          buf.writeInt32LE(secChain[0], secEntry.entryFileOffset + 0x74);
+        } else {
+          rootChain = ext.rootChain;
+          secChain = ext.miniChain;
+          writeMiniChainBytes(buf, secChain, rootChain, ssz, mssz, ext.compressed);
+        }
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      } else {
+        const ext = deflateAndFitWithExpansion(secRaw, capacity, ssz, fat, fatAddrs, secChain, buf, false);
+        buf = ext.buf; fat = ext.fat; secChain = ext.chain;
+        writeChainBytes(buf, secChain, ssz, ext.compressed);
+        buf.writeUInt32LE(ext.compressed.length, secEntry.entryFileOffset + 0x78);
+        buf.writeUInt32LE(0, secEntry.entryFileOffset + 0x7C);
+      }
+    }
+    writeFileSync(filePath, buf);
+    summary.push({ op: op.type, para, control: ctrl, row: R, col: C, was: `${CS}×${RS}`, cells_added: RS * CS - 1 });
+  }
+  return Object.assign(summary, { mode: 'in-place', unmerge_count: summary.length });
+}
+
 // True if a cell cluster holds just an empty paragraph (PARA_HEADER text_count
 // ≤ 1 = the EOP terminator only) — safe to clone as a fresh blank cell.
 function isEmptyCellCluster(clusterBytes) {
