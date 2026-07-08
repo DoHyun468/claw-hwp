@@ -9501,7 +9501,7 @@ export async function splitCellInPlace(filePath, ops) {
 }
 
 /**
- * Unmerge a merged table cell (`unmerge_cell`) in an existing `.hwp` via
+ * Unmerge a merged table cell (`unmerge_cells`) in an existing `.hwp` via
  * raw-patch. Op: `{ section?, para?, control?, row, col }` — target the merged
  * cell's TOP-LEFT (row,col). GT-confirmed against Hancom's own 셀 병합해제
  * (upload → table-op split on a rowSpan-2 cell → download): the merged cell's
@@ -9512,11 +9512,11 @@ export async function splitCellInPlace(filePath, ops) {
  * inherit its column's width/borderFill and render as genuine Hancom empty
  * cells. Section 0 only.
  */
-export async function unmergeCellInPlace(filePath, ops) {
+export async function unmergeCellsInPlace(filePath, ops) {
   if (!Array.isArray(ops) || ops.length === 0) return Object.assign([], { mode: 'in-place', unmerge_count: 0 });
   for (const op of ops) {
-    if ((op.section ?? 0) !== 0) throw new Error(`unmerge_cell: only section 0 supported (got ${op.section})`);
-    if (!Number.isInteger(op.row) || !Number.isInteger(op.col)) throw new Error("unmerge_cell: 'row' and 'col' (integers) are required");
+    if ((op.section ?? 0) !== 0) throw new Error(`unmerge_cells: only section 0 supported (got ${op.section})`);
+    if (!Number.isInteger(op.row) || !Number.isInteger(op.col)) throw new Error("unmerge_cells: 'row' and 'col' (integers) are required");
   }
   const summary = [];
   for (const op of ops) {
@@ -9550,9 +9550,9 @@ export async function unmergeCellInPlace(filePath, ops) {
     const tableRec = findTableRecord(records, para, ctrl);
     const cells = tableCellRecords(records, secRaw, para, ctrl);
     const target = cells.find((c) => c.row === R && c.col === C);
-    if (!target) throw new Error(`unmerge_cell: cell (${R},${C}) not found (target the merged cell's top-left)`);
+    if (!target) throw new Error(`unmerge_cells: cell (${R},${C}) not found (target the merged cell's top-left)`);
     const RS = target.rowSpan, CS = target.colSpan;
-    if (RS <= 1 && CS <= 1) throw new Error(`unmerge_cell: cell (${R},${C}) is already 1×1 (not merged)`);
+    if (RS <= 1 && CS <= 1) throw new Error(`unmerge_cells: cell (${R},${C}) is already 1×1 (not merged)`);
 
     // Clone source = the merged cell itself (before we shrink it) — matches the column.
     const targetCluster = Buffer.from(secRaw.slice(target.startByte, target.endByte));

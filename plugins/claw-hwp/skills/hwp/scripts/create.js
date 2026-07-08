@@ -3573,8 +3573,9 @@ async function readStdin() {
   // cell-patch.js splitCellInPlace.
   const SPLIT_OPS = new Set(['split_cell']);
   // Unmerge a merged table cell (rowSpan/colSpan → 1×1 + a blank cell at every
-  // freed grid slot). See cell-patch.js unmergeCellInPlace (GT vs Hancom 병합해제).
-  const UNMERGE_OPS = new Set(['unmerge_cell']);
+  // freed grid slot). Inverse of merge_cells; name matches .hwpx track + Excel/
+  // Word "Unmerge Cells". See cell-patch.js unmergeCellsInPlace (GT vs Hancom 병합해제).
+  const UNMERGE_OPS = new Set(['unmerge_cells']);
   // 문단 띠 / horizontal divider line (raw-patch — inserts a new paragraph
   // holding a gso rectangle the width of the text column). Self-contained in
   // Section0; no DocInfo change. See cell-patch.js insertParaLineInPlace.
@@ -3930,8 +3931,8 @@ async function readStdin() {
       }
       const unmergeOps = ops.filter((o) => UNMERGE_OPS.has(o.type));
       if (unmergeOps.length > 0) {
-        const { unmergeCellInPlace } = await import('./cell-patch.js');
-        const umSummary = await unmergeCellInPlace(outPath, unmergeOps);
+        const { unmergeCellsInPlace } = await import('./cell-patch.js');
+        const umSummary = await unmergeCellsInPlace(outPath, unmergeOps);
         subModes.push(`unmerge:${umSummary.mode || 'in-place'}`);
         for (const e of umSummary) allEdits.push({ kind: 'unmerge', ...e });
       }
