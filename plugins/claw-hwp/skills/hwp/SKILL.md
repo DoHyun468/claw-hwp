@@ -400,7 +400,7 @@ echo '{
   "path": "path/to/file.hwpx",
   "output": "out.hwpx",
   "operations": [
-    {"type": "fill_template", "values": {"{{이름}}": "남대현", "{{회사}}": "RECON Labs"}},
+    {"type": "fill_template", "values": {"{{이름}}": "홍길동", "{{회사}}": "가나다컴퍼니"}},
     {"type": "set_cell_text", "table": 2, "row": 1, "col": 1, "text": "100만원"},
     {"type": "append_paragraph", "text": "새 문단"}
   ]
