@@ -3572,6 +3572,10 @@ async function readStdin() {
   // Table structure: split one cell into N stacked rows (raw-patch). See
   // cell-patch.js splitCellInPlace.
   const SPLIT_OPS = new Set(['split_cell']);
+  // Unmerge a merged table cell (rowSpan/colSpan → 1×1 + a blank cell at every
+  // freed grid slot). Inverse of merge_cells; name matches .hwpx track + Excel/
+  // Word "Unmerge Cells". See cell-patch.js unmergeCellsInPlace (GT vs Hancom 병합해제).
+  const UNMERGE_OPS = new Set(['unmerge_cells']);
   // 문단 띠 / horizontal divider line (raw-patch — inserts a new paragraph
   // holding a gso rectangle the width of the text column). Self-contained in
   // Section0; no DocInfo change. See cell-patch.js insertParaLineInPlace.
@@ -3668,7 +3672,7 @@ async function readStdin() {
   // matches Hop's bytes 99% but fails Hancom Docs's render check due to
   // an as-yet-unidentified cascading DocInfo reference. Going through
   // rhwp's emit produces the exact bytes Hop produces.
-  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS, ...PLACE_SEAL_OPS, ...DELETE_OBJECT_OPS, ...EQUATION_OPS]);
+  const RAW_PATCH_OPS = new Set([...CELL_OPS, ...REPLACE_TEXT_OPS, ...APPEND_PARA_OPS, ...APPEND_TABLE_OPS, ...SETUP_DOC_OPS, ...APPLY_TEXT_STYLE_OPS, ...APPLY_PARAGRAPH_STYLE_OPS, ...CELL_STYLE_OPS, ...LIST_OPS, ...CELL_PROP_OPS, ...TABLE_PROP_OPS, ...OBJECT_PROP_OPS, ...MERGE_OPS, ...DELROW_OPS, ...INSROW_OPS, ...SPLIT_OPS, ...UNMERGE_OPS, ...PARALINE_OPS, ...FIELD_OPS, ...HYPERLINK_OPS, ...BOOKMARK_OPS, ...FOOTNOTE_OPS, ...ENDNOTE_OPS, ...PAGENUM_OPS, ...SET_COLUMNS_OPS, ...STYLE_OPS, ...HEADERFOOTER_OPS, ...EQUALIZE_OPS, ...SHAPE_OPS, ...TEXTBOX_OPS, ...IMAGE_RAWPATCH_OPS, ...CHART_OPS, ...PLACE_SEAL_OPS, ...DELETE_OBJECT_OPS, ...EQUATION_OPS]);
   // TEMP HYPOTHESIS TEST: force rhwp emit path to check whether sheetjs
   // CFB.write was the only Hancom-Docs reject cause. If FORCE_RHWP_EMIT=1
   // is set, bypass raw-patch and run everything through HANDLERS + exportHwp.
@@ -3924,6 +3928,13 @@ async function readStdin() {
         const spSummary = await splitCellInPlace(outPath, splitOps);
         subModes.push(`split:${spSummary.mode || 'in-place'}`);
         for (const e of spSummary) allEdits.push({ kind: 'split', ...e });
+      }
+      const unmergeOps = ops.filter((o) => UNMERGE_OPS.has(o.type));
+      if (unmergeOps.length > 0) {
+        const { unmergeCellsInPlace } = await import('./cell-patch.js');
+        const umSummary = await unmergeCellsInPlace(outPath, unmergeOps);
+        subModes.push(`unmerge:${umSummary.mode || 'in-place'}`);
+        for (const e of umSummary) allEdits.push({ kind: 'unmerge', ...e });
       }
       // insert_para_line is dispatched LATER (after the object-insert + table
       // ops) — it adds a new body paragraph, which would shift the absolute
