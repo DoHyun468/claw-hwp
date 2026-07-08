@@ -342,7 +342,7 @@ Template fill + a cell edit + a styled run, saved in place:
 echo '{
   "path": "form.hwpx", "output": "form.hwpx",
   "operations": [
-    {"type": "fill_template", "values": {"{{이름}}": "남대현", "{{날짜}}": "2026-05-21"}},
+    {"type": "fill_template", "values": {"{{이름}}": "홍길동", "{{날짜}}": "2026-05-21"}},
     {"type": "set_cell_text", "table": 0, "row": 2, "col": 1, "text": "100만원"},
     {"type": "apply_text_style", "target": "합계", "bold": true, "color": "FF0000"}
   ]

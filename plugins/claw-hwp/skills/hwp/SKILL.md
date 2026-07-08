@@ -25,7 +25,7 @@ This skill helps Claude work with Korean Hangul Word Processor documents — rea
 1. `node scripts/secure-fill.mjs detect` — 환경·영구 프로필 확인.
 2. 영구 프로필 있으면(`local_proven`) 그대로 사용, 재질문 X.
 3. 없으면: 빈 서식 분석 → **`.txt`**(JSON 금지) 빈 양식을 **바탕화면**에 `secure-fill template`. 사용자가 콜론 뒤 값만 적게 안내. (값을 채팅으로 위임하면 그때만 맥락 유입을 **선고지**하고 수용 → 임시폴더 txt → 즉시 `shred`.)
-4. `secure-fill fill --profile <txt> --map <mapping.json> --out <결과.hwp|.hwpx>`. **프로필엔 숫자만**(생년월일 `970605`, 전화 `01012345678`). 서식 칸 모양이 다르면 매핑 필드 `format`에 **그 모양을 그대로** 적어라(자유 패턴, 고정 목록 아님): 날짜는 `mm dd`·`yy.mm.dd`·`yyyy년 m월 d일`(yyyy/yy/mm/dd/m/d 토큰), 숫자칸은 `#`=숫자 한 자리 마스크 `###-####-####`·`######-#######`·`###########`. 특수만 프리셋: `phone:intl-paren`·`phone:intl`·`rrn:masked`. 변환은 도구가 함 — 에이전트는 **모양만**, 값·변환값 모두 컨텍스트 안 거침.
+4. `secure-fill fill --profile <txt> --map <mapping.json> --out <결과.hwp|.hwpx>`. **프로필엔 숫자만**(생년월일 `900101`, 전화 `01012345678`). 서식 칸 모양이 다르면 매핑 필드 `format`에 **그 모양을 그대로** 적어라(자유 패턴, 고정 목록 아님): 날짜는 `mm dd`·`yy.mm.dd`·`yyyy년 m월 d일`(yyyy/yy/mm/dd/m/d 토큰), 숫자칸은 `#`=숫자 한 자리 마스크 `###-####-####`·`######-#######`·`###########`. 특수만 프리셋: `phone:intl-paren`·`phone:intl`·`rrn:masked`. 변환은 도구가 함 — 에이전트는 **모양만**, 값·변환값 모두 컨텍스트 안 거침.
 5. **기본 ephemeral**: 끝나면 `secure-fill shred`. 결과 문서는 "개인정보 문서이니 관리" 고지.
 6. 영구 저장은 사용자가 **명시**할 때만 `secure-fill stash`(→ `~/.claw-hwp/`, 600, 평문·중고판매 경고). git 커밋/푸시·repo 보관 금지. **`stash`/`shred`로 기존 영구 프로필을 덮어쓰거나 지울 땐 사용자 확인 먼저** — 실제 사용자 데이터일 수 있다.
 
@@ -400,7 +400,7 @@ echo '{
   "path": "path/to/file.hwpx",
   "output": "out.hwpx",
   "operations": [
-    {"type": "fill_template", "values": {"{{이름}}": "남대현", "{{회사}}": "RECON Labs"}},
+    {"type": "fill_template", "values": {"{{이름}}": "홍길동", "{{회사}}": "가나다컴퍼니"}},
     {"type": "set_cell_text", "table": 2, "row": 1, "col": 1, "text": "100만원"},
     {"type": "append_paragraph", "text": "새 문단"}
   ]
