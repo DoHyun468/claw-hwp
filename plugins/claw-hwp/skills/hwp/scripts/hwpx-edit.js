@@ -754,6 +754,78 @@ function setTcTagAttr(inner, tag, name, val) {
   return inner.replace(new RegExp(`(<hp:${tag}\\b[^>]*?\\b${name}=")\\d+(")`), `$1${val}$2`);
 }
 
+// Undo a merge: restore a merged cell (colSpan/rowSpan > 1) to individual 1×1 cells —
+// the inverse of merge_cells. GT (claw-hancomdocs 셀 나누기 of a merged cell → download):
+// re-created cells inherit the survivor's borderFillIDRef + cellMargin + subList shell,
+// carry an EMPTY paragraph (a self-closing <hp:run>, no <hp:t>), and the merged width/height
+// is divided evenly across the restored cells; cellAddr is restored so the grid is
+// rectangular again. (Hancom's webhwp 셀 나누기 row-splits a merged cell instead of
+// grid-restoring it — this op does the grid restore the user means by "unmerge".)
+function opUnmergeCells(doc, tableIndex, row, col) {
+  const { section, el } = getTable(doc, tableIndex);
+  let tbl = el.inner;
+  const cellByColAddr = (rowInner, c) => {
+    const tcs = scanTopLevel(rowInner, 'hp:tc');
+    return tcs.find((tc) => tcTagAttr(tc.inner, 'cellAddr', 'colAddr') === c) || tcs[c] || null;
+  };
+  const rows0 = scanTopLevel(tbl, 'hp:tr');
+  if (row < 0 || row >= rows0.length) throw new Error(`unmerge_cells: row ${row} out of range`);
+  const target = cellByColAddr(rows0[row].inner, col);
+  if (!target) throw new Error(`unmerge_cells: cell (row ${row}, col ${col}) not found in table ${tableIndex}`);
+  const cs = tcTagAttr(target.inner, 'cellSpan', 'colSpan') || 1;
+  const rs = tcTagAttr(target.inner, 'cellSpan', 'rowSpan') || 1;
+  if (cs < 2 && rs < 2) throw new Error(`unmerge_cells: cell (row ${row}, col ${col}) is not merged (colSpan ${cs}, rowSpan ${rs})`);
+  const ca0 = tcTagAttr(target.inner, 'cellAddr', 'colAddr') ?? col;
+  const ra0 = tcTagAttr(target.inner, 'cellAddr', 'rowAddr') ?? row;
+  const W = tcTagAttr(target.inner, 'cellSz', 'width') || 0;
+  const H = tcTagAttr(target.inner, 'cellSz', 'height') || 0;
+  const wEach = W > cs ? Math.floor(W / cs) : W;   // split the merged width evenly (else keep — Hancom recomputes)
+  const hEach = H > rs ? Math.floor(H / rs) : H;
+  // Empty cell mirroring the survivor's shell (tc attrs / subList / cellMargin), empty paragraph.
+  const subEl = scanTopLevel(target.inner, 'hp:subList')[0];
+  const pEl = subEl ? scanTopLevel(subEl.inner, 'hp:p')[0] : null;
+  const cpr = pEl ? (pEl.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1] : '0';
+  const marginEl = (target.inner.match(/<hp:cellMargin\b[^>]*\/?>/) || [''])[0];
+  const pAttrs = pEl ? pEl.attrs : ' id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"';
+  const mkEmpty = (ra, ca) =>
+    `<hp:tc${target.attrs}>` +
+    `<hp:subList${subEl ? subEl.attrs : ''}><hp:p${pAttrs}><hp:run charPrIDRef="${cpr}"/></hp:p></hp:subList>` +
+    `<hp:cellAddr colAddr="${ca}" rowAddr="${ra}"/>` +
+    `<hp:cellSpan colSpan="1" rowSpan="1"/>` +
+    `<hp:cellSz width="${wEach}" height="${hEach}"/>` +
+    marginEl +
+    `</hp:tc>`;
+  // 1) Survivor → a 1×1 cell (keeps text + addr); split its size.
+  let survivor = target.inner;
+  survivor = setTcTagAttr(setTcTagAttr(survivor, 'cellSpan', 'colSpan', 1), 'cellSpan', 'rowSpan', 1);
+  survivor = setTcTagAttr(setTcTagAttr(survivor, 'cellSz', 'width', wEach), 'cellSz', 'height', hEach);
+  {
+    const rEl = scanTopLevel(tbl, 'hp:tr')[row];
+    const tgt = cellByColAddr(rEl.inner, col);
+    let fill = `<hp:tc${target.attrs}>${survivor}</hp:tc>`;
+    for (let k = 1; k < cs; k++) fill += mkEmpty(ra0, ca0 + k);        // horizontal fill
+    tbl = spliceEl(tbl, rEl, `<hp:tr${rEl.attrs}>${spliceEl(rEl.inner, tgt, fill)}</hp:tr>`);
+  }
+  // 2) rowSpan: rows ra0+1..ra0+rs-1 are missing the cs cells the merge removed — re-insert them.
+  for (let dr = 1; dr < rs; dr++) {
+    const rEl = scanTopLevel(tbl, 'hp:tr')[row + dr];
+    if (!rEl) break;
+    let insertAfter = null;
+    for (const tc of scanTopLevel(rEl.inner, 'hp:tc')) {
+      const a = tcTagAttr(tc.inner, 'cellAddr', 'colAddr');
+      if (a != null && a < ca0) insertAfter = tc;
+    }
+    let fills = '';
+    for (let k = 0; k < cs; k++) fills += mkEmpty(ra0 + dr, ca0 + k);
+    const newInner = insertAfter
+      ? spliceEl(rEl.inner, insertAfter, `<hp:tc${insertAfter.attrs}>${insertAfter.inner}</hp:tc>${fills}`)
+      : fills + rEl.inner;
+    tbl = spliceEl(tbl, rEl, `<hp:tr${rEl.attrs}>${newInner}</hp:tr>`);
+  }
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${dropLinesegs(tbl)}</hp:tbl>`));
+  return { table: tableIndex, row, col, unmerged: { colSpan: cs, rowSpan: rs } };
+}
+
 // Split one table cell into nRows × nCols sub-cells (셀 나누기). Grid model
 // verified against Hancom-native ground truth (claw-hancomdocs split → download):
 // splitting a 1×1 cell inserts (nCols-1) grid columns and/or (nRows-1) grid rows
@@ -4587,6 +4659,7 @@ function applyOp(doc, op) {
     case 'append_table_column': return opAppendTableColumn(doc, op.table, op.cells);
     case 'delete_table_column': return opDeleteTableColumn(doc, op.table, op.col);
     case 'merge_cells': return opMergeCells(doc, op.table, op.mode, op);
+    case 'unmerge_cells': return opUnmergeCells(doc, op.table, op.row, op.col);
     case 'insert_table': return opInsertTable(doc, op.index, op.rows, op.cols, op.cells);
     case 'set_cell_background': return opSetCellBackground(doc, op.table, op.row, op.col, op.color);
     case 'set_cell_border': return opSetCellBorder(doc, op.table, op.row, op.col, op.color, op.width, op.sides);
