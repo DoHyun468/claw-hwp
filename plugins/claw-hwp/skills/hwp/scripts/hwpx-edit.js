@@ -755,7 +755,7 @@ function setTcTagAttr(inner, tag, name, val) {
 }
 
 // Undo a merge: restore a merged cell (colSpan/rowSpan > 1) to individual 1×1 cells —
-// the inverse of merge_cells. GT (claw-hancomdocs 셀 나누기 of a merged cell → download):
+// the inverse of merge_cells. GT (Hancom Docs 셀 나누기 of a merged cell → download):
 // re-created cells inherit the survivor's borderFillIDRef + cellMargin + subList shell,
 // carry an EMPTY paragraph (a self-closing <hp:run>, no <hp:t>), and the merged width/height
 // is divided evenly across the restored cells; cellAddr is restored so the grid is
@@ -827,7 +827,7 @@ function opUnmergeCells(doc, tableIndex, row, col) {
 }
 
 // Split one table cell into nRows × nCols sub-cells (셀 나누기). Grid model
-// verified against Hancom-native ground truth (claw-hancomdocs split → download):
+// verified against Hancom-native ground truth (Hancom Docs split → download):
 // splitting a 1×1 cell inserts (nCols-1) grid columns and/or (nRows-1) grid rows
 // at the cell's position; every other cell that SPANS the split axis grows its
 // span to keep covering it, and cells past the split shift their addr. The target
@@ -902,7 +902,7 @@ function opSplitCell(doc, tableIndex, row, col, nRows, nCols) {
 }
 
 // Attach a caption (캡션, e.g. "그림 1." / "표 1.") to an object. Structure
-// verified against Hancom-native ground truth (image caption via claw-hancomdocs
+// verified against Hancom-native ground truth (image caption via Hancom Docs
 // → download): <hp:caption side= fullSz="0" width= gap= lastWidth="0"> holding a
 // subList>p>run>t, placed as the LAST child of the object element (after
 // shapeComment for pic/shape/chart). Tables carry it right after the shape-header
@@ -950,7 +950,7 @@ function opSetCaption(doc, target, index, text, side, gapMm) {
   throw new Error(`set_caption: no ${target} #${idx} found in document`);
 }
 
-// ── 개체(그림/도형/차트) 속성 편집 — claw-hancomdocs object-prop 흡수 (handoff §2) ──
+// ── 개체(그림/도형/차트) 속성 편집 — Hancom Docs object-prop 흡수 (handoff §2) ──
 // 객체는 target(image/chart/shape) + index 로 지목(set_caption 과 동일 주소 체계). 편집은
 // 객체의 <hp:sz>(크기)·<hp:pos>(위치/글자처럼취급)·textWrap attr(배치)·<hp:outMargin>(글
 // 과의 간격)·<hp:lineShape>(선·화살표)·<hc:winBrush>(채우기·투명도·무늬)를 in-place 수정.
@@ -2100,7 +2100,7 @@ function opSetCellSize(doc, tableIndex, row, col, width, height) {
 }
 
 // ── 표/셀 속성 다이얼로그(기본·표·여백/캡션·셀)의 빈 칸 채우기 ────────────────
-// GT 구조: handoff/shared/SHARED_op-inventory-for-GT.md §1 (claw-hancomdocs 가
+// GT 구조: handoff/shared/SHARED_op-inventory-for-GT.md §1 (Hancom Docs 가
 // 한컴 web 에서 실측한 native XML). margin/size 입력은 mm(다이얼로그 단위) → HWPUNIT.
 const HU_PER_MM = 283.46;
 const mm2hu = (v) => Math.round(Number(v) * HU_PER_MM);
