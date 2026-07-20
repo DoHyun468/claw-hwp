@@ -4871,7 +4871,7 @@ function _icWriteOoxml(cfb, newXml) {
 // Inject colour into the OOXMLChartContents, mirroring the HWPX track's
 // buildChartSpace colour model so .hwp and .hwpx charts match a document theme
 // the same way. Hancom stores the colour differently per chart family (verified,
-// GT in handoff/shared/gt/chart-*-schemeclr.hwpx):
+// GT from Hancom's per-family chart rendering):
 //   - fill families (bar/area/scatter/bubble): bare <a:solidFill> in <c:spPr>
 //   - stroke families (line/radar): <a:solidFill> inside <a:ln> (a bare fill
 //     leaves the stroke colour unchanged)
