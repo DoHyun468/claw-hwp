@@ -4092,7 +4092,7 @@ export async function insertPageNumberInPlace(filePath, ops) {
 
 
 // ── 다단 (multi-column) raw-patch ─────────────────────────────────────────
-// GT-first (claw-hancomdocs `columns --count N` on a .hwp): the section's
+// GT-first (Hancom Docs `columns --count N` on a .hwp): the section's
 // column layout lives in the "cold" (단 정의) CTRL_HEADER, a fixed 16-byte
 // record: id "dloc" + attribute(u16) + gap(u16) + 8 reserved bytes. The
 // attribute is 0x1000 (same-width flag) | (count << 2) | type(bits 0-1, 0 =
@@ -5442,7 +5442,7 @@ export async function insertChartInPlace(filePath, ops) {
 // (images/charts) it then shifts every higher storage id down by 1 so the
 // BIN_DATA defs / stream pointers / gso binDataIDs stay contiguous: Hancom Docs
 // resolves a binDataID by position, so leaving a gap renders the higher objects
-// as broken-image placeholders (GT: claw-hancomdocs delete renumbers; the gap
+// as broken-image placeholders (GT: Hancom Docs delete renumbers; the gap
 // case is render-confirmed broken, the renumbered case render-confirmed clean).
 // CFB streams are NOT renamed or removed (no red-black-tree surgery): the
 // dir-entry chain pointers among BIN000{S..N} are rotated so each name serves the
@@ -8618,7 +8618,7 @@ export async function applyCellPropertyInPlace(filePath, ops) {
       : (e.margin_mm != null ? [e.margin_mm, e.margin_mm, e.margin_mm, e.margin_mm] : null);
     if (margins) for (let i = 0; i < 4; i++) secRaw.writeUInt16LE(mm(margins[i]) & 0xFFFF, o + 24 + i * 2);
     // Header / title cell (제목 셀): LIST_HEADER offset 6 (u16). GT-confirmed
-    // (gt_title: claw-hancomdocs table-cell-prop --title-cell, .hwp download) —
+    // (gt_title: Hancom Docs table-cell-prop --title-cell, .hwp download) —
     // base 0 → 4 (bit 2). On the top row this is HWP's repeat-header-row behavior.
     if (e.header != null) secRaw.writeUInt16LE(e.header ? 4 : 0, o + 6);
     summary.push({ op: e.type, para, control: ctrl, cellIndex: e.cellIndex, row: e.row, col: e.col,
@@ -8661,7 +8661,7 @@ export async function applyCellPropertyInPlace(filePath, ops) {
 
 // ── 표 바깥 여백 (table outer margin) raw-patch ──────────────────────────────
 //
-// GT-first (gt_margin: claw-hancomdocs `table-cell-prop --table-margin "5,5,3,3"`
+// GT-first (gt_margin: Hancom Docs `table-cell-prop --table-margin "5,5,3,3"`
 // applied in 한컴 web, downloaded as .hwp — NOT converted from .hwpx). The table's
 // outer margin lives in the table CTRL_HEADER (tag 0x47, ctrl_id " lbt" = "tbl "
 // reversed in-stream, body size 46). In-record offset 28/30/32/34 = u16
@@ -8674,7 +8674,7 @@ export async function applyCellPropertyInPlace(filePath, ops) {
 const TABLE_CTRL_ID = ' lbt'; // "tbl " stored reversed (little-endian ctrl_id)
 const TABLE_OUTMARGIN_OFF = 28; // in-record offset of the 4 outer-margin u16s
 // Page-split mode = TABLE record (0x4d) attribute bits 0-1. GT-confirmed
-// (claw-hancomdocs table-cell-prop --page-split, .hwp download): none→0,
+// (Hancom Docs table-cell-prop --page-split, .hwp download): none→0,
 // cell→1, table→2 (table == the default). 한컴 spec: 0 나누지않음 / 1 셀단위로나눔 / 2 나눔.
 const TABLE_PAGE_SPLIT = { none: 0, cell: 1, table: 2 };
 // Text-wrap / placement = bits in the gso/table CTRL_HEADER attribute (offset 4).
@@ -8828,7 +8828,7 @@ export async function applyTablePropertyInPlace(filePath, ops) {
 
 // ── 객체(그림/도형) 속성 (object fill / border / outer margin) raw-patch ────
 //
-// GT-first (claw-hancomdocs object-prop --fill/--border/--border-width/--margin
+// GT-first (Hancom Docs object-prop --fill/--border/--border-width/--margin
 // on a gso shape, downloaded as .hwp and diffed vs a round-trip baseline). A
 // drawing object = a gso CTRL_HEADER (ctrl_id ' osg' = "gso " reversed, a
 // CommonObjAttr like the table's ' lbt') followed by a SHAPE_COMPONENT (0x4c)
@@ -8854,7 +8854,7 @@ const COMP_BORDER_WIDTH_OFF = 200;
 const COMP_FILL_OFF = 213;
 const COMP_FILL_ALPHA_OFF = 229; // fill transparency: alpha byte = round(t% × 255/100)
 const COMP_BORDER_TYPE_OFF = 204; // line style byte = 0x40 | enum
-// GT-confirmed (object-prop --border-type, .hwp download). claw-hancomdocs already
+// GT-confirmed (object-prop --border-type, .hwp download). Hancom Docs already
 // corrects Hancom's UI dash↔dot combo swap, so these are the standard values —
 // no swap needed here.
 const BORDER_TYPE = {

@@ -56,4 +56,5 @@ _verified_hwpx_samples/
 # auto-loaded by the cold-start skill — keep out of the public repo. They recur
 # at the root during dev, so ignore the patterns.
 /*HANDOFF*.md
+/*PROPOSAL*.md
 experiment/
