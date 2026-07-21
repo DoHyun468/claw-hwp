@@ -104,7 +104,7 @@ when the same edit is performed through its UI.
 
 ### Table / cell properties (표·셀 속성 다이얼로그)
 
-Mirrors the 4-tab 표/셀 속성 dialog. Margin/size inputs are **mm** → HWPUNIT (≈283.46/mm). Structures cross-checked against claw-hancomdocs's Hancom-web ground truth (`handoff/shared/SHARED_op-inventory-for-GT.md` §1) and round-trip-verified (Hancom preserves them 1:1).
+Mirrors the 4-tab 표/셀 속성 dialog. Margin/size inputs are **mm** → HWPUNIT (≈283.46/mm). Structures cross-checked against Hancom Docs's Hancom-web ground truth and round-trip-verified (Hancom preserves them 1:1).
 
 | Op | Required | Optional | Notes |
 |----|----------|----------|-------|
@@ -122,7 +122,7 @@ Mirrors the 4-tab 표/셀 속성 dialog. Margin/size inputs are **mm** → HWPUN
 
 ### Object properties (그림·도형 속성 — image/shape/chart)
 
-Edit an existing object's geometry/border/fill. The object is addressed by `target` (`image`/`shape`/`chart`) + `index` (0-based, in document order — same scheme as `set_caption`). mm → HWPUNIT. GT: `handoff/shared/SHARED_op-inventory-for-GT.md` §2; round-trip-verified on Hancom (size/textWrap/lineShape/winBrush all preserved).
+Edit an existing object's geometry/border/fill. The object is addressed by `target` (`image`/`shape`/`chart`) + `index` (0-based, in document order — same scheme as `set_caption`). mm → HWPUNIT. GT: Hancom-web ground truth; round-trip-verified on Hancom (size/textWrap/lineShape/winBrush all preserved).
 
 | Op | Required | Optional | Notes |
 |----|----------|----------|-------|
