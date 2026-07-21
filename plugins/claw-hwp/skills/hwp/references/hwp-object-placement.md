@@ -8,7 +8,7 @@
 ## wrap enum (5종) — set_object_property·set_table_property·insert_*가 전부 공유
 
 `inline | topbottom | square | behind | front` — 바이트 인코딩은 `set_object_property.wrap`
-(Hancom Docs `object-prop`로 5모드 전부 GT 검증)과 **동일**(gso CTRL_HEADER attribute,
+(Hancom native GT로 5모드 전부 검증)과 **동일**(gso CTRL_HEADER attribute,
 mask `0x600001`). insert 시 넣는 attribute가 set_object_property가 쓰는 값과 바이트 일치하므로,
 insert+wrap = insert 후 set_object_property(wrap)과 같다.
 
