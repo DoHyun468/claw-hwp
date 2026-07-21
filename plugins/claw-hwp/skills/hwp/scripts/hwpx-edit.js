@@ -950,7 +950,7 @@ function opSetCaption(doc, target, index, text, side, gapMm) {
   throw new Error(`set_caption: no ${target} #${idx} found in document`);
 }
 
-// ── 개체(그림/도형/차트) 속성 편집 — Hancom Docs object-prop 흡수 (handoff §2) ──
+// ── 개체(그림/도형/차트) 속성 편집 — Hancom native 개체 속성 흡수 ──
 // 객체는 target(image/chart/shape) + index 로 지목(set_caption 과 동일 주소 체계). 편집은
 // 객체의 <hp:sz>(크기)·<hp:pos>(위치/글자처럼취급)·textWrap attr(배치)·<hp:outMargin>(글
 // 과의 간격)·<hp:lineShape>(선·화살표)·<hc:winBrush>(채우기·투명도·무늬)를 in-place 수정.
@@ -1055,7 +1055,7 @@ function opSetObjectMargin(doc, target, index, opts) {
 }
 
 // 선(테두리) 색/굵기/종류 + 화살표 (hp:lineShape). NOTE: 우리는 XML 직접 emit 이라 표준
-// HWPX style 값을 그대로 쓴다(파선=DASH, 점선=DOT). handoff 의 파선↔점선 swap 은 한컴 UI
+// HWPX style 값을 그대로 쓴다(파선=DASH, 점선=DOT). Hancom native GT 의 파선↔점선 swap 은 한컴 UI
 // 클릭 보정용일 뿐 — 단, 한컴 web RENDER 는 그 둘을 바꿔 그리는 별도 버그가 있어 화면상
 // 파선이 점선처럼 보일 수 있음(파일 type 은 표준이 맞음).
 const OBJ_LINE_STYLE = { solid: 'SOLID', dashed: 'DASH', dotted: 'DOT', 'long-dash': 'LONG_DASH', 'dash-dot': 'DASH_DOT', 'dash-dot-dot': 'DASH_DOT_DOT', double: 'DOUBLE_SLIM', 'circle-dot': 'CIRCLE' };
@@ -2100,7 +2100,7 @@ function opSetCellSize(doc, tableIndex, row, col, width, height) {
 }
 
 // ── 표/셀 속성 다이얼로그(기본·표·여백/캡션·셀)의 빈 칸 채우기 ────────────────
-// GT 구조: handoff/shared/SHARED_op-inventory-for-GT.md §1 (Hancom Docs 가
+// GT 구조 (Hancom native): Hancom Docs 가
 // 한컴 web 에서 실측한 native XML). margin/size 입력은 mm(다이얼로그 단위) → HWPUNIT.
 const HU_PER_MM = 283.46;
 const mm2hu = (v) => Math.round(Number(v) * HU_PER_MM);
@@ -2257,7 +2257,7 @@ function opSetTitleCell(doc, tableIndex, row, col, on) {
 }
 
 // 표가 여러 쪽에 자동분할될 때 잘린 가장자리에 그려지는 경계선(여백/캡션 탭의 '자동으로
-// 나뉜 표의 경계선 설정'). GT(handoff §1): 표 borderFill 에 breakCellSeparateLine="1" 을
+// 나뉜 표의 경계선 설정'). GT(Hancom native): 표 borderFill 에 breakCellSeparateLine="1" 을
 // 켜고 그 **<hh:diagonal> 슬롯**(top/bottomBorder 아님!)에 type/width/color 를 저장. 표는
 // '나눔'(pageBreak="CELL") 모드여야 활성. 표의 기존 borderFill 을 복제(테두리 모양은 유지)
 // 해 위 두 가지를 적용하고, 표를 새 borderFill 로 repoint. line_type 은 표준 HWPX style 직접
