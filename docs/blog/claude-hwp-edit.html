@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>클로드로 한글(HWP) 문서 편집·작성·자동화하는 법 — 한컴오피스 없이 (2026) | claw-hwp</title>
+<meta name="description" content="claw-hwp를 설치하면 클로드(Claude)·코덱스(Codex)가 한글 문서(.hwp·.hwpx)를 한컴오피스 없이, 변환 없이 직접 읽고·만들고·편집합니다. 고친 파일이 한컴에서 안 깨지는지 검증하는 무료 오픈소스 스킬.">
+<meta name="keywords" content="클로드 hwp, 클로드 한글 문서 편집, 한글 자동화, 한컴 없이 hwp, hwp 편집, claude hwp, codex hwp, hwpx 편집, 한글 문서 자동화">
+<meta name="author" content="claw-hwp">
+<link rel="canonical" href="https://dohyun468.github.io/claw-hwp/blog/claude-hwp-edit.html">
+<meta name="robots" content="index, follow">
+<!-- Open Graph -->
+<meta property="og:type" content="article">
+<meta property="og:title" content="클로드로 한글(HWP) 문서 편집·작성·자동화하는 법 — 한컴오피스 없이 (2026)">
+<meta property="og:description" content="클로드·코덱스가 .hwp를 한컴 없이, 변환 없이 직접 편집. 고친 파일이 한컴에서 안 깨지는지 검증하는 무료 오픈소스 스킬.">
+<meta property="og:url" content="https://dohyun468.github.io/claw-hwp/blog/claude-hwp-edit.html">
+<meta property="og:site_name" content="claw-hwp">
+<meta property="og:locale" content="ko_KR">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="클로드로 한글(HWP) 문서 편집·자동화 — 한컴 없이 (2026)">
+<meta name="twitter:description" content="클로드·코덱스가 .hwp를 한컴 없이 직접 편집하는 무료 오픈소스 스킬.">
+<!-- FAQPage 구조화 데이터 (AI개요·리치결과용) -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"클로드나 코덱스로 한글(HWP) 문서를 편집할 수 있나요?","acceptedAnswer":{"@type":"Answer","text":"네. claw-hwp를 설치하면 클로드·코덱스가 .hwp·.hwpx를 직접 읽고·만들고·편집합니다. 한컴오피스가 없어도 됩니다."}},
+    {"@type":"Question","name":".hwp를 .hwpx나 PDF로 변환해야 하나요?","acceptedAnswer":{"@type":"Answer","text":"아니요. 변환 없이 원본 .hwp를 있는 그대로 편집합니다. 고친 파일은 한컴오피스·한컴독스에서 그대로 열립니다."}},
+    {"@type":"Question","name":"mac에서도 되나요?","acceptedAnswer":{"@type":"Answer","text":"됩니다. mac·윈도우에서 한컴오피스·윈도우 전용 프로그램 없이 작동합니다."}},
+    {"@type":"Question","name":"개인정보가 든 서식을 안전하게 채울 수 있나요?","acceptedAnswer":{"@type":"Answer","text":"네. 주민등록번호·계좌번호 같은 값을 AI 대화에 올리지 않고 파일에서 바로 칸에만 채우는 안전 모드가 있습니다."}},
+    {"@type":"Question","name":"엑셀·PDF 자료를 한글 양식에 자동으로 옮길 수 있나요?","acceptedAnswer":{"@type":"Answer","text":"네. 엑셀·PDF에 흩어진 데이터를 읽어 한글 서식의 해당 칸에 채워 줍니다."}},
+    {"@type":"Question","name":"브라우저 미리보기가 한컴과 100% 똑같나요?","acceptedAnswer":{"@type":"Answer","text":"아니요. 미리보기는 작업 중 빠른 확인용이라 한컴과 완전히 같지는 않습니다. 최종 확인·검토는 한컴오피스·한컴독스에서 하세요."}},
+    {"@type":"Question","name":"무료인가요?","acceptedAnswer":{"@type":"Answer","text":"네, MIT 라이선스 오픈소스입니다."}}
+  ]
+}
+</script>
+<!-- SoftwareApplication 구조화 데이터 -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "claw-hwp",
+  "applicationCategory": "BusinessApplication",
+  "operatingSystem": "macOS, Windows",
+  "description": "클로드·코덱스가 한글 문서(.hwp/.hwpx)를 한컴오피스 없이 읽고·만들고·편집하는 오픈소스 에이전트 스킬.",
+  "url": "https://github.com/DoHyun468/claw-hwp",
+  "license": "https://opensource.org/licenses/MIT",
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+}
+</script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", "맑은 고딕", sans-serif; line-height: 1.75; color: #1a1a1a; background: #fff; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.9rem; line-height: 1.35; margin: 0 0 1.2rem; letter-spacing: -0.02em; }
+  h2 { font-size: 1.35rem; margin: 2.6rem 0 0.9rem; letter-spacing: -0.01em; }
+  p, li { font-size: 1.03rem; }
+  a { color: #2563eb; }
+  .lead { font-size: 1.08rem; }
+  .summary { background: #f0f6ff; border: 1px solid #d6e4ff; border-left: 4px solid #2563eb; border-radius: 10px; padding: 1rem 1.15rem; margin: 0 0 1.8rem; }
+  .summary strong { color: #1d4ed8; }
+  blockquote { margin: 1.2rem 0; padding: 0.6rem 1rem; border-left: 3px solid #cbd5e1; color: #475569; background: #f8fafc; border-radius: 0 8px 8px 0; }
+  .warn { background: #fff7ed; border: 1px solid #fed7aa; border-left: 4px solid #f59e0b; border-radius: 8px; padding: 0.85rem 1rem; color: #7c2d12; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 1rem 1.1rem; border-radius: 10px; overflow-x: auto; font-size: 0.92rem; }
+  code { font-family: "SFMono-Regular", Consolas, monospace; }
+  p code, li code { background: #f1f5f9; padding: 0.12em 0.4em; border-radius: 5px; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.95rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #e2e8f0; padding: 0.6rem 0.8rem; text-align: left; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 700; }
+  .faq h3 { font-size: 1.05rem; margin: 1.4rem 0 0.35rem; }
+  .faq p { margin: 0.2rem 0 0; color: #334155; }
+  footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; color: #64748b; font-size: 0.95rem; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e5e7eb; background: #0b0f19; }
+    h1, h2 { color: #f1f5f9; }
+    a { color: #60a5fa; }
+    .summary { background: #10203a; border-color: #1e3a5f; }
+    .summary strong { color: #93c5fd; }
+    blockquote { background: #111827; border-color: #334155; color: #94a3b8; }
+    .warn { background: #2a1a0a; border-color: #7c4a12; color: #fdba74; }
+    th { background: #111827; }
+    th, td { border-color: #1f2937; }
+    p code, li code { background: #1f2937; }
+    .faq p { color: #cbd5e1; }
+    footer { border-color: #1f2937; }
+  }
+</style>
+</head>
+<body>
+<article class="wrap">
+  <h1>클로드로 한글(HWP) 문서 편집·작성·자동화하는 법 — 한컴오피스 없이 (2026)</h1>
+
+  <div class="summary">
+    <strong>한 줄 요약:</strong> <code>claw-hwp</code>를 설치하면 클로드(Claude)·코덱스(Codex) 같은 AI가 한글 문서(.hwp·.hwpx)를 <strong>한컴오피스 없이, 변환 없이</strong> 직접 읽고·만들고·편집합니다. 고친 파일이 한컴에서 안 깨지는지 매번 검증하고, 무료 오픈소스(MIT)입니다.
+  </div>
+
+  <h2>AI가 한글 파일을 못 읽어서 막힌 적 있나요?</h2>
+  <p class="lead">ChatGPT·클로드로 업무를 자동화하다 보면 꼭 막히는 지점이 있습니다. <strong>한글(.hwp) 파일.</strong> 회사 공문·보고서·사업계획서·서식은 대부분 한글로 오는데, AI는 이걸 바로 못 다룹니다. 그래서 보통은 이렇게 우회하죠.</p>
+  <ul>
+    <li>PDF·워드로 <strong>변환</strong>한 뒤 업로드 → 표·서식이 깨지고, 다시 한글로 되돌릴 수 없음</li>
+    <li>한컴오피스 <strong>자동화(COM)</strong> → 윈도우 + 한컴 라이선스 필수, mac 불가</li>
+    <li>손으로 복붙 → 반복이 쌓이면 결국 사람이 다 함</li>
+  </ul>
+  <p><code>claw-hwp</code>는 이 우회들을 없앱니다. <strong>원본 .hwp를 있는 그대로</strong>, 한컴 없이 편집합니다.</p>
+
+  <h2>claw-hwp란?</h2>
+  <p>클로드·코덱스에 설치하는 <strong>오픈소스 에이전트 스킬</strong>입니다. 설치 후에는 한국어로 말하듯 시키기만 하면 됩니다.</p>
+  <blockquote>
+    "이 보고서 표에서 매출 칸을 120억으로 바꿔줘"<br>
+    "이 엑셀 데이터를 강사소개서 양식에 채워줘"<br>
+    "표 하나 만들고 꼬리말에 쪽번호 넣어줘"
+  </blockquote>
+  <p>결과 파일은 <strong>한컴오피스·한컴독스(한글 웹)에서 그대로 열립니다 — 안 깨져요.</strong> 한컴오피스·LibreOffice·윈도우 전용 프로그램, 아무것도 필요 없습니다.</p>
+
+  <h2>설치 (2분)</h2>
+  <p><strong>Claude 앱 / Claude Code</strong></p>
+  <pre><code>claude plugin marketplace add https://github.com/DoHyun468/claw-hwp
+claude plugin install claw-hwp@claw-hwp</code></pre>
+  <p><strong>Codex 앱</strong></p>
+  <pre><code>codex plugin marketplace add https://github.com/DoHyun468/claw-hwp
+codex plugin add claw-hwp@claw-hwp</code></pre>
+  <p>설치 후 한글 파일을 채팅에 올리거나 파일 이름을 말하면 자동으로 작동합니다.</p>
+
+  <h2>이런 걸 할 수 있어요</h2>
+  <ul>
+    <li><strong>읽기</strong> — 문서·표·셀 내용까지 통째로 추출</li>
+    <li><strong>글자·문단 꾸미기</strong> — 굵게·색·글꼴·정렬·줄간격·자간</li>
+    <li><strong>표</strong> — 만들기, 셀 병합·병합 해제, 행/열 추가, 셀 값 채우기</li>
+    <li><strong>개체</strong> — 차트(20종+), 이미지, 도형, 서명·직인, 각주, 쪽번호, 수식</li>
+    <li><strong>양식 자동 채우기</strong> — 엑셀·PDF에 흩어진 데이터를 한글 서식의 해당 칸에 자동 기입</li>
+    <li><strong>개인정보 안전 채우기</strong> — 주민등록번호·계좌번호 같은 값을 AI 대화에 올리지 않고 파일에서 바로 칸에만 채움</li>
+    <li><strong>검증</strong> — 고친 파일이 한컴에서 안 깨지고 열리는지 매번 확인</li>
+  </ul>
+
+  <h2>다른 방법과 뭐가 다른가요?</h2>
+  <table>
+    <thead><tr><th></th><th>claw-hwp</th><th>HWP 변환(PDF/DOCX)</th><th>한컴 자동화(COM)</th></tr></thead>
+    <tbody>
+      <tr><td>한컴오피스</td><td><strong>불필요</strong></td><td>필요(변환 시)</td><td>필수</td></tr>
+      <tr><td>운영체제</td><td>mac·윈도우</td><td>무관</td><td>윈도우 전용</td></tr>
+      <tr><td>.hwp 직접 편집</td><td><strong>✅ 원본 그대로</strong></td><td>❌ 변환됨</td><td>✅</td></tr>
+      <tr><td>표·서식 보존</td><td><strong>✅</strong></td><td>❌ 자주 깨짐</td><td>✅</td></tr>
+      <tr><td>한컴 열림 검증</td><td><strong>✅ 매번</strong></td><td>—</td><td>—</td></tr>
+      <tr><td>개인정보 안전</td><td><strong>✅ 값이 AI 대화 안 거침</strong></td><td>—</td><td>—</td></tr>
+      <tr><td>비용</td><td><strong>무료(MIT)</strong></td><td>—</td><td>라이선스</td></tr>
+    </tbody>
+  </table>
+  <p>핵심 차이는 두 가지입니다. ① <strong>변환 없이 원본을 편집</strong>하니 표·서식이 안 깨지고, ② <strong>고친 파일이 한컴에서 실제로 열리는지 매번 검증</strong>합니다. "열립니다"가 아니라 "검증했습니다".</p>
+
+  <h2>자주 묻는 질문 (FAQ)</h2>
+  <div class="faq">
+    <h3>Q. 클로드나 코덱스로 한글(HWP) 문서를 편집할 수 있나요?</h3>
+    <p>네. <code>claw-hwp</code>를 설치하면 클로드·코덱스가 .hwp·.hwpx를 직접 읽고·만들고·편집합니다. 한컴오피스가 없어도 됩니다.</p>
+    <h3>Q. .hwp를 .hwpx나 PDF로 변환해야 하나요?</h3>
+    <p>아니요. 변환 없이 원본 .hwp를 있는 그대로 편집합니다. 고친 파일은 한컴오피스·한컴독스에서 그대로 열립니다.</p>
+    <h3>Q. mac에서도 되나요?</h3>
+    <p>됩니다. mac·윈도우에서 한컴오피스·윈도우 전용 프로그램 없이 작동합니다.</p>
+    <h3>Q. 개인정보가 든 서식을 안전하게 채울 수 있나요?</h3>
+    <p>네. 주민등록번호·계좌번호 같은 값을 AI 대화에 올리지 않고 파일에서 바로 칸에만 채우는 안전 모드가 있습니다.</p>
+    <h3>Q. 엑셀·PDF 자료를 한글 양식에 자동으로 옮길 수 있나요?</h3>
+    <p>네. 엑셀·PDF에 흩어진 데이터를 읽어 한글 서식의 해당 칸에 채워 줍니다.</p>
+    <h3>Q. 브라우저 미리보기가 한컴과 100% 똑같나요?</h3>
+    <p>아니요. 미리보기는 작업 중 빠른 확인용이라 한컴과 완전히 같지는 않습니다. 최종 확인·검토는 한컴오피스·한컴독스에서 하세요.</p>
+    <h3>Q. 무료인가요?</h3>
+    <p>네, MIT 라이선스 오픈소스입니다.</p>
+  </div>
+
+  <h2>시작하기</h2>
+  <ul>
+    <li>GitHub: <a href="https://github.com/DoHyun468/claw-hwp">github.com/DoHyun468/claw-hwp</a></li>
+    <li>설치·로그인 없이 한글 파일을 열어 보기만 하려면: <a href="https://dohyun468.github.io/claw-hwp/">여기</a>에 파일을 끌어 놓으면 브라우저에서 바로 보여요.</li>
+  </ul>
+  <p class="warn">⚠️ 이 브라우저 미리보기는 <strong>작업 중 빠른 확인용</strong>이에요. 한컴과 100% 똑같지는 않으니 <strong>최종 확인·검토는 한컴오피스나 한컴독스에서</strong> 하세요. (파일을 고칠 때 한컴에서 안 깨지는지 자체 검증하는 것과는 별개의, 사람이 눈으로 보는 미리보기입니다.)</p>
+
+  <footer>
+    hwp라서 포기했던 자동화, 이제 그대로 열립니다. · <a href="https://github.com/DoHyun468/claw-hwp">claw-hwp</a> (MIT)
+  </footer>
+</article>
+</body>
+</html>
