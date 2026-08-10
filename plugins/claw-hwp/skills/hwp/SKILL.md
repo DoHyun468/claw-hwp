@@ -23,7 +23,7 @@ This skill helps Claude work with Korean Hangul Word Processor documents — rea
 
 **로컬(사용자 PC) 흐름**
 
-★ **`.hwp` 빈 서식이면 이 한 줄이 먼저다** — `node scripts/secure-fill.mjs fill --auto --profile <txt> --form <빈서식.hwp> --out <결과.hwp>`. 프로필 키를 서식 라벨에 자동 매칭해 inspect+채우기를 한 번에 하고, 출력의 per-field `chars` 리포트가 곧 채움 확인이다. → **`keys`·`--inspect`·`mapping.json` 작성·별도 `verify` 전부 불필요** (짓지 마라). `unmatched`/`ambiguous`로 나온 키(폼에 라벨 없음/중복)만, 또는 **`.hwpx`**면 아래 `--map` 단계로 보강. (`--auto`는 현재 `.hwp` 전용. 값은 여전히 컨텍스트에 안 들어온다.)
+★ **빈 서식이면 이 한 줄이 먼저다 (`.hwp`·`.hwpx` 공통)** — `node scripts/secure-fill.mjs fill --auto --profile <txt> --form <빈서식.hwp|.hwpx> --out <결과.hwp|.hwpx>`. 프로필 키를 서식 라벨에 자동 매칭해 inspect+채우기를 한 번에 하고, 출력의 per-field `chars` 리포트가 곧 채움 확인이다. → **`keys`·`--inspect`·`mapping.json` 작성·별도 `verify` 전부 불필요** (짓지 마라 — `--auto` 리포트가 곧 verify다). `unmatched`/`ambiguous`로 나온 키(폼에 라벨 없음/중복, 또는 `.hwpx`에서 라벨 옆 빈칸이 아닌 형식칸)만 아래 `--map` 단계로 보강한다. (값은 여전히 컨텍스트에 안 들어온다.)
 
 1. `node scripts/secure-fill.mjs detect` — 환경·영구 프로필 확인.
 2. 영구 프로필 있으면(`local_proven`) 그대로 사용, 재질문 X.

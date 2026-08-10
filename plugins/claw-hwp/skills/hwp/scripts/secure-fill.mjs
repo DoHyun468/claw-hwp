@@ -377,9 +377,9 @@ function cmdFillAuto(args) {
   assertProfileInput(profilePath, 'profile');
   const formAbs = path.resolve(form);
   if (!/\.hwpx?$/i.test(formAbs) || !existsSync(formAbs)) refuse(`--form must be an existing .hwp/.hwpx (got '${form}')`);
-  if (path.extname(formAbs).toLowerCase() === '.hwpx') {
-    refuse('fill --auto is currently .hwp only — .hwpx auto-fill is on the HWPX track. Use `fill --map` for .hwpx.');
-  }
+  // HWPX-track slice: .hwpx fill has no by-label targeting, so --auto resolves each matched
+  // label to the POSITION of its value cell and delegates to the {table,row,col} path.
+  if (path.extname(formAbs).toLowerCase() === '.hwpx') return fillAutoHwpx(args, formAbs, profilePath);
   const profile = loadProfile(profilePath);            // values in-tool, never printed
   const keys = Object.keys(profile).filter((k) => profile[k] != null && String(profile[k]).trim() !== '');
   // Collect the form's text-bearing (label) cells from --inspect.
@@ -406,6 +406,68 @@ function cmdFillAuto(args) {
   }, null, 2));
   if (!fields.length) refuse('fill --auto matched no fields — profile keys must equal form labels, or use `fill --map`');
   // Reuse the proven .hwp fill path with an in-memory preset mapping (no mapping.json on disk).
+  cmdFill(args, { template: formAbs, fields });
+}
+
+// ── `fill --auto` (.hwpx): HWPX-track slice ──────────────────────────────────
+// .hwpx fill has NO by-label targeting (label+offset is .hwp-only), so --auto can't hand a
+// label straight to the engine like the .hwp path does. Instead it enumerates the form's cells
+// (via hwpx-edit's read-only `inspect: 'cells'`, which uses the SAME colAddr addressing
+// set_cell_text resolves) and converts each 1:1-matched label into the POSITION of its value
+// cell — the empty cell immediately to the right (colSpan-aware). Then it delegates to cmdFill's
+// {table,row,col} path. Ambiguity is REFUSED, never guessed, exactly like the .hwp branch:
+//   • key matches 0 labels                    → unmatched
+//   • key matches >1 labels                    → ambiguous (multi-person/parallel form — use --map)
+//   • matched label has no empty right cell    → unmatched (header-on-top / value-below forms; use --map)
+// Values stay in-tool; only label text + cell coordinates (never PII) are ever printed.
+function fillAutoHwpx(args, formAbs, profilePath) {
+  if (path.extname(String(args.out)).toLowerCase() !== '.hwpx') refuse('a .hwpx --form needs a .hwpx --out');
+  const profile = loadProfile(profilePath);            // values in-tool, never printed
+  const keys = Object.keys(profile).filter((k) => profile[k] != null && String(profile[k]).trim() !== '');
+  // Read the form's cell inventory {table,row,col,text} (no mutation, no save).
+  const res = spawnSync('node', [HWPX_EDIT], { input: JSON.stringify({ path: formAbs, inspect: 'cells' }), encoding: 'utf8', maxBuffer: 1 << 26 });
+  let tables = null;
+  try { const o = JSON.parse(res.stdout) || {}; if (o.ok) tables = o.tables; } catch {}
+  if (!tables) refuse('fill --auto could not inspect the .hwpx form (hwpx-edit inspect failed)');
+  // For each text-bearing (label) cell, precompute its value cell = same row, the cell after the
+  // label (colSpan-aware), and whether that cell exists and is empty.
+  const labels = [];
+  for (const t of tables) {
+    const byRC = new Map();                            // "row,col" → cell
+    for (const c of t.cells) byRC.set(`${c.row},${c.col}`, c);
+    for (const c of t.cells) {
+      const txt = (c.text || '').trim();
+      if (!txt) continue;
+      const valueCol = c.col + (c.colSpan || 1);
+      const vcell = byRC.get(`${c.row},${valueCol}`);
+      labels.push({
+        orig: txt, norm: normLabel(txt), table: t.index, row: c.row, valueCol,
+        valueExists: !!vcell, valueEmpty: vcell ? (vcell.text || '').trim() === '' : false,
+      });
+    }
+  }
+  const fields = [], unmatched = [], ambiguous = [];
+  for (const key of keys) {
+    const nk = normLabel(key);
+    const hits = labels.filter((l) => l.norm === nk);
+    if (hits.length === 1) {
+      const h = hits[0];
+      if (!h.valueExists || !h.valueEmpty) { unmatched.push(key); continue; } // no empty right cell → don't guess/clobber
+      const fmt = inferFormat(key);
+      fields.push({ key, label: h.orig, table: h.table, row: h.row, col: h.valueCol, ...(fmt ? { format: fmt } : {}) });
+    } else if (hits.length === 0) unmatched.push(key);
+    else ambiguous.push(key); // duplicate label — don't guess which block; caller retargets with --map {table,row,col}
+  }
+  // Report the MATCH PLAN (label/coordinate names only — never values) so the agent sees what will fill.
+  console.log(JSON.stringify({
+    auto: true, form: path.basename(formAbs), engine: 'hwpx',
+    matched: fields.map((f) => f.label), unmatched, ambiguous,
+    note: ambiguous.length
+      ? 'ambiguous keys matched >1 label — NOT filled; target them via `fill --map` {table,row,col}'
+      : 'matched keys fill the empty cell right of each label; values never printed',
+  }, null, 2));
+  if (!fields.length) refuse('fill --auto matched no fillable fields — a profile key must equal a form label that has an empty cell to its right, or use `fill --map`');
+  // Delegate to the .hwpx fill engine via an in-memory positional preset (no mapping.json on disk).
   cmdFill(args, { template: formAbs, fields });
 }
 
@@ -508,16 +570,16 @@ subcommands:
   template <out.txt> --keys a,b              빈 채움 템플릿(.txt) 생성 (값 없음)
   fill  --profile <txt> --map <map.json> --out <결과.hwp|.hwpx>
                                              서식 채우기. --profile 생략 시 저장된 영구 프로필 사용.
-  fill --auto --profile <txt> --form <빈서식.hwp> --out <결과.hwp>   ★ .hwp 가장 간단
-                                             프로필 키를 서식 라벨에 자동 매칭 → mapping.json 불필요.
+  fill --auto --profile <txt> --form <빈서식.hwp|.hwpx> --out <결과.hwp|.hwpx>   ★ 가장 간단
+                                             프로필 키를 서식 라벨에 자동 매칭 → mapping.json 불필요 (.hwp·.hwpx 공통).
                                              애매(0/2+ 매칭)한 키는 안 채우고 unmatched 로 보고.
   verify --out <채운파일> --map <map.json>    채운 값 검증 (마스킹 출력)
   stash <profile.txt> / shred <profile.txt>  영구 프로필 저장(~/.claw-hwp) / 안전 삭제
   handoff --form <서식> --out <노트.md>       업로드 환경용 PII-free 인수인계 노트
 
 fill 워크플로:
-  ★ .hwp면 한 줄로 끝 — node secure-fill.mjs fill --auto --profile "<txt>" --form "<빈서식.hwp>" --out "<결과.hwp>"
-     (라벨 자동매칭. 매칭이 애매하다고 나오거나 .hwpx면 아래 --map 5스텝으로.)
+  ★ 한 줄로 끝 — node secure-fill.mjs fill --auto --profile "<txt>" --form "<빈서식.hwp|.hwpx>" --out "<결과.hwp|.hwpx>"
+     (.hwp·.hwpx 둘 다. 라벨 자동매칭. 매칭이 애매하다고 나오면 아래 --map 5스텝으로.)
 
   --map 수동 (5스텝):
   1) node secure-fill.mjs keys "<profile.txt>"                          # 필드명 확인 (값 안 봄)
