@@ -429,7 +429,53 @@ function flags(argv) {
   return o;
 }
 
+const HELP = `secure-fill.mjs — .hwp/.hwpx 서식을 개인정보 값이 Claude 컨텍스트에 유입되지 않게 채운다.
+값은 이 도구가 프로필 파일에서 직접 읽어 셀에만 쓰고, 에이전트에는 개수/마스킹만 반환한다.
+⚠️ 프로필/채운 값을 직접 cat/Read/grep 하지 말 것 — keys/verify 만 써라 (값은 절대 컨텍스트에 안 들어옴).
+   이 도움말이면 충분하다 — 소스(secure-fill.mjs)를 통째로 읽지 마라.
+
+subcommands:
+  detect                                     환경 + 영구 프로필 존재 여부 (값 없음)
+  keys <profile.txt>                         프로필의 필드명만 나열 (값 안 읽음)
+  template <out.txt> --keys a,b              빈 채움 템플릿(.txt) 생성 (값 없음)
+  fill  --profile <txt> --map <map.json> --out <결과.hwp|.hwpx>
+                                             서식 채우기. --profile 생략 시 저장된 영구 프로필 사용.
+  verify --out <채운파일> --map <map.json>    채운 값 검증 (마스킹 출력)
+  stash <profile.txt> / shred <profile.txt>  영구 프로필 저장(~/.claw-hwp) / 안전 삭제
+  handoff --form <서식> --out <노트.md>       업로드 환경용 PII-free 인수인계 노트
+
+fill 워크플로 (5스텝, 이대로만 하면 됨):
+  1) node secure-fill.mjs keys "<profile.txt>"                          # 필드명 확인 (값 안 봄)
+  2) node extract_text.js "<빈서식>" --inspect --with-cell-text        # 셀 {table,row,col} 구조 확인
+  3) map.json 작성 (아래 예시)
+  4) node secure-fill.mjs fill --profile "<txt>" --map "<map.json>" --out "<결과.hwp>"
+  5) node secure-fill.mjs verify --out "<결과.hwp>" --map "<map.json>"  # 마스킹 검증
+
+map.json 형식:
+{
+  "template": "강사소개서(서식).hwp",     // map.json 과 같은 폴더의 기존 서식 (상대경로만, 절대/상위경로 금지)
+  "fields": [
+    { "key": "성명", "label": "성명" },                                 // .hwp 라벨 기반: 라벨 셀의 옆칸을 채움
+    { "key": "주민등록번호", "label": "주민등록번호", "format": "######-#######" },
+    { "key": "휴대폰", "label": "휴대폰", "format": "###-####-####" },
+    { "key": "생년월일", "label": "생년월일", "format": "yyyy.mm.dd" }
+  ]
+  // 위치 기반(.hwp/.hwpx 공통): { "key":"주소", "table":0, "row":4, "col":1, "format":"..." }
+  // .hwpx placeholder:          { "key":"성명", "placeholder":"(    )", "format":"..." }
+  // 중복 라벨(다인/병렬 폼): 라벨에 "occurrence":0(문서순) 추가하거나 위치 기반 {table,row,col} 로 지목
+}
+
+format 토큰:  # = 숫자 한 자리  (예 ###-####-####, ######-#######).  날짜 = yyyy/yy/mm/dd/m/d 조합.
+  프리셋:  rrn:masked · phone:intl · phone:intl-paren.
+  프로필 값엔 숫자만 넣어라 (전화 01012345678, 생일 900101) — 모양 변환은 format 이 처리.`;
+
 const [cmd, ...rest] = process.argv.slice(2);
+// Help must never fall through to a subcommand — `keys --help` etc. used to hit
+// loadProfile('--help') → ENOENT. Intercept BEFORE dispatch so any --help/-h prints usage.
+if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help' || rest.includes('--help') || rest.includes('-h')) {
+  console.log(HELP);
+  process.exit(0);
+}
 switch (cmd) {
   case 'detect': cmdDetect(); break;
   case 'keys': cmdKeys(rest[0]); break;
@@ -440,6 +486,6 @@ switch (cmd) {
   case 'stash': cmdStash(flags(rest)); break;
   case 'shred': cmdShred(rest[0]); break;
   default:
-    console.log('usage: secure-fill.mjs <detect|keys|template|fill|verify|stash|shred|handoff> ...');
+    console.log(HELP);
     process.exit(1);
 }
