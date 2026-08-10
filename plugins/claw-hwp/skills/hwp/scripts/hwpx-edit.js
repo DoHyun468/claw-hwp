@@ -449,6 +449,27 @@ function getTable(doc, tableIndex) {
   return tables[tableIndex];
 }
 
+// Read-only cell inventory: every table's cells as {row, col, colSpan, rowSpan, text},
+// using the SAME addressing set_cell_text resolves (row = <hp:tr> index, col = <hp:cellAddr>
+// colAddr with positional fallback). Consumed by secure-fill `fill --auto` on .hwpx to turn a
+// matched label into the position of its value cell. Pure read — never mutates, never saves.
+function dumpCells(doc) {
+  return doc.tablesDeep().map((t, index) => {
+    const rows = scanTopLevel(t.el.inner, 'hp:tr');
+    const cells = [];
+    rows.forEach((rw, ri) => {
+      for (const tc of scanTopLevel(rw.inner, 'hp:tc')) {
+        const am = tc.inner.match(/<hp:cellAddr [^>]*colAddr="(\d+)"[^>]*rowAddr="(\d+)"|<hp:cellAddr [^>]*rowAddr="(\d+)"[^>]*colAddr="(\d+)"/);
+        const col = am ? (am[1] !== undefined ? Number(am[1]) : Number(am[4])) : cells.filter((c) => c.row === ri).length;
+        const sm = tc.inner.match(/<hp:cellSpan [^>]*colSpan="(\d+)"[^>]*rowSpan="(\d+)"/);
+        const text = xmlUnescape((tc.inner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((x) => x.replace(/<\/?hp:t>/g, '')).join(''));
+        cells.push({ row: ri, col, colSpan: sm ? Number(sm[1]) : 1, rowSpan: sm ? Number(sm[2]) : 1, text });
+      }
+    });
+    return { index, rows: rows.length, cells };
+  });
+}
+
 // Set the inner text of one <hp:tc>, collapsing its first paragraph to a single
 // run. Preserves the <hp:subList> wrapper and trailing cell metadata.
 function xmlUnescape(s) {
@@ -4756,6 +4777,11 @@ async function main() {
     : inputPath.replace(/\.hwpx$/i, '_edited.hwpx');
 
   const doc = new Hwpx(unzipSync(bytes));
+  // Read-only inspect: dump the cell inventory and exit without touching/saving the file.
+  if (payload.inspect === 'cells') {
+    process.stdout.write(JSON.stringify({ ok: true, tables: dumpCells(doc) }, null, 2) + '\n');
+    return;
+  }
   const ops = Array.isArray(payload.operations) ? payload.operations : [];
   const results = [];
   for (let i = 0; i < ops.length; i++) {
