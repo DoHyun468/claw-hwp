@@ -194,10 +194,11 @@
 
 ### 👀 "눈으로 확인" 도우미도 같이 *(선택)*
 
-위에서 소개한 한컴독스 캡처를 쓰려면 — Claude Code(CLI)에서 한 줄:
+위에서 소개한 한컴독스 캡처를 쓰려면 — Claude Code(CLI)에서 두 줄(마켓 추가 → 설치):
 
 ```
-claude plugin install https://github.com/DoHyun468/hancomdocs-capture
+claude plugin marketplace add https://github.com/DoHyun468/hancomdocs-capture
+claude plugin install hancomdocs-capture@hancomdocs-capture
 ```
 
 처음 한 번 한컴독스 로그인만 하면 계속 쓸 수 있어요.
