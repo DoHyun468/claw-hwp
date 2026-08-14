@@ -609,14 +609,14 @@ In Desktop and CLI paths, "fire preview" means open the viewer / link directly. 
 
 For automated verification, use the **separate** companion skill `hancomdocs-capture` (한컴독스 web automation with login state). Invoke it independently after editing — see that skill's own SKILL.md for the invocation contract.
 
-**Install** (currently from GitHub; marketplace publish pending):
+**Install** (two steps — add the marketplace, then install the plugin):
 
 ```bash
-claude plugin install https://github.com/DoHyun468/hancomdocs-capture
-# After publish: claude plugin install hancomdocs-capture
+claude plugin marketplace add https://github.com/DoHyun468/hancomdocs-capture
+claude plugin install hancomdocs-capture@hancomdocs-capture
 ```
 
-If not installed and the user needs visual verification, suggest the install command above; otherwise proceed without it (claw-hwp itself never depends on capture).
+If it's not installed and the user needs visual verification, run the two commands above, then invoke it. **Do NOT substitute generic browser automation (Claude-in-Chrome or any browser MCP) to drive 한컴독스 yourself** — typing into the web editor and its upload flow corrupt the document and trip permission blocks; `hancomdocs-capture` is headless (no visible window) and purpose-built to avoid exactly that. If you genuinely can't install it, ask the user to open the file in 한컴독스 (web) / 한컴오피스 (desktop) themselves — never drive it with a generic browser tool. claw-hwp itself never depends on capture.
 
 #### When to proactively suggest verification
 
