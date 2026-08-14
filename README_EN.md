@@ -194,10 +194,11 @@ The same info is shaped differently per form. A birthdate as `900101` here, `90.
 
 ### Add the "see-it-with-your-eyes" helper too *(optional)*
 
-To use the Hancom Docs capture above — one line in Claude Code (CLI):
+To use the Hancom Docs capture above — two lines in Claude Code (CLI) (add the marketplace, then install):
 
 ```
-claude plugin install https://github.com/DoHyun468/hancomdocs-capture
+claude plugin marketplace add https://github.com/DoHyun468/hancomdocs-capture
+claude plugin install hancomdocs-capture@hancomdocs-capture
 ```
 
 Log in to Hancom Docs once, and you're set.
