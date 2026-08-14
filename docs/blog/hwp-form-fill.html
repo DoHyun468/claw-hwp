@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>클로드로 한글(HWP) 양식·서식 자동 채우기 — 개인정보 안전하게 (2026) | claw-hwp</title>
+<meta name="description" content="claw-hwp로 클로드(Claude)·코덱스(Codex)가 엑셀·PDF 데이터를 한글 서식(.hwp) 칸에 자동으로 채웁니다. 주민등록번호·계좌번호 같은 값은 AI 대화에 올리지 않고 파일에서 바로 채우는 안전 모드. 무료 오픈소스.">
+<meta name="keywords" content="hwp 양식 자동 채우기, 한글 서식 자동 작성, 개인정보 문서 자동화, 엑셀 hwp 채우기, hwp 서식 작성, 클로드 hwp 양식, 한글 문서 자동 작성, 주민번호 서식 자동">
+<meta name="author" content="claw-hwp">
+<link rel="canonical" href="https://dohyun468.github.io/claw-hwp/blog/hwp-form-fill.html">
+<meta name="robots" content="index, follow">
+<!-- Open Graph -->
+<meta property="og:type" content="article">
+<meta property="og:title" content="클로드로 한글(HWP) 양식·서식 자동 채우기 — 개인정보 안전하게 (2026)">
+<meta property="og:description" content="엑셀·PDF 데이터를 한글 서식 칸에 자동 기입. 주민번호·계좌 같은 값은 AI 대화에 안 올라가는 안전 모드. 무료 오픈소스.">
+<meta property="og:url" content="https://dohyun468.github.io/claw-hwp/blog/hwp-form-fill.html">
+<meta property="og:site_name" content="claw-hwp">
+<meta property="og:locale" content="ko_KR">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="클로드로 한글(HWP) 양식 자동 채우기 — 개인정보 안전하게 (2026)">
+<meta name="twitter:description" content="엑셀·PDF를 한글 서식에 자동으로 채우는 무료 오픈소스 스킬. 개인정보는 AI 대화 안 거침.">
+<!-- FAQPage 구조화 데이터 (AI개요·리치결과용) -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"엑셀이나 PDF에 있는 데이터를 한글(HWP) 양식에 자동으로 채울 수 있나요?","acceptedAnswer":{"@type":"Answer","text":"네. claw-hwp를 설치하면 클로드·코덱스가 엑셀·PDF에 흩어진 데이터를 읽어 한글 서식(.hwp)의 해당 칸에 자동으로 채워 줍니다. 한컴오피스가 없어도 됩니다."}},
+    {"@type":"Question","name":"주민등록번호·계좌번호 같은 개인정보가 AI에 노출되나요?","acceptedAnswer":{"@type":"Answer","text":"아니요. 안전 모드는 개인정보 값을 AI 대화(모델)에 올리지 않고, 파일에서 바로 서식의 칸에만 채웁니다. AI는 어떤 항목을 어디에 넣을지만 정하고, 실제 값은 사람의 파일 안에서만 이동합니다."}},
+    {"@type":"Question","name":"칸마다 매핑을 직접 설정해야 하나요?","acceptedAnswer":{"@type":"Answer","text":"빈 서식이면 항목 이름(성명·생년월일·주소 등)을 서식의 라벨과 알아서 맞춰 채웁니다. 어느 칸에 넣을지 애매하면 함부로 넣지 않고 물어봅니다."}},
+    {"@type":"Question","name":"채운 파일이 한컴오피스에서 안 깨지나요?","acceptedAnswer":{"@type":"Answer","text":"네. 원본 서식을 있는 그대로 두고 값만 채우며, 고친 파일이 한컴오피스·한컴독스에서 안 깨지고 열리는지 검증합니다."}},
+    {"@type":"Question","name":"주민등록번호처럼 형식이 정해진 값도 알아서 맞춰 주나요?","acceptedAnswer":{"@type":"Answer","text":"네. 주민등록번호·전화번호처럼 하이픈이 들어가는 형식은 서식에 맞게 자동으로 맞춰 채웁니다."}},
+    {"@type":"Question","name":"무료인가요?","acceptedAnswer":{"@type":"Answer","text":"네, MIT 라이선스 오픈소스입니다."}}
+  ]
+}
+</script>
+<!-- HowTo 구조화 데이터 -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "HowTo",
+  "name": "엑셀·PDF 데이터를 한글(HWP) 서식에 자동으로 채우는 법",
+  "description": "claw-hwp로 클로드·코덱스가 한글 서식의 빈 칸을 데이터 파일로 자동으로 채우게 하는 방법.",
+  "step": [
+    {"@type":"HowToStep","position":1,"name":"claw-hwp 설치","text":"클로드나 코덱스에 claw-hwp 스킬을 설치합니다."},
+    {"@type":"HowToStep","position":2,"name":"빈 서식과 데이터 준비","text":"채울 한글 서식(.hwp)과, 값이 든 엑셀·PDF·텍스트를 준비합니다."},
+    {"@type":"HowToStep","position":3,"name":"자연어로 요청","text":"\"이 데이터로 이 양식 채워줘\"라고 말하면 항목 이름을 서식 라벨과 맞춰 채웁니다."},
+    {"@type":"HowToStep","position":4,"name":"한컴에서 확인","text":"채운 파일을 한컴오피스·한컴독스에서 열어 안 깨졌는지 확인합니다."}
+  ]
+}
+</script>
+<!-- SoftwareApplication 구조화 데이터 -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "claw-hwp",
+  "applicationCategory": "BusinessApplication",
+  "operatingSystem": "macOS, Windows",
+  "description": "클로드·코덱스가 한글 문서(.hwp/.hwpx)를 한컴오피스 없이 읽고·만들고·편집하고, 서식을 자동으로 채우는 오픈소스 에이전트 스킬.",
+  "url": "https://github.com/DoHyun468/claw-hwp",
+  "license": "https://opensource.org/licenses/MIT",
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+}
+</script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", "맑은 고딕", sans-serif; line-height: 1.75; color: #1a1a1a; background: #fff; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.9rem; line-height: 1.35; margin: 0 0 1.2rem; letter-spacing: -0.02em; }
+  h2 { font-size: 1.35rem; margin: 2.6rem 0 0.9rem; letter-spacing: -0.01em; }
+  p, li { font-size: 1.03rem; }
+  a { color: #2563eb; }
+  .lead { font-size: 1.08rem; }
+  .summary { background: #f0f6ff; border: 1px solid #d6e4ff; border-left: 4px solid #2563eb; border-radius: 10px; padding: 1rem 1.15rem; margin: 0 0 1.8rem; }
+  .summary strong { color: #1d4ed8; }
+  blockquote { margin: 1.2rem 0; padding: 0.6rem 1rem; border-left: 3px solid #cbd5e1; color: #475569; background: #f8fafc; border-radius: 0 8px 8px 0; }
+  .safe { background: #ecfdf5; border: 1px solid #a7f3d0; border-left: 4px solid #10b981; border-radius: 8px; padding: 0.85rem 1rem; color: #064e3b; }
+  .warn { background: #fff7ed; border: 1px solid #fed7aa; border-left: 4px solid #f59e0b; border-radius: 8px; padding: 0.85rem 1rem; color: #7c2d12; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 1rem 1.1rem; border-radius: 10px; overflow-x: auto; font-size: 0.92rem; }
+  code { font-family: "SFMono-Regular", Consolas, monospace; }
+  p code, li code { background: #f1f5f9; padding: 0.12em 0.4em; border-radius: 5px; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 0.95rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #e2e8f0; padding: 0.6rem 0.8rem; text-align: left; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 700; }
+  ol.steps { padding-left: 1.2rem; }
+  ol.steps li { margin: 0.5rem 0; }
+  .faq h3 { font-size: 1.05rem; margin: 1.4rem 0 0.35rem; }
+  .faq p { margin: 0.2rem 0 0; color: #334155; }
+  footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; color: #64748b; font-size: 0.95rem; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e5e7eb; background: #0b0f19; }
+    h1, h2 { color: #f1f5f9; }
+    a { color: #60a5fa; }
+    .summary { background: #10203a; border-color: #1e3a5f; }
+    .summary strong { color: #93c5fd; }
+    blockquote { background: #111827; border-color: #334155; color: #94a3b8; }
+    .safe { background: #0a2a1e; border-color: #12654a; color: #6ee7b7; }
+    .warn { background: #2a1a0a; border-color: #7c4a12; color: #fdba74; }
+    th { background: #111827; }
+    th, td { border-color: #1f2937; }
+    p code, li code { background: #1f2937; }
+    .faq p { color: #cbd5e1; }
+    footer { border-color: #1f2937; }
+  }
+</style>
+</head>
+<body>
+<article class="wrap">
+  <h1>클로드로 한글(HWP) 양식·서식 자동 채우기 — 개인정보 안전하게 (2026)</h1>
+
+  <div class="summary">
+    <strong>한 줄 요약:</strong> <code>claw-hwp</code>를 설치하면 클로드(Claude)·코덱스(Codex)가 엑셀·PDF에 흩어진 데이터를 <strong>한글 서식(.hwp)의 해당 칸에 자동으로</strong> 채워 줍니다. 주민등록번호·계좌번호 같은 값은 <strong>AI 대화에 올리지 않고</strong> 파일에서 바로 채우는 안전 모드가 있고, 무료 오픈소스(MIT)입니다.
+  </div>
+
+  <h2>매번 같은 서식에 이름·주민번호·주소를 손으로 채우고 있나요?</h2>
+  <p class="lead">강사 이력서, 지원서, 견적서, 계약서, 각종 신청서 — 회사·기관의 한글 서식은 <strong>칸은 그대로인데 사람만 바뀌는</strong> 경우가 많습니다. 엑셀 명단이나 PDF 자료를 보고 한 칸 한 칸 옮겨 적다 보면 시간도 걸리고 오타도 납니다.</p>
+  <p>그렇다고 AI에 맡기자니 걸리는 게 있죠. <strong>주민등록번호·계좌번호·연락처</strong>가 든 서식을 통째로 AI에 올려도 되나? <code>claw-hwp</code>는 이 두 가지 — <em>자동으로</em> 채우되 <em>개인정보는 안 새게</em> — 를 같이 해결합니다.</p>
+
+  <h2>claw-hwp 양식 자동 채우기란?</h2>
+  <p>클로드·코덱스에 설치하는 <strong>오픈소스 에이전트 스킬</strong>입니다. 빈 한글 서식과 데이터만 주면, 한국어로 말하듯 시키기만 하면 됩니다.</p>
+  <blockquote>
+    "이 엑셀 명단으로 강사 이력서 양식 채워줘"<br>
+    "이 사람 정보로 지원서 빈칸 채워줘"<br>
+    "견적 항목들 이 견적서 표에 넣어줘"
+  </blockquote>
+  <p>서식의 <strong>라벨(성명·생년월일·주소·연락처 …)</strong>을 읽어 데이터의 같은 항목을 알아서 맞춰 넣습니다. 어느 칸에 넣을지 애매하면 <strong>함부로 넣지 않고 물어봅니다</strong>(엉뚱한 칸에 잘못 채우는 것보다 안전). 원본 서식은 그대로 두고 값만 채우니 표·서식이 안 깨집니다.</p>
+
+  <h2>주민번호·계좌번호는 어떻게 안전한가요?</h2>
+  <p>보통 AI로 문서를 다루면 그 내용이 <strong>AI 대화(모델)에 올라갑니다.</strong> 개인정보가 든 서식이라면 이게 부담이죠. claw-hwp의 <strong>안전 모드</strong>는 방식이 다릅니다.</p>
+  <div class="safe">
+    🔒 <strong>값은 AI 대화를 거치지 않습니다.</strong> AI는 "어떤 항목을 어느 칸에 넣을지"만 정하고, 실제 값(주민등록번호·계좌번호 등)은 <strong>사람의 컴퓨터 안에서 파일 → 파일로만</strong> 이동합니다. 즉 민감한 숫자가 모델에 전송되지 않습니다.
+  </div>
+  <p>주민등록번호·전화번호처럼 <strong>하이픈이 들어가는 형식</strong>은 서식에 맞게 자동으로 맞춰 채웁니다.</p>
+
+  <h2>설치하고 한 번에 채우기</h2>
+  <p><strong>Claude 앱 / Claude Code</strong></p>
+  <pre><code>claude plugin marketplace add https://github.com/DoHyun468/claw-hwp
+claude plugin install claw-hwp@claw-hwp</code></pre>
+  <p>설치 후에는 이렇게 하면 됩니다.</p>
+  <ol class="steps">
+    <li>채울 <strong>빈 한글 서식(.hwp)</strong>과, 값이 든 <strong>엑셀·PDF·텍스트</strong>를 준비합니다.</li>
+    <li>클로드/코덱스에게 <strong>"이 데이터로 이 양식 채워줘"</strong>라고 말합니다.</li>
+    <li>서식 라벨과 데이터 항목을 맞춰 채웁니다. 개인정보 값은 <strong>대화에 안 올라갑니다.</strong></li>
+    <li>채운 파일을 <strong>한컴오피스·한컴독스에서 열어</strong> 확인합니다(안 깨짐).</li>
+  </ol>
+
+  <h2>이런 서식에 씁니다</h2>
+  <ul>
+    <li><strong>인사·채용</strong> — 이력서, 지원서, 재직·경력 증명 서식</li>
+    <li><strong>영업·회계</strong> — 견적서, 거래명세서, 지출결의서</li>
+    <li><strong>계약·행정</strong> — 계약서, 각종 신청서·동의서</li>
+    <li><strong>교육</strong> — 강사 이력서, 출강 계획서, 수강 신청서</li>
+  </ul>
+  <p>공통점은 <strong>"틀은 같고 값만 바뀌는 반복"</strong>. 한 건이든 여러 건이든 이 반복을 대신 합니다.</p>
+
+  <h2>손복붙·변환과 뭐가 다른가요?</h2>
+  <table>
+    <thead><tr><th></th><th>claw-hwp 안전 채우기</th><th>손으로 복붙</th><th>변환 후 채우기</th></tr></thead>
+    <tbody>
+      <tr><td>원본 .hwp 서식</td><td><strong>그대로 유지</strong></td><td>그대로</td><td>❌ 변환돼 깨짐</td></tr>
+      <tr><td>속도</td><td><strong>자동</strong></td><td>느림·오타</td><td>수동</td></tr>
+      <tr><td>개인정보</td><td><strong>✅ AI 대화 안 거침</strong></td><td>노출 없음</td><td>업로드 시 노출</td></tr>
+      <tr><td>애매한 칸</td><td><strong>물어봄(오기입 방지)</strong></td><td>—</td><td>—</td></tr>
+      <tr><td>한컴 열림 검증</td><td><strong>✅</strong></td><td>—</td><td>—</td></tr>
+      <tr><td>비용</td><td><strong>무료(MIT)</strong></td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <h2>자주 묻는 질문 (FAQ)</h2>
+  <div class="faq">
+    <h3>Q. 엑셀이나 PDF 데이터를 한글 양식에 자동으로 채울 수 있나요?</h3>
+    <p>네. 엑셀·PDF에 흩어진 데이터를 읽어 한글 서식(.hwp)의 해당 칸에 자동으로 채워 줍니다. 한컴오피스가 없어도 됩니다.</p>
+    <h3>Q. 주민등록번호·계좌번호 같은 개인정보가 AI에 노출되나요?</h3>
+    <p>아니요. 안전 모드는 값을 AI 대화(모델)에 올리지 않고 파일에서 바로 칸에만 채웁니다. AI는 어떤 항목을 어디에 넣을지만 정합니다.</p>
+    <h3>Q. 칸마다 매핑을 직접 설정해야 하나요?</h3>
+    <p>빈 서식이면 항목 이름을 서식 라벨과 알아서 맞춰 채웁니다. 애매하면 함부로 넣지 않고 물어봅니다.</p>
+    <h3>Q. 채운 파일이 한컴에서 안 깨지나요?</h3>
+    <p>네. 원본 서식을 그대로 두고 값만 채우며, 한컴오피스·한컴독스에서 안 깨지고 열리는지 검증합니다.</p>
+    <h3>Q. 주민번호처럼 형식이 정해진 값도 맞춰 주나요?</h3>
+    <p>네. 주민등록번호·전화번호처럼 하이픈이 들어가는 형식은 서식에 맞게 자동으로 맞춰 채웁니다.</p>
+    <h3>Q. 무료인가요?</h3>
+    <p>네, MIT 라이선스 오픈소스입니다.</p>
+  </div>
+
+  <h2>시작하기</h2>
+  <ul>
+    <li>GitHub: <a href="https://github.com/DoHyun468/claw-hwp">github.com/DoHyun468/claw-hwp</a></li>
+    <li>편집·자동화 전반이 궁금하면: <a href="https://dohyun468.github.io/claw-hwp/blog/claude-hwp-edit.html">클로드로 한글(HWP) 문서 편집·작성·자동화하는 법</a></li>
+    <li>설치 없이 한글 파일을 열어 보기만 하려면: <a href="https://dohyun468.github.io/claw-hwp/">여기</a>에 파일을 끌어 놓으면 브라우저에서 바로 보여요.</li>
+  </ul>
+  <p class="warn">⚠️ 브라우저 미리보기는 <strong>작업 중 빠른 확인용</strong>이라 한컴과 100% 똑같지는 않아요. 개인정보가 든 최종본은 <strong>한컴오피스·한컴독스에서 직접</strong> 확인하세요.</p>
+
+  <footer>
+    반복되는 한글 서식, 안전하게 자동으로. · <a href="https://github.com/DoHyun468/claw-hwp">claw-hwp</a> (MIT)
+  </footer>
+</article>
+</body>
+</html>
