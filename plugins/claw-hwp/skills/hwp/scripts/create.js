@@ -2338,8 +2338,20 @@ async function patchHwpxPictures(filePath, patches) {
         const cur = body.match(/<hp:curSz\b[^>]*\bwidth="(\d+)"[^>]*\bheight="(\d+)"/);
         const natW = clip ? clip[1] : (cur && cur[1] !== "0" ? cur[1] : p.widthHwp);
         const natH = clip ? clip[2] : (cur && cur[2] !== "0" ? cur[2] : p.heightHwp);
+        // orgSz must EQUAL curSz (the display frame), not the native pixel
+        // rect: Hancom multiplies the drawn bitmap by curSz / orgSz on top of
+        // the frame-sized imgRect + identity scaMatrix this pic carries, so a
+        // native-sized orgSz shrinks the image into the frame's top-left
+        // corner by exactly that ratio (observed: a 1500px-wide PNG in a
+        // 14.5cm frame rendered at ~37% = curSz/orgSz) while the frame keeps
+        // reserving the full requested space. imgDim stays native — the local
+        // rhwp viewer scales the bitmap by orgSz / imgDim, which with
+        // orgSz = display size is precisely the native→display ratio. This
+        // pair renders correctly in both Hancom and the local viewer.
+        const dispW = cur && cur[1] !== "0" ? cur[1] : String(p.widthHwp);
+        const dispH = cur && cur[2] !== "0" ? cur[2] : String(p.heightHwp);
         const fixed = body
-          .replace(/<hp:orgSz\s+width="0"\s+height="0"\s*\/>/g, `<hp:orgSz width="${natW}" height="${natH}"/>`)
+          .replace(/<hp:orgSz\s+width="\d+"\s+height="\d+"\s*\/>/g, `<hp:orgSz width="${dispW}" height="${dispH}"/>`)
           .replace(/<hp:imgDim\s+dimwidth="0"\s+dimheight="0"\s*\/>/g, `<hp:imgDim dimwidth="${natW}" dimheight="${natH}"/>`);
         xml = before + fixed + after;
         // ok either way: pic exists; isEmbeded manifest fix (above) still applies.
