@@ -217,7 +217,7 @@ All five themes use only render-confirmed fonts (see the **`font_family`** note 
 | `append_paragraph` | `text` | `align`, `line_spacing`, `spacing_before`, `spacing_after`, `runs` |
 | `append_table` ⚠️ | `headers`(머리글 행), `rows` (shape honored; cell content empty — see ⚠️) | `col_widths_cm`, `merges`, `cell_props`, `spacing_before`, `spacing_after`, `align`, `header_fill`(머리행 배경색 #hex), `no_header` |
 | `append_image` ⚠️ | `path` | `width_cm`, `height_cm`, `alt`, `spacing_before`, `spacing_after`, `align` |
-| `append_bullet_list`, `append_numbered_list` | `items[]` | — |
+| `append_bullet_list`, `append_numbered_list` | `items[]` | — (each item = one list paragraph. On `.hwpx` these are real Hancom list items — ▶ bullet / `1.` `2.` numbering, left-aligned, inline `**bold**` kept — and **each `append_numbered_list` call restarts at 1**. On `.hwp` the marker is written as leading text.) |
 | `append_page_break` | — | — |
 | `set_header`, `set_footer` | `text` | `apply_to` (0 = both pages, default) — 머리말/꼬리말, whole document |
 | `append_footnote` | `text` | — (attaches a footnote to the **end of the current paragraph** — add right after the `append_paragraph` it annotates) |

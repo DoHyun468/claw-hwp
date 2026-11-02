@@ -241,6 +241,13 @@ const tableHeaderFills = [];
 // reference. The binary HWP path is unaffected — its PARA_CHARSHAPE record
 // already references the correct shape id.
 const headingPatches = [];
+// .hwpx native lists (post-export): one entry per list item paragraph the
+// append_bullet_list / append_numbered_list handlers wrote. The handlers keep
+// emitting the literal "• " / "N. " prefix (that's what the .hwp path ships);
+// patchHwpxNativeLists turns those paragraphs into real Hancom list paragraphs
+// on the .hwpx output only.
+const listPatches = [];
+let numberedListSeq = 0;
 
 // Tracks body paragraphs (append_paragraph) whose run carries char styling
 // (size / colour / bold / italic / underline). Same rhwp .hwpx-export quirk as
@@ -1535,11 +1542,17 @@ const HANDLERS = {
       const text = typeof item === "string" ? item : String(item.text ?? "");
       const prefix = "• ";
       startNewParagraph(doc, cursor);
+      listPatches.push({ paraIdx: cursor.para, kind: "bullet", prefix });
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
       const liDefaults = {};
       const liFontIds = themeFontIds(doc, "body");
       if (liFontIds) liDefaults.fontIds = liFontIds;
       writeRunsAt(doc, cursor, runs, liDefaults);
+      // Same post-export run re-link / re-split as append_paragraph — without
+      // this, inline **bold** etc. inside a list item was flattened on .hwpx.
+      const liStyle = uniformRunStyle(runs);
+      if (liStyle) bodyStylePatches.push({ paraIdx: cursor.para, ...liStyle });
+      else { const seg = mixedRunSegments(runs); if (seg) mixedRunPatches.push({ paraIdx: cursor.para, segments: seg }); }
       // List items breathe between each other but stay tighter than body
       // paragraphs (700 HWPUNIT after ≈ 2.5mm) — 100 (≈0.35mm) read as packed.
       applyParaProps(doc, cursor, {
@@ -1554,15 +1567,22 @@ const HANDLERS = {
 
   append_numbered_list(doc, op, cursor) {
     const items = op.items || [];
+    const listSeq = ++numberedListSeq;   // each call = its own numbering (restarts at 1)
     items.forEach((item, idx) => {
       const text = typeof item === "string" ? item : String(item.text ?? "");
       const prefix = `${idx + 1}. `;
       startNewParagraph(doc, cursor);
+      listPatches.push({ paraIdx: cursor.para, kind: "number", listSeq, prefix });
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
       const liDefaults = {};
       const liFontIds = themeFontIds(doc, "body");
       if (liFontIds) liDefaults.fontIds = liFontIds;
       writeRunsAt(doc, cursor, runs, liDefaults);
+      // Same post-export run re-link / re-split as append_paragraph — without
+      // this, inline **bold** etc. inside a list item was flattened on .hwpx.
+      const liStyle = uniformRunStyle(runs);
+      if (liStyle) bodyStylePatches.push({ paraIdx: cursor.para, ...liStyle });
+      else { const seg = mixedRunSegments(runs); if (seg) mixedRunPatches.push({ paraIdx: cursor.para, segments: seg }); }
       applyParaProps(doc, cursor, {
         align: "left",
         lineSpacing: LIST_LINE_SPACING,
@@ -2474,6 +2494,95 @@ async function patchHwpxSectionNamespace(filePath) {
   }
   if (patched) fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
   return patched;
+}
+
+// .hwpx native bullet / numbered lists (GT-first, 2026-11-02).
+// GT handoff/shared/gt/list-bullet-number-restart-GT.hwpx (한컴독스 list --type
+// bullet|number on body paragraphs, para-shape --after 2.5 on one bullet):
+//   * a list paragraph's paraPr = the BODY paraPr (same align / hp:switch margins /
+//     lineSpacing) with <hh:heading type="BULLET" idRef="1" level="0"/> (or
+//     type="NUMBER" idRef="N") in place of heading NONE — nothing else changes;
+//   * bullet glyph = <hh:bullets> id 1; numbers = <hh:numbering> ("^1." DIGIT …);
+//   * a SECOND numbered list that must restart at 1 gets its OWN <hh:numbering>
+//     (idRef 2) — numbering is per numbering-id, so one definition per list.
+// So: for each tracked list paragraph, clone its current (already hp:switch,
+// LIST_* spaced) paraPr with the heading swapped in, retarget the paragraph,
+// and strip the literal "• " / "N. " prefix the rhwp build wrote. Needs the
+// stub fingerprint to have run first (bullets ▶ id=1 + numbering id=1 exist).
+async function patchHwpxNativeLists(filePath, patches) {
+  if (!patches.length) return 0;
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const he = zip.file("Contents/header.xml"), se = zip.file("Contents/section0.xml");
+  if (!he || !se) return 0;
+  let header = await he.async("string");
+  let xml = await se.async("string");
+  if (!/<hh:bullet\b[^>]*\bid="1"/.test(header) || !/<hh:numbering\b[^>]*\bid="1"/.test(header)) return 0;
+
+  // numbering per numbered list: seq 1 → id 1 (stub's), seq k → clone of id 1
+  const numId = new Map([[1, "1"]]);
+  const seqs = [...new Set(patches.filter((p) => p.kind === "number").map((p) => p.listSeq))].sort((a, b) => a - b);
+  const num1 = (header.match(/<hh:numbering\b[^>]*\bid="1"[^>]*>[\s\S]*?<\/hh:numbering>/) || [])[0];
+  let addedNum = 0;
+  for (const seq of seqs) {
+    if (seq === 1 || !num1) continue;
+    const ids = [...header.matchAll(/<hh:numbering\b[^>]*\bid="(\d+)"/g)].map((m) => Number(m[1]));
+    const nid = String(Math.max(0, ...ids) + 1);
+    header = header.replace("</hh:numberings>", num1.replace(/^<hh:numbering\b([^>]*)\bid="1"/, `<hh:numbering$1id="${nid}"`) + "</hh:numberings>");
+    numId.set(seq, nid);
+    addedNum++;
+  }
+  if (addedNum) header = header.replace(/(<hh:numberings itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + addedNum) + b);
+
+  const regions = topLevelParaRegions(xml);
+  const paraPrOf = (id) => (header.match(new RegExp(`<hh:paraPr\\b[^>]*\\bid="${id}"[^>]*>[\\s\\S]*?</hh:paraPr>`)) || [])[0];
+  const clones = new Map();   // `${kind}:${idRef}:${srcId}` → new paraPr id
+  let addedPp = 0, done = 0;
+  const nextPpId = () => String(Math.max(0, ...[...header.matchAll(/<hh:paraPr\b[^>]*\bid="(\d+)"/g)].map((m) => Number(m[1]))) + 1);
+
+  for (let i = patches.length - 1; i >= 0; i--) {   // reverse: offsets stay valid
+    const p = patches[i];
+    if (p.paraIdx < 0 || p.paraIdx >= regions.length) continue;
+    const r = regions[p.paraIdx];
+    let body = xml.slice(r.start, r.end);
+    const srcId = (body.match(/^<hp:p\b[^>]*\bparaPrIDRef="(\d+)"/) || [])[1];
+    if (!srcId) continue;
+    const idRef = p.kind === "bullet" ? "1" : numId.get(p.listSeq);
+    if (!idRef) continue;
+    // the literal prefix must still open the paragraph text, else leave it alone
+    const tM = /<hp:t\b[^>]*>([^<]*)<\/hp:t>/.exec(body);
+    if (!tM || !tM[1].startsWith(p.prefix)) continue;
+    const key = `${p.kind}:${idRef}:${srcId}`;
+    let newId = clones.get(key);
+    if (!newId) {
+      const src = paraPrOf(srcId);
+      if (!src || !/<hp:switch/.test(src)) continue;   // not native-structured → skip
+      newId = nextPpId();
+      const heading = `<hh:heading type="${p.kind === "bullet" ? "BULLET" : "NUMBER"}" idRef="${idRef}" level="0"/>`;
+      let pp = src.replace(/^<hh:paraPr\b([^>]*)\bid="\d+"/, `<hh:paraPr$1id="${newId}"`);
+      pp = /<hh:heading\b[^>]*\/>/.test(pp) ? pp.replace(/<hh:heading\b[^>]*\/>/, heading) : pp.replace(/(<hh:align\b[^>]*\/>)/, `$1${heading}`);
+      header = header.replace("</hh:paraProperties>", pp + "</hh:paraProperties>");
+      addedPp++;
+      clones.set(key, newId);
+    }
+    body = body.replace(/^(<hp:p\b[^>]*\bparaPrIDRef=")\d+(")/, `$1${newId}$2`);
+    const rest = tM[1].slice(p.prefix.length);
+    if (rest === "") {
+      // the prefix sat in its own run (mixed-run re-split) → remove that run entirely
+      const emptyRun = new RegExp(`<hp:run\\b[^>]*>(?:(?!</hp:run>)[^<]|<(?!hp:t\\b))*?${tM[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*</hp:run>`);
+      body = emptyRun.test(body) ? body.replace(emptyRun, "") : body.replace(tM[0], tM[0].replace(tM[1], ""));
+    } else {
+      body = body.replace(tM[0], tM[0].replace(tM[1], rest));
+    }
+    xml = xml.slice(0, r.start) + body + xml.slice(r.end);
+    done++;
+  }
+  if (addedPp) header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + addedPp) + b);
+  if (done) {
+    zip.file("Contents/header.xml", header);
+    zip.file("Contents/section0.xml", xml);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return done;
 }
 
 async function patchHwpxStubFingerprint(filePath) {
@@ -4503,6 +4612,8 @@ async function readStdin() {
       }
       const r = await patchHwpxStubFingerprint(outPath);
       if (r.patched) log.push(`hwpx_stub_fingerprint: paraPr injected=${r.paraPrInjected || 0}`);
+      const nl = await patchHwpxNativeLists(outPath, listPatches);
+      if (nl) log.push(`hwpx_patch: ${nl} list paragraph(s) → native bullet/number paraPr (literal prefix stripped)`);
     } catch (err) {
       log.push(`hwpx_stub_fingerprint failed: ${err.message}`);
     }
