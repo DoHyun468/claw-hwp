@@ -3329,10 +3329,16 @@ function sealParaPrMetrics(doc, paraPrId) {
     const blk = h.slice(i, end < 0 ? i + 5000 : end);
     const caseM = blk.match(/HwpUnitChar[\s\S]*?<hh:margin>([\s\S]*?)<\/hh:margin>/);
     const marg = (caseM ? caseM[1] : (blk.match(/<hh:margin>([\s\S]*?)<\/hh:margin>/) || [, ''])[1]) || '';
+    // NOTE (2026-11-02): although hp:case margins are stored as mm×100, the
+    // /283.46 reading below is what matches Hancom web's rendered line pitch
+    // (verified again on a plain 5-line doc: switching to /100 put the stamp
+    // ~6 mm too low). Keep it; the object-line leading below is the real fix
+    // for documents with stacked objects.
+    const div = 283.46;
     const prev = marg.match(/<hc:prev value="(\d+)"/);
     const next = marg.match(/<hc:next value="(\d+)"/);
-    if (prev) out.prevMm = Number(prev[1]) / 283.46;
-    if (next) out.nextMm = Number(next[1]) / 283.46;
+    if (prev) out.prevMm = Number(prev[1]) / div;
+    if (next) out.nextMm = Number(next[1]) / div;
     const ls = blk.match(/<hh:lineSpacing[^>]*type="PERCENT"[^>]*value="(\d+)"/);
     if (ls) out.pct = Number(ls[1]);
     return out;
@@ -3356,12 +3362,45 @@ function sealParaAlign(doc, paraPrId) {
   return 'LEFT';
 }
 // Vertical advance (mm) from a paragraph's top to the next block's top.
+// Height (mm) that in-flow objects inside a paragraph / cell add to its line:
+// inline (treatAsChar=1) or 자리차지 (TOP_AND_BOTTOM) pictures, shapes, charts,
+// equations and text boxes take their <hp:sz> height + outMargin top/bottom (+ a
+// caption line). Floating front/behind/square objects don't push the flow.
+// Render sweep 2026-11-02: a stamp anchored below charts/shapes/text boxes
+// landed ~110 mm too high because only text lines were summed.
+function sealInlineObjHeightMm(doc, inner) {
+  let h = 0;
+  for (const tag of ['hp:pic', 'hp:rect', 'hp:ellipse', 'hp:line', 'hp:arc', 'hp:polygon', 'hp:curve', 'hp:chart', 'hp:equation', 'hp:container']) {
+    for (const o of scanTopLevel(inner, tag)) {
+      if (o.selfClosing) continue;
+      const pos = o.inner.match(/<hp:pos\b[^>]*>/);
+      const inline = pos && /treatAsChar="1"/.test(pos[0]);
+      const tb = /textWrap="TOP_AND_BOTTOM"/.test(o.attrs);
+      if (!inline && !tb) continue;
+      const sz = o.inner.match(/<hp:sz\b[^>]*\bheight="(\d+)"/);
+      const om = o.inner.match(/<hp:outMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
+      let oh = (sz ? Number(sz[1]) : 0) / 283.46 + (om ? (Number(om[1]) + Number(om[2])) / 283.46 : 0);
+      if (/<hp:caption\b/.test(o.inner)) {
+        const gap = o.inner.match(/<hp:caption\b[^>]*\bgap="(\d+)"/);
+        oh += (gap ? Number(gap[1]) / 283.46 : 3) + charPrFontPt(doc, (o.inner.match(/<hp:caption\b[\s\S]*?charPrIDRef="(\d+)"/) || [, null])[1]) * PT2MM * 1.6;
+      }
+      h = Math.max(h, oh);
+    }
+  }
+  return h;
+}
 function sealParaAdvanceMm(doc, pInner, pAttrs, pageTextWmm) {
   const pt = charPrFontPt(doc, (pInner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
   const m = sealParaPrMetrics(doc, (pAttrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
   const txt = (pInner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((s) => s.replace(/<\/?hp:t>/g, '')).join('');
   const lines = Math.max(1, Math.ceil(estTextWidthMm(txt, pt) / Math.max(10, pageTextWmm)));
-  return m.prevMm + lines * (pt * PT2MM * (m.pct / 100)) + m.nextMm;
+  const textH = lines * (pt * PT2MM * (m.pct / 100));
+  const objH = sealInlineObjHeightMm(doc, pInner);
+  // An in-flow object makes its line as tall as the object PLUS the line's
+  // leading (Hancom keeps the paragraph line-spacing % on object lines: a 15 mm
+  // text box renders ~16.8 mm tall at 150%). Render-measured 2026-11-02.
+  const leading = pt * PT2MM * Math.max(0, m.pct / 100 - 1);
+  return m.prevMm + Math.max(textH, objH ? objH + leading : 0) + m.nextMm;
 }
 // Vertical advance (mm) of a table block = outMargin top/bottom + Σ row heights.
 function sealTableAdvanceMm(doc, tblInner) {
@@ -3377,7 +3416,7 @@ function sealTableAdvanceMm(doc, tblInner) {
       const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
       const cm = c.inner.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
       const mv = cm ? (Number(cm[1]) + Number(cm[2])) / 283.46 : 2.8;
-      rh = Math.max(rh, lines * (ptc * PT2MM * 1.3) + mv);
+      rh = Math.max(rh, lines * (ptc * PT2MM * 1.3) + mv, sealInlineObjHeightMm(doc, c.inner) + mv);
     }
     h += rh || 7;
   }
@@ -3584,7 +3623,10 @@ function opPlaceSeal(doc, op) {
     // ≈ -0.08 when the origin is the line's own top (PARA cell / clamped body),
     // ≈ +0.2 when the origin is the page/content top and originYMm carried the
     // line's distance down to it (free-text PAGE frame). dy_mm overrides.
-    const lineMidMm = pt * PT2MM * vFactor;
+    // PAGE frame (free text): the caller passes the anchor line's real middle
+    // (paraPr prev-gap + half the first line's height) as lineMidOverrideMm —
+    // the old 0.2 em guess sat the stamp ~3 mm above the line (sweep 2026-11-02).
+    const lineMidMm = o && o.lineMidOverrideMm != null ? o.lineMidOverrideMm : pt * PT2MM * vFactor;
     let dx = originXMm + lineLeft + (ov ? (startX + aw / 2 - wMm / 2) : (startX + aw + 2));
     let dy = originYMm + (lineMidMm - sealMm / 2);
     if (op.dx_mm != null) dx = Number(op.dx_mm);
@@ -3621,7 +3663,9 @@ function opPlaceSeal(doc, op) {
         if (b.inner.includes('<hp:tbl')) topMm += sealTableAdvanceMm(doc, scanTopLevel(b.inner, 'hp:tbl')[0].inner);
         else topMm += sealParaAdvanceMm(doc, b.inner, b.attrs, roomWidthMm);
       }
-      o = { originYMm: topMm, roomWidthMm, vFactor: 0.2 };
+      const am = sealParaPrMetrics(doc, (p.attrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
+      const apt = op.font_pt != null ? Number(op.font_pt) : charPrFontPt(doc, (p.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+      o = { originYMm: topMm, roomWidthMm, vFactor: 0.2, lineMidOverrideMm: am.prevMm + (apt * PT2MM * (am.pct / 100)) / 2 };
     } else {
       o = { roomWidthMm }; // user forced PARA/PAPER (PARA rests low — its choice)
     }
@@ -4738,6 +4782,12 @@ function opInsertChart(doc, op) {
 function buildShape(shape, w, h, fillColor, lineColor, lineWidth, wrap, x, y, margin) {
   const id = freshId(), inst = freshId();
   const lw = lineWidth || 33;
+  // A `line` with height_mm:0 (horizontal rule) must still own a box at least
+  // as tall as its stroke: with <hp:sz height="0"> Hancom web draws NOTHING
+  // (render sweep 2026-11-02 — box height = stroke width draws the rule at the
+  // box top; startPt/endPt keep y=0 so the line stays horizontal).
+  const endY = h;
+  if (shape === 'line' && h < lw) h = lw;
   const tw = wrap || 'IN_FRONT_OF_TEXT';
   const hx = Math.round(Number(x) || 0), vy = Math.round(Number(y) || 0);
   const om = margin != null ? Math.round(Number(margin)) : 0;
@@ -4758,7 +4808,7 @@ function buildShape(shape, w, h, fillColor, lineColor, lineWidth, wrap, x, y, ma
   const open = (extra) => `<hp:${shape} id="${id}" zOrder="0" numberingType="PICTURE" textWrap="${tw}" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="${inst}"${extra}>`;
   if (shape === 'line') {
     return open(' isReverseHV="0"') + common + shadow
-      + `<hc:startPt x="0" y="0"/><hc:endPt x="${w}" y="${h}"/>` + tail + `<hp:shapeComment>선</hp:shapeComment></hp:line>`;
+      + `<hc:startPt x="0" y="0"/><hc:endPt x="${w}" y="${endY}"/>` + tail + `<hp:shapeComment>선</hp:shapeComment></hp:line>`;
   }
   if (shape === 'ellipse') {
     return open(' intervalDirty="0" hasArcPr="0" arcType="NORMAL"') + common + fill + shadow
