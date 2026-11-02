@@ -2479,6 +2479,30 @@ async function patchHwpxPageMargin(filePath, m) {
 // patchHwpxPictures(), so image-less documents never got it and
 // python-hwpx's package validator flagged section0.xml. Runs on every
 // section, idempotent (skips a root that already declares it).
+// rhwp writes every <hh:style paraPrIDRef="1042"> (that's the langID leaking
+// into the paraPr slot) — a paraPr that doesn't exist. GT (every Hancom-saved
+// file): all named styles reference paraPr 0. apply_style then handed that
+// dangling id to paragraphs (render fell back to defaults). Rewrite any style
+// paraPrIDRef that names a missing paraPr to 0. Idempotent.
+async function patchHwpxStyleParaRefs(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const he = zip.file("Contents/header.xml");
+  if (!he) return 0;
+  let header = await he.async("string");
+  const ids = new Set([...header.matchAll(/<hh:paraPr\b[^>]*\bid="(\d+)"/g)].map((m) => m[1]));
+  let n = 0;
+  header = header.replace(/(<hh:style\b[^>]*\bparaPrIDRef=")(\d+)(")/g, (m, a, id, b) => {
+    if (ids.has(id)) return m;
+    n++;
+    return `${a}0${b}`;
+  });
+  if (n) {
+    zip.file("Contents/header.xml", header);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
+  }
+  return n;
+}
+
 async function patchHwpxSectionNamespace(filePath) {
   const buf = fs.readFileSync(filePath);
   const zip = await JSZip.loadAsync(buf);
@@ -4609,6 +4633,8 @@ async function readStdin() {
       {
         const n = await patchHwpxSectionNamespace(outPath);
         if (n) log.push(`hwpx_patch: ${n} section root(s) += xmlns:hwpunitchar (#48)`);
+        const sr = await patchHwpxStyleParaRefs(outPath);
+        if (sr) log.push(`hwpx_patch: ${sr} named style(s) paraPrIDRef → 0 (was dangling)`);
       }
       const r = await patchHwpxStubFingerprint(outPath);
       if (r.patched) log.push(`hwpx_stub_fingerprint: paraPr injected=${r.paraPrInjected || 0}`);

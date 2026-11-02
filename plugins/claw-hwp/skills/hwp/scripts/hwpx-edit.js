@@ -925,7 +925,11 @@ function opSplitCell(doc, tableIndex, row, col, nRows, nCols) {
   let newAttrs = el.attrs;
   if (dM) newAttrs = bumpColCnt(newAttrs, dM);
   if (dN) newAttrs = bumpRowCnt(newAttrs, dN);
-  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${newAttrs}>${dropLinesegs(newRows.join(''))}</hp:tbl>`));
+  // Keep everything that precedes the first row (hp:sz / pos / outMargin /
+  // inMargin / caption) — rebuilding from rows alone dropped them (sweep
+  // 2026-11-02: python-hwpx flagged the table, and the table lost its size).
+  const preRow = rowsEls.length ? el.inner.slice(0, rowsEls[0].start) : '';
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${newAttrs}>${preRow}${dropLinesegs(newRows.join(''))}</hp:tbl>`));
   return { table: tableIndex, row, col, intoRows: nRows, intoCols: nCols };
 }
 
@@ -1181,7 +1185,11 @@ function opInsertTable(doc, index, rows, cols, cells) {
     // but drop any caption — a fresh table shouldn't inherit the template's caption.
     const firstTrIdx = srcTbl.el.inner.indexOf('<hp:tr');
     tblMeta = (firstTrIdx >= 0 ? srcTbl.el.inner.slice(0, firstTrIdx) : '')
-      .replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, '');
+      .replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, '')
+      // … nor its per-cell zones (set_cell_background/border/diagonal live in
+      // <hp:cellzoneList>) — a fresh table inheriting a yellow cell from the
+      // template was caught by the 2026-11-02 render sweep.
+      .replace(/<hp:cellzoneList\b[\s\S]*?<\/hp:cellzoneList>/, '');
   } else {
     // Fallback path — no source table to clone. Hancom Docs's web viewer
     // suppresses cellzone fills when the table's own borderFill paints a
@@ -2346,15 +2354,43 @@ function opDistributeTable(doc, tableIndex, mode) {
   const tbl = el.inner;
   const rows = scanTopLevel(tbl, 'hp:tr');
   if (!rows.length) throw new Error('distribute_table: table has no rows');
-  const rowH = rows.map((r) => { const c = scanTopLevel(r.inner, 'hp:tc')[0]; const m = c && c.inner.match(/<hp:cellSz width="\d+" height="(\d+)"/); return m ? Number(m[1]) : 0; });
-  const cols = scanTopLevel(rows[0].inner, 'hp:tc');
-  const colW = cols.map((c) => { const m = c.inner.match(/<hp:cellSz width="(\d+)"/); return m ? Number(m[1]) : 0; });
-  const eqH = Math.round(rowH.reduce((a, b) => a + b, 0) / rows.length);
-  const eqW = Math.round(colW.reduce((a, b) => a + b, 0) / (cols.length || 1));
-  const newInner = tbl.replace(/<hp:cellSz width="(\d+)" height="(\d+)"\/>/g, (m, w, h) =>
-    `<hp:cellSz width="${mode === 'height' ? w : eqW}" height="${mode === 'width' ? h : eqH}"/>`);
+  // Grid-aware (sweep 2026-11-02): a merged/split table has cells spanning
+  // several grid columns/rows. Giving EVERY cell the same width made rows with
+  // more cells wider than the table (one row summed to 1.7× the table width →
+  // the table ran off the page). Distribute per GRID column/row: unit = table
+  // width ÷ colCnt, cell width = unit × colSpan (same for heights / rowSpan).
+  const colCnt = Number((el.attrs.match(/\bcolCnt="(\d+)"/) || [, 0])[1]) || 0;
+  const rowCnt = Number((el.attrs.match(/\browCnt="(\d+)"/) || [, 0])[1]) || rows.length;
+  const spanSum = (row, attr, sz) => scanTopLevel(row.inner, 'hp:tc').reduce((a, tc) => {
+    const span = Number((tc.inner.match(new RegExp(`<hp:cellSpan[^>]*\\b${attr}="(\\d+)"`)) || [, 1])[1]) || 1;
+    return a + (span === 1 ? Number((tc.inner.match(new RegExp(`<hp:cellSz[^>]*\\b${sz}="(\\d+)"`)) || [, 0])[1]) : 0);
+  }, 0);
+  // table width: hp:sz if present, else the widest single-span row sum
+  const szW = Number((tbl.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
+  const rowSums = rows.map((r) => scanTopLevel(r.inner, 'hp:tc').reduce((a, tc) => a + Number((tc.inner.match(/<hp:cellSz width="(\d+)"/) || [, 0])[1]), 0));
+  const totalW = szW || Math.max(...rowSums);
+  // table height: sum of each grid row's height taken from a rowSpan-1 cell
+  const rowH = rows.map((r) => { const tc = scanTopLevel(r.inner, 'hp:tc').find((c) => !/<hp:cellSpan[^>]*rowSpan="([2-9]|\d{2,})"/.test(c.inner)) || scanTopLevel(r.inner, 'hp:tc')[0]; const m = tc && tc.inner.match(/<hp:cellSz width="\d+" height="(\d+)"/); return m ? Number(m[1]) : 0; });
+  const totalH = rowH.reduce((a, b) => a + b, 0);
+  const unitW = colCnt ? totalW / colCnt : 0;
+  const unitH = rowCnt ? totalH / rowCnt : 0;
+  let newInner = tbl;
+  const newRows = rows.map((r) => {
+    const tcs = scanTopLevel(r.inner, 'hp:tc');
+    let ri = r.inner;
+    for (let i = tcs.length - 1; i >= 0; i--) {
+      const tc = tcs[i];
+      const cs = Number((tc.inner.match(/<hp:cellSpan[^>]*colSpan="(\d+)"/) || [, 1])[1]) || 1;
+      const rs = Number((tc.inner.match(/<hp:cellSpan[^>]*rowSpan="(\d+)"/) || [, 1])[1]) || 1;
+      const inner2 = tc.inner.replace(/<hp:cellSz width="(\d+)" height="(\d+)"\/>/, (m, w, h) =>
+        `<hp:cellSz width="${mode === 'height' || !unitW ? w : Math.round(unitW * cs)}" height="${mode === 'width' || !unitH ? h : Math.round(unitH * rs)}"/>`);
+      ri = ri.slice(0, tc.start) + `<hp:tc${tc.attrs}>${inner2}</hp:tc>` + ri.slice(tc.end);
+    }
+    return `<hp:tr${r.attrs}>${ri}</hp:tr>`;
+  });
+  for (let i = rows.length - 1; i >= 0; i--) newInner = newInner.slice(0, rows[i].start) + newRows[i] + newInner.slice(rows[i].end);
   doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${newInner}</hp:tbl>`));
-  return { table: tableIndex, mode, eqWidth: mode !== 'height' ? eqW : undefined, eqHeight: mode !== 'width' ? eqH : undefined, rows: rows.length, cols: cols.length };
+  return { table: tableIndex, mode, gridCols: colCnt, gridRows: rowCnt, unitWidth: mode !== 'height' ? Math.round(unitW) : undefined, unitHeight: mode !== 'width' ? Math.round(unitH) : undefined };
 }
 
 // ── style operations (clone-mutate-retarget in header.xml) ───────────────────
@@ -2487,7 +2523,7 @@ function findFontIdByFace(doc, face) {
 // paraPr twin of buildCharPrRefCounts — section refs + <hh:style paraPrIDRef>
 // (a named style's paraPr is not a free placeholder either).
 function buildParaPrRefCounts(doc) {
-  const counts = {};
+  const counts = { '0': 1 };   // id 0 = document default — never a placeholder
   for (const name of doc.sectionNames()) {
     for (const m of doc.read(name).matchAll(/paraPrIDRef="(\d+)"/g)) counts[m[1]] = (counts[m[1]] || 0) + 1;
   }
@@ -2498,7 +2534,7 @@ function buildParaPrRefCounts(doc) {
   return counts;
 }
 function buildCharPrRefCounts(doc) {
-  const counts = {};
+  const counts = { '0': 1 };   // id 0 = document default — never a placeholder
   for (const name of doc.sectionNames()) {
     const xml = doc.read(name);
     for (const m of xml.matchAll(/charPrIDRef="(\d+)"/g)) {
@@ -2853,7 +2889,11 @@ function opApplyStyle(doc, index, style) {
     throw new Error(`apply_style: style "${want}" not found. Available: ${avail}`);
   }
   const styleId = getAttr(hit.attrs, 'id');
-  const ppr = getAttr(hit.attrs, 'paraPrIDRef');
+  let ppr = getAttr(hit.attrs, 'paraPrIDRef');
+  // Guard: rhwp-built docs declare styles with paraPrIDRef="1042" (a paraPr that
+  // doesn't exist; Hancom native uses 0). Never hand a paragraph a dangling id —
+  // fall back to 0, the document default, like Hancom's own files.
+  if (ppr != null && !new RegExp(`<hh:paraPr\\b[^>]*\\bid="${ppr}"`).test(doc.read(headerName))) ppr = '0';
   const cpr = getAttr(hit.attrs, 'charPrIDRef');
   const paras = doc.paragraphs();
   if (index < 0 || index >= paras.length) throw new Error(`apply_style: index ${index} out of range (0..${paras.length - 1})`);
