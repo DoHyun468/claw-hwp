@@ -998,7 +998,7 @@ const HANDLERS = {
         header: pd.marginHeader, footer: pd.marginFooter, gutter: pd.marginGutter,
       };
     }
-    log.push(`setup_document: ${op.page_size || "default"} ${op.orientation || pd.landscape ? "landscape" : "portrait"}, margin=${op.margin_mm ?? "?"}mm, base_font=${op.base_font || "default"}`);
+    log.push(`setup_document: ${op.page_size || "default"} ${op.orientation ? String(op.orientation).toLowerCase() : (pd.landscape ? "landscape" : "portrait")}, margin=${op.margin_mm ?? "?"}mm, base_font=${op.base_font || "default"}`);
   },
 
   append_paragraph(doc, op, cursor) {
@@ -2453,6 +2453,29 @@ async function patchHwpxPageMargin(filePath, m) {
 // requires settings.xml + version.xml + other metadata to match a Hancom-
 // round-tripped file. Keep this as best-effort; the BULLET text-prefix
 // fallback in hwpx-edit.js's opSetParagraphList covers the remaining gap.
+// Issue #48: Hancom-saved hwpx declares xmlns:hwpunitchar on EVERY <hs:sec>
+// root (GT: handoff/shared/gt/*.hwpx — all carry it), but bundled rhwp
+// (≤0.7.15) omits it. The same splice used to live only inside
+// patchHwpxPictures(), so image-less documents never got it and
+// python-hwpx's package validator flagged section0.xml. Runs on every
+// section, idempotent (skips a root that already declares it).
+async function patchHwpxSectionNamespace(filePath) {
+  const buf = fs.readFileSync(filePath);
+  const zip = await JSZip.loadAsync(buf);
+  let patched = 0;
+  for (const name of Object.keys(zip.files)) {
+    if (!/^Contents\/section\d+\.xml$/i.test(name)) continue;
+    let xml = await zip.file(name).async("string");
+    const root = xml.match(/<hs:sec\b[^>]*>/);
+    if (!root || /xmlns:hwpunitchar=/.test(root[0])) continue;
+    xml = xml.replace(/<hs:sec\b([^>]*?)>/, '<hs:sec$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">');
+    zip.file(name, xml);
+    patched++;
+  }
+  if (patched) fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
+  return patched;
+}
+
 async function patchHwpxStubFingerprint(filePath) {
   const stubPath = path.join(__dirname, "templates", "hancom_native_stub.hwpx");
   if (!fs.existsSync(stubPath)) return { patched: false, reason: "stub missing" };
@@ -2544,12 +2567,18 @@ async function patchHwpxStubFingerprint(filePath) {
 
   let injected = 0;
   if (!hasBullet && stubBulletParaPr) {
-    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`);
+    // Stub BULLET paraPr is CENTER-aligned → list items centred on Hancom web.
+    // GT (2026-11-02): Hancom writes bullet paragraphs with the same structure
+    // and align LEFT, so rewrite only the align attribute (see hwpx-edit.js
+    // injectHancomListInfra for the full note).
+    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`)
+      .replace(/<hh:align horizontal="CENTER"/, '<hh:align horizontal="LEFT"');
     header = header.replace("</hh:paraProperties>", newBullet + "</hh:paraProperties>");
     injected++;
   }
   if (!hasNumber && stubNumberParaPr) {
-    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`);
+    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`)
+      .replace(/<hh:align horizontal="CENTER"/, '<hh:align horizontal="LEFT"');
     header = header.replace("</hh:paraProperties>", newNumber + "</hh:paraProperties>");
     injected++;
   }
@@ -3092,10 +3121,18 @@ async function patchHwpxLandscape(filePath) {
     let xml = await zip.file(name).async("string");
     const m = xml.match(/<hp:pagePr\b[^>]*?>/);
     if (!m) continue;
+    // GT (2026-11-02, 한컴독스 page-setup --orientation landscape → download,
+    // handoff/shared/gt/landscape-GT.hwpx): Hancom stores a landscape page as
+    // landscape="NARROWLY" with the paper dims UNCHANGED (A4 = 59528×84186,
+    // W<H); portrait is landscape="WIDELY" (same dims). The enum is the
+    // orientation, the dims are the paper. The earlier W↔H swap (issue #46)
+    // produced a custom 297×210 paper that Hancom then rotated again.
     const w = Number((m[0].match(/\bwidth="(\d+)"/) || [])[1]);
     const h = Number((m[0].match(/\bheight="(\d+)"/) || [])[1]);
-    if (w && h && w < h) {
-      const tag = m[0].replace(/\bwidth="\d+"/, `width="${h}"`).replace(/\bheight="\d+"/, `height="${w}"`);
+    let tag = m[0];
+    if (w && h && w > h) tag = tag.replace(/\bwidth="\d+"/, `width="${h}"`).replace(/\bheight="\d+"/, `height="${w}"`);
+    tag = /\blandscape="/.test(tag) ? tag.replace(/\blandscape="[^"]*"/, 'landscape="NARROWLY"') : tag.replace(/^<hp:pagePr\b/, '<hp:pagePr landscape="NARROWLY"');
+    if (tag !== m[0]) {
       xml = xml.replace(m[0], tag);
       zip.file(name, xml);
       total++;
@@ -4432,7 +4469,7 @@ async function readStdin() {
   if (ext === ".hwpx" && requestedLandscape) {
     try {
       const n = await patchHwpxLandscape(outPath);
-      if (n > 0) log.push(`hwpx_patch: landscape page W↔H swap (Hancom-web orientation)`);
+      if (n > 0) log.push(`hwpx_patch: landscape page → landscape="NARROWLY" (dims kept, GT #46)`);
     } catch (err) {
       log.push(`hwpx_landscape_patch failed: ${err.message}`);
     }
@@ -4460,6 +4497,10 @@ async function readStdin() {
   // any remaining gap.
   if (ext === ".hwpx") {
     try {
+      {
+        const n = await patchHwpxSectionNamespace(outPath);
+        if (n) log.push(`hwpx_patch: ${n} section root(s) += xmlns:hwpunitchar (#48)`);
+      }
       const r = await patchHwpxStubFingerprint(outPath);
       if (r.patched) log.push(`hwpx_stub_fingerprint: paraPr injected=${r.paraPrInjected || 0}`);
     } catch (err) {

@@ -1834,9 +1834,15 @@ function injectHancomListInfra(doc) {
   const stubBullets = (stubHeader.match(/<hh:bullets\b[^>]*>[\s\S]*?<\/hh:bullets>/) || [])[0];
   const stubNumbering = (stubHeader.match(/<hh:numbering id="1"[^>]*>[\s\S]*?<\/hh:numbering>/) || [])[0];
 
-  // Avoid duplicate injection if a Hancom-authored list paraPr already lives in this doc.
-  const hasBullet = /<hh:heading\s+type="BULLET"/.test(header);
-  const hasNumber = /<hh:heading\s+type="NUMBER"/.test(header);
+  // Avoid duplicate injection if a usable list paraPr already lives in this doc.
+  // "Usable" = not CENTER-aligned: docs stamped by older create.js builds carry
+  // only the stub's centred BULLET paraPr (every bullet item rendered centred on
+  // Hancom web), so for those we still inject a LEFT one and let
+  // reuseExistingListParaPr prefer it.
+  const hasUsable = (type) => scanTopLevel(header, 'hh:paraPr').some((pp) =>
+    new RegExp(`<hh:heading\\s+type="${type}"`).test(pp.inner) && !/<hh:align\s+horizontal="CENTER"/.test(pp.inner));
+  const hasBullet = hasUsable('BULLET');
+  const hasNumber = hasUsable('NUMBER');
 
   // Renumber stub's paraPr ids to avoid clashing with existing ones.
   const existingIds = [...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map((m) => Number(m[1]));
@@ -1844,14 +1850,22 @@ function injectHancomListInfra(doc) {
   let bulletId = String(maxId + 1);
   let numberId = String(maxId + 2);
 
+  // The stub's BULLET paraPr (id=2) was authored centred, so every bullet item
+  // rendered CENTER on Hancom web. GT (한컴독스 list --type bullet + align left,
+  // 2026-11-02, handoff/shared/gt/bullet-left-align-GT.hwpx): Hancom stores a
+  // bullet paragraph as the SAME hp:switch structure with <hh:align
+  // horizontal="LEFT"> (or the body's own align) + heading BULLET — so only the
+  // align attribute is rewritten here; the fingerprint-bearing structure stays
+  // byte-identical. NUMBER (id=3) is already LEFT in the stub.
+  const leftAlign = (pp) => pp.replace(/<hh:align horizontal="CENTER"/, '<hh:align horizontal="LEFT"');
   let injected = 0;
   if (!hasBullet && stubBulletParaPr) {
-    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`);
+    const newBullet = leftAlign(stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`));
     header = header.replace('</hh:paraProperties>', newBullet + '</hh:paraProperties>');
     injected++;
   }
   if (!hasNumber && stubNumberParaPr) {
-    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`);
+    const newNumber = leftAlign(stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`));
     header = header.replace('</hh:paraProperties>', newNumber + '</hh:paraProperties>');
     injected++;
   }
@@ -1936,19 +1950,26 @@ function injectHancomListInfra(doc) {
 // web rejects our synthesised list paraPrs even when byte-level identical to
 // stock, so reusing an existing one is the only reliable path to list
 // rendering surviving cloud open.
-function reuseExistingListParaPr(doc, type, lvl) {
+function reuseExistingListParaPr(doc, type, lvl, opts) {
+  const allowCentred = !opts || opts.allowCentred !== false;
   const headerName = doc.headerName();
   if (!headerName) return null;
   const header = doc.read(headerName);
   const paraPrs = scanTopLevel(header, 'hh:paraPr');
+  // Prefer a left/justified list paraPr over a centred one: docs stamped by
+  // older create.js builds carry the stub's CENTER bullet paraPr, and reusing
+  // it centres every list item (GT: Hancom's own bullet paragraphs are LEFT /
+  // body-aligned). If only a centred match exists it is still reused.
+  let centred = null;
   for (const pp of paraPrs) {
     const hm = pp.inner.match(/<hh:heading\s+type="([^"]+)"\s+idRef="[^"]*"\s+level="(\d+)"/);
     if (!hm) continue;
     if (hm[1] !== type) continue;
     if (Number(hm[2]) !== lvl) continue;
+    if (/<hh:align\s+horizontal="CENTER"/.test(pp.inner)) { if (!centred) centred = getAttr(pp.attrs, 'id'); continue; }
     return getAttr(pp.attrs, 'id');
   }
-  return null;
+  return allowCentred ? centred : null;
 }
 
 // Bullet / numbered list — Hancom's mechanism is a paraPr with
@@ -1979,7 +2000,7 @@ function opSetParagraphList(doc, index, type, level, options) {
   // the host doc's existing ones if it has any.
   if (t === 'BULLET' || t === 'NUMBER') {
     // 1. Try reusing an existing Hancom-authored list paraPr.
-    let reused = reuseExistingListParaPr(doc, t, lvl);
+    let reused = reuseExistingListParaPr(doc, t, lvl, { allowCentred: false });
     // 2. If none exists, inject the Hancom-round-trip stub fingerprint into
     //    this doc (native BULLET + NUMBER paraPrs, bullets/numbering tables,
     //    xmlns:hwpunitchar, Scripts/ — from templates/hancom_native_stub.hwpx)
@@ -1988,7 +2009,10 @@ function opSetParagraphList(doc, index, type, level, options) {
     //    rendering, not just docs that already round-tripped through Hancom.
     if (!reused) {
       const injected = injectHancomListInfra(doc);
-      if (injected) reused = reuseExistingListParaPr(doc, t, lvl);
+      if (injected) reused = reuseExistingListParaPr(doc, t, lvl, { allowCentred: false });
+      // Injection impossible (stub missing) but a centred native paraPr exists →
+      // still better than losing list semantics: reuse it (items render centred).
+      if (!reused) reused = reuseExistingListParaPr(doc, t, lvl, { allowCentred: true });
     }
     if (reused) {
       const newOpen = el.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${reused}"`);
@@ -4280,9 +4304,17 @@ function opSetPageSetup(doc, opts) {
     if (preset) { w = toHu(preset[0]); h = toHu(preset[1]); }
     if (opts.width_mm != null) w = toHu(opts.width_mm);
     if (opts.height_mm != null) h = toHu(opts.height_mm);
+    // Orientation is the `landscape` enum, NOT the dims (GT 2026-11-02, Hancom
+    // native: portrait = landscape="WIDELY", landscape = landscape="NARROWLY",
+    // paper dims identical W<H in both). Dims are normalised to W<H so a doc
+    // that was previously "landscaped" by swapping W/H (old behaviour, issue
+    // #46 — Hancom read it as a custom 297×210 paper and rotated it again) is
+    // repaired on the way through.
+    if (w > h) [w, h] = [h, w];
     if (opts.orientation) {
       const land = String(opts.orientation).toLowerCase() === 'landscape';
-      if ((land && w < h) || (!land && w > h)) [w, h] = [h, w];
+      const val = land ? 'NARROWLY' : 'WIDELY';
+      pagePr = /\blandscape="/.test(pagePr) ? pagePr.replace(/\blandscape="[^"]*"/, `landscape="${val}"`) : pagePr.replace(/^<hp:pagePr\b/, `<hp:pagePr landscape="${val}"`);
     }
     pagePr = pagePr.replace(/\bwidth="\d+"/, `width="${w}"`).replace(/\bheight="\d+"/, `height="${h}"`);
     xml = xml.replace(pm[0], pagePr);
@@ -4755,6 +4787,17 @@ function applyOp(doc, op) {
 }
 
 function save(doc, outputPath) {
+  // Hancom-native docs declare xmlns:hwpunitchar on every <hs:sec> root (GT;
+  // python-hwpx's package validator requires it — issue #48). Done HERE, after
+  // all ops ran: splicing it mid-op shifts the section byte offsets that
+  // already-scanned paragraph/table elements rely on (corrupted a paragraph
+  // when tried inside injectHancomListInfra). Idempotent.
+  for (const secName of doc.sectionNames()) {
+    const sx = doc.read(secName);
+    const root = sx.match(/<hs:sec\b[^>]*>/);
+    if (!root || /xmlns:hwpunitchar=/.test(root[0])) continue;
+    doc.write(secName, sx.replace(/<hs:sec\b([^>]*?)>/, '<hs:sec$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">'));
+  }
   // Write dirty text files back into the byte map, then zip.
   for (const name of doc.dirty) doc.files[name] = strToU8(doc.text[name]);
   // mimetype must be the first entry and STORED (uncompressed) per HWPX spec.

@@ -159,7 +159,7 @@ are registered on demand.
 | `set_number_list` | `index`, `level?` (default `0`), `style?` (`"korean"` or `"decimal"`), `number?` (fallback only) | Marks paragraph `index` as a numbered item. With `style: "korean"`, levels cycle `1.` / `가.` / `1)` / `가)` / `(1)` / `(가)`. With `style: "decimal"`, levels are `1.` / `1.1.` / `1.1.1.` / …. Without `style`, uses the doc's existing numbering id=1. `level` 0–5 picks the format. **Hancom Docs web compatibility is automatic** — same three-step path as `set_bullet_list` (reuse a native NUMBER paraPr → else inject the Hancom-native list structure and retry → `reusedHancomNative: true`). **Numbered lists now survive the web viewer on any hwpx, including plain ones that never round-tripped through Hancom.** Only if the injection can't run (template missing) does it fall back to a literal `"1. "`-style text prefix using the optional `number` arg (`fallback: "text-prefix"`; no auto-increment across calls, so pass `number` per paragraph). |
 | `clear_list` | `index` | Strips any `<hh:heading>` from the paragraph's paraPr, leaving it as plain text. |
 
-> Lists clone the paragraph's CURRENT paraPr and splice the heading in, so the margin/lineSpacing of the body is preserved. The Hancom stock list paraPrs that carry default indents (margin.left=1000+) are intentionally NOT reused — bullet/numbered items render at the body's own left margin.
+> **Alignment:** list items render **left-aligned** (the reused/injected list paraPr is `align LEFT`, matching how Hancom itself stores a bullet paragraph). If the document already carries a Hancom-native list paraPr, that one is reused as-is; a *centred* one is only reused when nothing better exists and no left-aligned one can be injected (then items centre). Body margin/lineSpacing of the list paraPr are the Hancom stock values (no extra indent).
 
 ### Header / Footer (머리말 / 꼬리말)
 
@@ -282,7 +282,7 @@ hwpx ships with `colCount="1"`.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `set_page_setup` | `size?`, `orientation?`, `width_mm?`, `height_mm?`, `margin_mm?` | Rewrites every section's `<hp:pagePr>` (paper size) + `<hp:margin>`. `size` preset: `a3`/`a4`/`a5`/`b4`/`b5`/`letter`/`legal`. `orientation`: `portrait` / `landscape` (swaps width↔height — landscape = width > height; the pagePr `landscape` enum is a separate binding hint, left as-is). `width_mm` / `height_mm` set an exact size instead of a preset. `margin_mm` sets all four page margins (mm). Renders on Hancom Docs web (landscape capture-verified). |
+| `set_page_setup` | `size?`, `orientation?`, `width_mm?`, `height_mm?`, `margin_mm?` | Rewrites every section's `<hp:pagePr>` (paper size) + `<hp:margin>`. `size` preset: `a3`/`a4`/`a5`/`b4`/`b5`/`letter`/`legal`. `orientation`: `portrait` / `landscape` — sets the page's orientation flag the way Hancom itself stores it (paper size stays the portrait A4 210×297; only the orientation changes). Never swaps width↔height: a swapped 297×210 page is read by Hancom as a *custom paper* and gets rotated again (issue #46). A document that was landscaped that old way is repaired when it passes through this op. `width_mm` / `height_mm` set an exact size instead of a preset. `margin_mm` sets all four page margins (mm). Renders on Hancom Docs web (landscape capture-verified). |
 
 ### Chart (차트)
 
