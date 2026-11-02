@@ -4425,19 +4425,32 @@ function stdSer(idx, name, cat, values, explode, color, pointColors, stroke, pie
   const cl = colLetter(idx);
   return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>`
     + `<c:tx><c:strRef><c:f>Sheet1!$${cl}$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>${xmlEscape(name)}</c:v></c:pt></c:strCache></c:strRef></c:tx>`
-    + `${serSpPr(color, stroke)}<c:invertIfNegative val="0"/>`
+    + `${serSpPr(color, stroke)}`
+    // GT (chart-line-stroke-schemeclr.hwpx): line/radar series declare a hidden
+    // marker (symbol none) right after spPr; bar/area/pie carry invertIfNegative.
+    + (stroke ? `<c:marker><c:symbol val="none"/><c:size val="7"/></c:marker>` : `<c:invertIfNegative val="0"/>`)
     + (explode ? `<c:explosion val="25"/>` : '')
     + dPtXml(pointColors, pie)
     + `<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$${cat.length + 1}</c:f><c:strCache>${strCachePts(cat)}</c:strCache></c:strRef></c:cat>`
     + `<c:val><c:numRef><c:f>Sheet1!$${cl}$2:$${cl}$${values.length + 1}</c:f><c:numCache>${numCachePts(values)}</c:numCache></c:numRef></c:val>`
     + `</c:ser>`;
 }
-// Scatter series: xVal + yVal (numeric X shared from `cat`).
-function scatterSer(idx, name, xvals, yvals) {
+// Scatter series: xVal + yVal (numeric X shared from `cat`). Colour lives on
+// the MARKER (fill + 9525-EMU outline), not the series spPr — GT
+// chart-scatter-marker-schemeclr.hwpx (한컴독스 chart-style theme): the series
+// spPr keeps <a:ln><a:noFill/> (no connecting line) and <c:marker> carries
+// <c:spPr><a:solidFill/> + <a:ln><a:solidFill/>. Default (no colour) = the
+// GT default <c:marker><c:size val="7"/><c:spPr/></c:marker>.
+function scatterMarker(color) {
+  const f = chartColorFill(color);
+  if (!f) return '<c:marker><c:size val="7"/><c:spPr/></c:marker>';
+  return `<c:marker><c:size val="7"/><c:spPr>${f}<a:ln w="9525" cap="flat" cmpd="sng" algn="ctr">${f}<a:prstDash val="solid"/><a:round/><a:headEnd w="med" len="med"/><a:tailEnd w="med" len="med"/></a:ln></c:spPr></c:marker>`;
+}
+function scatterSer(idx, name, xvals, yvals, color) {
   const cl = colLetter(idx);
   return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>`
     + `<c:tx><c:strRef><c:f>Sheet1!$${cl}$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>${xmlEscape(name)}</c:v></c:pt></c:strCache></c:strRef></c:tx>`
-    + `<c:spPr><a:ln w="28575"><a:noFill/></a:ln></c:spPr><c:marker><c:symbol val="circle"/><c:size val="7"/></c:marker>`
+    + `<c:spPr><a:ln w="28575" cap="flat" cmpd="sng" algn="ctr"><a:noFill/><a:prstDash val="solid"/><a:round/><a:headEnd w="med" len="med"/><a:tailEnd w="med" len="med"/></a:ln></c:spPr>${scatterMarker(color)}`
     + `<c:xVal><c:numRef><c:f>Sheet1!$A$2:$A$${xvals.length + 1}</c:f><c:numCache>${numCachePts(xvals)}</c:numCache></c:numRef></c:xVal>`
     + `<c:yVal><c:numRef><c:f>Sheet1!$${cl}$2:$${cl}$${yvals.length + 1}</c:f><c:numCache>${numCachePts(yvals)}</c:numCache></c:numRef></c:yVal>`
     + `</c:ser>`;
@@ -4463,7 +4476,7 @@ function buildChartSpace(spec, cat, series) {
       const v = Number(c);
       return (c !== undefined && c !== '' && Number.isFinite(v)) ? v : i + 1;
     });
-    const sers = series.map((s, i) => scatterSer(i, s.name, xs, s.values)).join('');
+    const sers = series.map((s, i) => scatterSer(i, s.name, xs, s.values, s.color)).join('');
     plot = `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${ax1}"/><c:axId val="${ax2}"/></c:scatterChart>`
       + valAxXml(ax1, 'b', ax2) + valAxXml(ax2, 'l', ax1);
   } else if (spec.pie) {
