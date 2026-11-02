@@ -276,7 +276,7 @@ hwpx ships with `colCount="1"`.
 
 | `type` | Args | Notes |
 |--------|------|-------|
-| `set_columns` | `count`, `gap_mm?` | Sets newspaper-style multi-column layout on **every** section. `count` = number of equal columns (`1` resets to single column; `2`+ makes body text flow top-to-bottom down one column then into the next). `gap_mm` = inter-column gap in mm (default ~4 mm). Renders on Hancom Docs web and desktop. Note: you need enough body text to actually fill column 1 before the flow into column 2 is visible. |
+| `set_columns` | `count`, `gap_mm?` | Sets newspaper-style multi-column layout on **every** section. `count` = number of equal columns (`1` resets to single column; `2`+ makes body text flow top-to-bottom down one column then into the next). `gap_mm` = inter-column gap in mm (default ~4 mm). Renders on Hancom Docs web and desktop. Note: you need enough body text to actually fill column 1 before the flow into column 2 is visible. Existing tables and objects keep their width — a full-width table inside a 2-column layout is clipped at the column edge (resize it with `set_table_size` / `set_object_size` first). |
 
 ### Page setup (편집 용지)
 
