@@ -20,7 +20,7 @@
 //   set_paragraph_text    { index, text }
 //   append_paragraph      { text }
 //   delete_paragraph      { index }
-//   set_cell_text         { table, row, col, text }
+//   set_cell_text         { table, row, col, text, fit? }   // fit=true: 공백 패딩 레이아웃 길이 보존
 //   append_table_row      { table, cells: [..] }
 //   delete_table_row      { table, row }
 //   append_table_column   { table, cells: [..] }   // cells top-to-bottom
@@ -81,6 +81,13 @@
 //   set_caption           { target?, index?, text, side?, gap_mm? }  // 캡션 — target: image|chart|shape|table
 //   apply_style           { index, style }   // 스타일 적용 — style: name ("개요 1"/"본문") or id
 //   para_line             { index, fill_color?, border_color?, border_width_mm?, sides? }  // 문단 띠 (테두리·배경)
+//   unmerge_cells         { table, row, col }   // 병합 해제 — merge_cells 역연산 (흡수된 셀 재생성, 격자 복원)
+//   delete_object         { target, index, renumber? }  // 객체 삭제 — image|chart|shape|equation, 감싼 문단째 제거 + 외부 파트/매니페스트 정리
+//   place_seal            { anchor, source, mode?, size_mm?, dx_mm?, dy_mm?, font_pt?, frame?, occurrence?, ext? }  // 도장/서명 PNG 를 앵커 문구 위/옆에 floating 배치
+//
+//   Read-only:  { "path": "in.hwpx", "inspect": "cells" }  → 모든 표(중첩 포함, op 과 같은 index 순서)의 셀 {row,col,colSpan,rowSpan,text} 덤프, 저장 없음.
+//   Indexing:   paragraph index = top-level <hp:p> 만 (표 셀 안 문단 제외) / table index = 문서 순서 전체 <hp:tbl> (중첩 포함, == extract_text --inspect 순서).
+//   Full contract + caveats per op: references/hwpx-edit-ops.md (single source of truth).
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 

@@ -28,6 +28,7 @@ echo '{ "path": "in.hwpx", "output": "out.hwpx", "operations": [ ... ] }' \
 - **`path`** (required) — input `.hwpx`. Rejected with a clear error if it isn't a ZIP-based `.hwpx`.
 - **`output`** (optional) — defaults to `<input>_edited.hwpx`. Set it equal to `path` to overwrite in place.
 - **`operations`** — array applied **in order** in a single load→save.
+- **`inspect: "cells"`** (instead of `operations`) — read-only: prints every table (nested included, same index order as the ops) with its cells as `{row, col, colSpan, rowSpan, text}`, then exits without saving. Use it to find the `table`/`row`/`col` for cell ops.
 
 Returns JSON: `{ "ok": true, "output": "...", "results": [ { "type": ..., ...stats } ] }`.
 
@@ -363,7 +364,7 @@ echo '{
 
 ## Known limits
 
-- **Cross-run text** — a find target split across two `<hp:t>` nodes won't match (same as Hancom's text replace).
+- **Cross-run text** — `replace_text` / `fill_template` match across runs and inline controls (see the Text table), but `apply_text_style`'s `target` must sit inside ONE run: a word whose letters are split across two differently-formatted runs isn't restyled (restyle each piece, or re-set the paragraph text first).
 - **`append_table_row` column count** — clones the *last* row; if that row is merged to fewer cells, the new row inherits that shape.
 - **`merge_cells`** assumes the target range has no prior merge.
 - For OWPML the op set doesn't reach, fall back to manual unpack/edit/pack (see SKILL.md Path A fallback).
