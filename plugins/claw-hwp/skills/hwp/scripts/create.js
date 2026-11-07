@@ -253,6 +253,13 @@ const tableHeaderFills = [];
 // reference. The binary HWP path is unaffected — its PARA_CHARSHAPE record
 // already references the correct shape id.
 const headingPatches = [];
+// .hwpx native lists (post-export): one entry per list item paragraph the
+// append_bullet_list / append_numbered_list handlers wrote. The handlers keep
+// emitting the literal "• " / "N. " prefix (that's what the .hwp path ships);
+// patchHwpxNativeLists turns those paragraphs into real Hancom list paragraphs
+// on the .hwpx output only.
+const listPatches = [];
+let numberedListSeq = 0;
 
 // Tracks body paragraphs (append_paragraph) whose run carries char styling
 // (size / colour / bold / italic / underline). Same rhwp .hwpx-export quirk as
@@ -1558,11 +1565,17 @@ const HANDLERS = {
       const text = typeof item === "string" ? item : String(item.text ?? "");
       const prefix = "• ";
       startNewParagraph(doc, cursor);
+      listPatches.push({ paraIdx: cursor.para, kind: "bullet", prefix });
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
       const liDefaults = {};
       const liFontIds = themeFontIds(doc, "body");
       if (liFontIds) liDefaults.fontIds = liFontIds;
       writeRunsAt(doc, cursor, runs, liDefaults);
+      // Same post-export run re-link / re-split as append_paragraph — without
+      // this, inline **bold** etc. inside a list item was flattened on .hwpx.
+      const liStyle = uniformRunStyle(runs);
+      if (liStyle) bodyStylePatches.push({ paraIdx: cursor.para, ...liStyle });
+      else { const seg = mixedRunSegments(runs); if (seg) mixedRunPatches.push({ paraIdx: cursor.para, segments: seg }); }
       // List items breathe between each other but stay tighter than body
       // paragraphs (700 HWPUNIT after ≈ 2.5mm) — 100 (≈0.35mm) read as packed.
       applyParaProps(doc, cursor, {
@@ -1577,15 +1590,22 @@ const HANDLERS = {
 
   append_numbered_list(doc, op, cursor) {
     const items = op.items || [];
+    const listSeq = ++numberedListSeq;   // each call = its own numbering (restarts at 1)
     items.forEach((item, idx) => {
       const text = typeof item === "string" ? item : String(item.text ?? "");
       const prefix = `${idx + 1}. `;
       startNewParagraph(doc, cursor);
+      listPatches.push({ paraIdx: cursor.para, kind: "number", listSeq, prefix });
       const runs = [{ text: prefix }, ...parseInlineRuns(text)];
       const liDefaults = {};
       const liFontIds = themeFontIds(doc, "body");
       if (liFontIds) liDefaults.fontIds = liFontIds;
       writeRunsAt(doc, cursor, runs, liDefaults);
+      // Same post-export run re-link / re-split as append_paragraph — without
+      // this, inline **bold** etc. inside a list item was flattened on .hwpx.
+      const liStyle = uniformRunStyle(runs);
+      if (liStyle) bodyStylePatches.push({ paraIdx: cursor.para, ...liStyle });
+      else { const seg = mixedRunSegments(runs); if (seg) mixedRunPatches.push({ paraIdx: cursor.para, segments: seg }); }
       applyParaProps(doc, cursor, {
         align: "left",
         lineSpacing: LIST_LINE_SPACING,
@@ -2476,6 +2496,142 @@ async function patchHwpxPageMargin(filePath, m) {
 // requires settings.xml + version.xml + other metadata to match a Hancom-
 // round-tripped file. Keep this as best-effort; the BULLET text-prefix
 // fallback in hwpx-edit.js's opSetParagraphList covers the remaining gap.
+// Issue #48: Hancom-saved hwpx declares xmlns:hwpunitchar on EVERY <hs:sec>
+// root (GT: handoff/shared/gt/*.hwpx — all carry it), but bundled rhwp
+// (≤0.7.15) omits it. The same splice used to live only inside
+// patchHwpxPictures(), so image-less documents never got it and
+// python-hwpx's package validator flagged section0.xml. Runs on every
+// section, idempotent (skips a root that already declares it).
+// rhwp writes every <hh:style paraPrIDRef="1042"> (that's the langID leaking
+// into the paraPr slot) — a paraPr that doesn't exist. GT (every Hancom-saved
+// file): all named styles reference paraPr 0. apply_style then handed that
+// dangling id to paragraphs (render fell back to defaults). Rewrite any style
+// paraPrIDRef that names a missing paraPr to 0. Idempotent.
+async function patchHwpxStyleParaRefs(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const he = zip.file("Contents/header.xml");
+  if (!he) return 0;
+  let header = await he.async("string");
+  const ids = new Set([...header.matchAll(/<hh:paraPr\b[^>]*\bid="(\d+)"/g)].map((m) => m[1]));
+  let n = 0;
+  header = header.replace(/(<hh:style\b[^>]*\bparaPrIDRef=")(\d+)(")/g, (m, a, id, b) => {
+    if (ids.has(id)) return m;
+    n++;
+    return `${a}0${b}`;
+  });
+  if (n) {
+    zip.file("Contents/header.xml", header);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
+  }
+  return n;
+}
+
+async function patchHwpxSectionNamespace(filePath) {
+  const buf = fs.readFileSync(filePath);
+  const zip = await JSZip.loadAsync(buf);
+  let patched = 0;
+  for (const name of Object.keys(zip.files)) {
+    if (!/^Contents\/section\d+\.xml$/i.test(name)) continue;
+    let xml = await zip.file(name).async("string");
+    const root = xml.match(/<hs:sec\b[^>]*>/);
+    if (!root || /xmlns:hwpunitchar=/.test(root[0])) continue;
+    xml = xml.replace(/<hs:sec\b([^>]*?)>/, '<hs:sec$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">');
+    zip.file(name, xml);
+    patched++;
+  }
+  if (patched) fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
+  return patched;
+}
+
+// .hwpx native bullet / numbered lists (GT-first, 2026-11-02).
+// GT handoff/shared/gt/list-bullet-number-restart-GT.hwpx (한컴독스 list --type
+// bullet|number on body paragraphs, para-shape --after 2.5 on one bullet):
+//   * a list paragraph's paraPr = the BODY paraPr (same align / hp:switch margins /
+//     lineSpacing) with <hh:heading type="BULLET" idRef="1" level="0"/> (or
+//     type="NUMBER" idRef="N") in place of heading NONE — nothing else changes;
+//   * bullet glyph = <hh:bullets> id 1; numbers = <hh:numbering> ("^1." DIGIT …);
+//   * a SECOND numbered list that must restart at 1 gets its OWN <hh:numbering>
+//     (idRef 2) — numbering is per numbering-id, so one definition per list.
+// So: for each tracked list paragraph, clone its current (already hp:switch,
+// LIST_* spaced) paraPr with the heading swapped in, retarget the paragraph,
+// and strip the literal "• " / "N. " prefix the rhwp build wrote. Needs the
+// stub fingerprint to have run first (bullets ▶ id=1 + numbering id=1 exist).
+async function patchHwpxNativeLists(filePath, patches) {
+  if (!patches.length) return 0;
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const he = zip.file("Contents/header.xml"), se = zip.file("Contents/section0.xml");
+  if (!he || !se) return 0;
+  let header = await he.async("string");
+  let xml = await se.async("string");
+  if (!/<hh:bullet\b[^>]*\bid="1"/.test(header) || !/<hh:numbering\b[^>]*\bid="1"/.test(header)) return 0;
+
+  // numbering per numbered list: seq 1 → id 1 (stub's), seq k → clone of id 1
+  const numId = new Map([[1, "1"]]);
+  const seqs = [...new Set(patches.filter((p) => p.kind === "number").map((p) => p.listSeq))].sort((a, b) => a - b);
+  const num1 = (header.match(/<hh:numbering\b[^>]*\bid="1"[^>]*>[\s\S]*?<\/hh:numbering>/) || [])[0];
+  let addedNum = 0;
+  for (const seq of seqs) {
+    if (seq === 1 || !num1) continue;
+    const ids = [...header.matchAll(/<hh:numbering\b[^>]*\bid="(\d+)"/g)].map((m) => Number(m[1]));
+    const nid = String(Math.max(0, ...ids) + 1);
+    header = header.replace("</hh:numberings>", num1.replace(/^<hh:numbering\b([^>]*)\bid="1"/, `<hh:numbering$1id="${nid}"`) + "</hh:numberings>");
+    numId.set(seq, nid);
+    addedNum++;
+  }
+  if (addedNum) header = header.replace(/(<hh:numberings itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + addedNum) + b);
+
+  const regions = topLevelParaRegions(xml);
+  const paraPrOf = (id) => (header.match(new RegExp(`<hh:paraPr\\b[^>]*\\bid="${id}"[^>]*>[\\s\\S]*?</hh:paraPr>`)) || [])[0];
+  const clones = new Map();   // `${kind}:${idRef}:${srcId}` → new paraPr id
+  let addedPp = 0, done = 0;
+  const nextPpId = () => String(Math.max(0, ...[...header.matchAll(/<hh:paraPr\b[^>]*\bid="(\d+)"/g)].map((m) => Number(m[1]))) + 1);
+
+  for (let i = patches.length - 1; i >= 0; i--) {   // reverse: offsets stay valid
+    const p = patches[i];
+    if (p.paraIdx < 0 || p.paraIdx >= regions.length) continue;
+    const r = regions[p.paraIdx];
+    let body = xml.slice(r.start, r.end);
+    const srcId = (body.match(/^<hp:p\b[^>]*\bparaPrIDRef="(\d+)"/) || [])[1];
+    if (!srcId) continue;
+    const idRef = p.kind === "bullet" ? "1" : numId.get(p.listSeq);
+    if (!idRef) continue;
+    // the literal prefix must still open the paragraph text, else leave it alone
+    const tM = /<hp:t\b[^>]*>([^<]*)<\/hp:t>/.exec(body);
+    if (!tM || !tM[1].startsWith(p.prefix)) continue;
+    const key = `${p.kind}:${idRef}:${srcId}`;
+    let newId = clones.get(key);
+    if (!newId) {
+      const src = paraPrOf(srcId);
+      if (!src || !/<hp:switch/.test(src)) continue;   // not native-structured → skip
+      newId = nextPpId();
+      const heading = `<hh:heading type="${p.kind === "bullet" ? "BULLET" : "NUMBER"}" idRef="${idRef}" level="0"/>`;
+      let pp = src.replace(/^<hh:paraPr\b([^>]*)\bid="\d+"/, `<hh:paraPr$1id="${newId}"`);
+      pp = /<hh:heading\b[^>]*\/>/.test(pp) ? pp.replace(/<hh:heading\b[^>]*\/>/, heading) : pp.replace(/(<hh:align\b[^>]*\/>)/, `$1${heading}`);
+      header = header.replace("</hh:paraProperties>", pp + "</hh:paraProperties>");
+      addedPp++;
+      clones.set(key, newId);
+    }
+    body = body.replace(/^(<hp:p\b[^>]*\bparaPrIDRef=")\d+(")/, `$1${newId}$2`);
+    const rest = tM[1].slice(p.prefix.length);
+    if (rest === "") {
+      // the prefix sat in its own run (mixed-run re-split) → remove that run entirely
+      const emptyRun = new RegExp(`<hp:run\\b[^>]*>(?:(?!</hp:run>)[^<]|<(?!hp:t\\b))*?${tM[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*</hp:run>`);
+      body = emptyRun.test(body) ? body.replace(emptyRun, "") : body.replace(tM[0], tM[0].replace(tM[1], ""));
+    } else {
+      body = body.replace(tM[0], tM[0].replace(tM[1], rest));
+    }
+    xml = xml.slice(0, r.start) + body + xml.slice(r.end);
+    done++;
+  }
+  if (addedPp) header = header.replace(/(<hh:paraProperties itemCnt=")(\d+)(")/, (m, a, n, b) => a + (Number(n) + addedPp) + b);
+  if (done) {
+    zip.file("Contents/header.xml", header);
+    zip.file("Contents/section0.xml", xml);
+    fs.writeFileSync(filePath, await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } }));
+  }
+  return done;
+}
+
 async function patchHwpxStubFingerprint(filePath) {
   const stubPath = path.join(__dirname, "templates", "hancom_native_stub.hwpx");
   if (!fs.existsSync(stubPath)) return { patched: false, reason: "stub missing" };
@@ -2567,12 +2723,18 @@ async function patchHwpxStubFingerprint(filePath) {
 
   let injected = 0;
   if (!hasBullet && stubBulletParaPr) {
-    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`);
+    // Stub BULLET paraPr is CENTER-aligned → list items centred on Hancom web.
+    // GT (2026-11-02): Hancom writes bullet paragraphs with the same structure
+    // and align LEFT, so rewrite only the align attribute (see hwpx-edit.js
+    // injectHancomListInfra for the full note).
+    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`)
+      .replace(/<hh:align horizontal="CENTER"/, '<hh:align horizontal="LEFT"');
     header = header.replace("</hh:paraProperties>", newBullet + "</hh:paraProperties>");
     injected++;
   }
   if (!hasNumber && stubNumberParaPr) {
-    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`);
+    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`)
+      .replace(/<hh:align horizontal="CENTER"/, '<hh:align horizontal="LEFT"');
     header = header.replace("</hh:paraProperties>", newNumber + "</hh:paraProperties>");
     injected++;
   }
@@ -3115,10 +3277,18 @@ async function patchHwpxLandscape(filePath) {
     let xml = await zip.file(name).async("string");
     const m = xml.match(/<hp:pagePr\b[^>]*?>/);
     if (!m) continue;
+    // GT (2026-11-02, 한컴독스 page-setup --orientation landscape → download,
+    // handoff/shared/gt/landscape-GT.hwpx): Hancom stores a landscape page as
+    // landscape="NARROWLY" with the paper dims UNCHANGED (A4 = 59528×84186,
+    // W<H); portrait is landscape="WIDELY" (same dims). The enum is the
+    // orientation, the dims are the paper. The earlier W↔H swap (issue #46)
+    // produced a custom 297×210 paper that Hancom then rotated again.
     const w = Number((m[0].match(/\bwidth="(\d+)"/) || [])[1]);
     const h = Number((m[0].match(/\bheight="(\d+)"/) || [])[1]);
-    if (w && h && w < h) {
-      const tag = m[0].replace(/\bwidth="\d+"/, `width="${h}"`).replace(/\bheight="\d+"/, `height="${w}"`);
+    let tag = m[0];
+    if (w && h && w > h) tag = tag.replace(/\bwidth="\d+"/, `width="${h}"`).replace(/\bheight="\d+"/, `height="${w}"`);
+    tag = /\blandscape="/.test(tag) ? tag.replace(/\blandscape="[^"]*"/, 'landscape="NARROWLY"') : tag.replace(/^<hp:pagePr\b/, '<hp:pagePr landscape="NARROWLY"');
+    if (tag !== m[0]) {
       xml = xml.replace(m[0], tag);
       zip.file(name, xml);
       total++;
@@ -4455,7 +4625,7 @@ async function readStdin() {
   if (ext === ".hwpx" && requestedLandscape) {
     try {
       const n = await patchHwpxLandscape(outPath);
-      if (n > 0) log.push(`hwpx_patch: landscape page W↔H swap (Hancom-web orientation)`);
+      if (n > 0) log.push(`hwpx_patch: landscape page → landscape="NARROWLY" (dims kept, GT #46)`);
     } catch (err) {
       log.push(`hwpx_landscape_patch failed: ${err.message}`);
     }
@@ -4483,8 +4653,16 @@ async function readStdin() {
   // any remaining gap.
   if (ext === ".hwpx") {
     try {
+      {
+        const n = await patchHwpxSectionNamespace(outPath);
+        if (n) log.push(`hwpx_patch: ${n} section root(s) += xmlns:hwpunitchar (#48)`);
+        const sr = await patchHwpxStyleParaRefs(outPath);
+        if (sr) log.push(`hwpx_patch: ${sr} named style(s) paraPrIDRef → 0 (was dangling)`);
+      }
       const r = await patchHwpxStubFingerprint(outPath);
       if (r.patched) log.push(`hwpx_stub_fingerprint: paraPr injected=${r.paraPrInjected || 0}`);
+      const nl = await patchHwpxNativeLists(outPath, listPatches);
+      if (nl) log.push(`hwpx_patch: ${nl} list paragraph(s) → native bullet/number paraPr (literal prefix stripped)`);
     } catch (err) {
       log.push(`hwpx_stub_fingerprint failed: ${err.message}`);
     }

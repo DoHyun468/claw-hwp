@@ -20,7 +20,7 @@
 //   set_paragraph_text    { index, text }
 //   append_paragraph      { text }
 //   delete_paragraph      { index }
-//   set_cell_text         { table, row, col, text }
+//   set_cell_text         { table, row, col, text, fit? }   // fit=true: 공백 패딩 레이아웃 길이 보존
 //   append_table_row      { table, cells: [..] }
 //   delete_table_row      { table, row }
 //   append_table_column   { table, cells: [..] }   // cells top-to-bottom
@@ -81,6 +81,13 @@
 //   set_caption           { target?, index?, text, side?, gap_mm? }  // 캡션 — target: image|chart|shape|table
 //   apply_style           { index, style }   // 스타일 적용 — style: name ("개요 1"/"본문") or id
 //   para_line             { index, fill_color?, border_color?, border_width_mm?, sides? }  // 문단 띠 (테두리·배경)
+//   unmerge_cells         { table, row, col }   // 병합 해제 — merge_cells 역연산 (흡수된 셀 재생성, 격자 복원)
+//   delete_object         { target, index, renumber? }  // 객체 삭제 — image|chart|shape|equation, 감싼 문단째 제거 + 외부 파트/매니페스트 정리
+//   place_seal            { anchor, source, mode?, size_mm?, dx_mm?, dy_mm?, font_pt?, frame?, occurrence?, ext? }  // 도장/서명 PNG 를 앵커 문구 위/옆에 floating 배치
+//
+//   Read-only:  { "path": "in.hwpx", "inspect": "cells" }  → 모든 표(중첩 포함, op 과 같은 index 순서)의 셀 {row,col,colSpan,rowSpan,text} 덤프, 저장 없음.
+//   Indexing:   paragraph index = top-level <hp:p> 만 (표 셀 안 문단 제외) / table index = 문서 순서 전체 <hp:tbl> (중첩 포함, == extract_text --inspect 순서).
+//   Full contract + caveats per op: references/hwpx-edit-ops.md (single source of truth).
 //
 // Output: JSON to stdout — { ok, output, results: [ { type, ...stats } ] }.
 
@@ -918,7 +925,11 @@ function opSplitCell(doc, tableIndex, row, col, nRows, nCols) {
   let newAttrs = el.attrs;
   if (dM) newAttrs = bumpColCnt(newAttrs, dM);
   if (dN) newAttrs = bumpRowCnt(newAttrs, dN);
-  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${newAttrs}>${dropLinesegs(newRows.join(''))}</hp:tbl>`));
+  // Keep everything that precedes the first row (hp:sz / pos / outMargin /
+  // inMargin / caption) — rebuilding from rows alone dropped them (sweep
+  // 2026-11-02: python-hwpx flagged the table, and the table lost its size).
+  const preRow = rowsEls.length ? el.inner.slice(0, rowsEls[0].start) : '';
+  doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${newAttrs}>${preRow}${dropLinesegs(newRows.join(''))}</hp:tbl>`));
   return { table: tableIndex, row, col, intoRows: nRows, intoCols: nCols };
 }
 
@@ -1174,7 +1185,11 @@ function opInsertTable(doc, index, rows, cols, cells) {
     // but drop any caption — a fresh table shouldn't inherit the template's caption.
     const firstTrIdx = srcTbl.el.inner.indexOf('<hp:tr');
     tblMeta = (firstTrIdx >= 0 ? srcTbl.el.inner.slice(0, firstTrIdx) : '')
-      .replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, '');
+      .replace(/<hp:caption\b[\s\S]*?<\/hp:caption>/, '')
+      // … nor its per-cell zones (set_cell_background/border/diagonal live in
+      // <hp:cellzoneList>) — a fresh table inheriting a yellow cell from the
+      // template was caught by the 2026-11-02 render sweep.
+      .replace(/<hp:cellzoneList\b[\s\S]*?<\/hp:cellzoneList>/, '');
   } else {
     // Fallback path — no source table to clone. Hancom Docs's web viewer
     // suppresses cellzone fills when the table's own borderFill paints a
@@ -1472,7 +1487,7 @@ function applyCellShadeColor(doc, tableIndex, row, col, color) {
   const updated = `<hh:charPr${newAttrs}>${base.inner}</hh:charPr>`;
   header = placeholder
     ? spliceEl(header, placeholder, updated)
-    : bumpListCount(spliceEl(header, base, `<hh:charPr${base.attrs}>${base.inner}</hh:charPr>` + updated), 'hh:charProperties', +1);
+    : bumpListCount(appendToList(header, 'hh:charProperties', updated), 'hh:charProperties', +1);
   doc.write(headerName, header);
   retargetCellRuns(doc, tableIndex, row, col, useId);
 }
@@ -1558,12 +1573,7 @@ function opSetCellAlign(doc, tableIndex, row, col, horizontal, vertical) {
     const srcParaRef = (p.attrs.match(/paraPrIDRef="(\d+)"/) || [, '0'])[1];
     const base = paraPrs.find((pr) => getAttr(pr.attrs, 'id') === srcParaRef) || paraPrs[0];
     // placeholder reuse — same Hancom-native trick as charPr ops.
-    const refCounts = {};
-    for (const name of doc.sectionNames()) {
-      for (const m of doc.read(name).matchAll(/paraPrIDRef="(\d+)"/g)) {
-        refCounts[m[1]] = (refCounts[m[1]] || 0) + 1;
-      }
-    }
+    const refCounts = buildParaPrRefCounts(doc);
     const placeholder = paraPrs.find((pr) => (refCounts[getAttr(pr.attrs, 'id')] || 0) === 0 && getAttr(pr.attrs, 'id') !== srcParaRef);
     const useId = placeholder ? getAttr(placeholder.attrs, 'id')
                               : String(Math.max(...paraPrs.map((pr) => Number(getAttr(pr.attrs, 'id') || 0))) + 1);
@@ -1574,7 +1584,7 @@ function opSetCellAlign(doc, tableIndex, row, col, horizontal, vertical) {
     const updated = `<hh:paraPr${mutAttrs}>${mutInner}</hh:paraPr>`;
     header = placeholder
       ? spliceEl(header, placeholder, updated)
-      : bumpListCount(spliceEl(header, base, `<hh:paraPr${base.attrs}>${base.inner}</hh:paraPr>` + updated), 'hh:paraProperties', +1);
+      : bumpListCount(appendToList(header, 'hh:paraProperties', updated), 'hh:paraProperties', +1);
     doc.write(headerName, header);
     // Retarget the cell paragraph's paraPrIDRef in tcInner
     const newPOpen = p.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${useId}"`);
@@ -1827,9 +1837,15 @@ function injectHancomListInfra(doc) {
   const stubBullets = (stubHeader.match(/<hh:bullets\b[^>]*>[\s\S]*?<\/hh:bullets>/) || [])[0];
   const stubNumbering = (stubHeader.match(/<hh:numbering id="1"[^>]*>[\s\S]*?<\/hh:numbering>/) || [])[0];
 
-  // Avoid duplicate injection if a Hancom-authored list paraPr already lives in this doc.
-  const hasBullet = /<hh:heading\s+type="BULLET"/.test(header);
-  const hasNumber = /<hh:heading\s+type="NUMBER"/.test(header);
+  // Avoid duplicate injection if a usable list paraPr already lives in this doc.
+  // "Usable" = not CENTER-aligned: docs stamped by older create.js builds carry
+  // only the stub's centred BULLET paraPr (every bullet item rendered centred on
+  // Hancom web), so for those we still inject a LEFT one and let
+  // reuseExistingListParaPr prefer it.
+  const hasUsable = (type) => scanTopLevel(header, 'hh:paraPr').some((pp) =>
+    new RegExp(`<hh:heading\\s+type="${type}"`).test(pp.inner) && !/<hh:align\s+horizontal="CENTER"/.test(pp.inner));
+  const hasBullet = hasUsable('BULLET');
+  const hasNumber = hasUsable('NUMBER');
 
   // Renumber stub's paraPr ids to avoid clashing with existing ones.
   const existingIds = [...header.matchAll(/<hh:paraPr\s+id="(\d+)"/g)].map((m) => Number(m[1]));
@@ -1837,14 +1853,22 @@ function injectHancomListInfra(doc) {
   let bulletId = String(maxId + 1);
   let numberId = String(maxId + 2);
 
+  // The stub's BULLET paraPr (id=2) was authored centred, so every bullet item
+  // rendered CENTER on Hancom web. GT (한컴독스 list --type bullet + align left,
+  // 2026-11-02, handoff/shared/gt/bullet-left-align-GT.hwpx): Hancom stores a
+  // bullet paragraph as the SAME hp:switch structure with <hh:align
+  // horizontal="LEFT"> (or the body's own align) + heading BULLET — so only the
+  // align attribute is rewritten here; the fingerprint-bearing structure stays
+  // byte-identical. NUMBER (id=3) is already LEFT in the stub.
+  const leftAlign = (pp) => pp.replace(/<hh:align horizontal="CENTER"/, '<hh:align horizontal="LEFT"');
   let injected = 0;
   if (!hasBullet && stubBulletParaPr) {
-    const newBullet = stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`);
+    const newBullet = leftAlign(stubBulletParaPr.replace(/^<hh:paraPr id="2"/, `<hh:paraPr id="${bulletId}"`));
     header = header.replace('</hh:paraProperties>', newBullet + '</hh:paraProperties>');
     injected++;
   }
   if (!hasNumber && stubNumberParaPr) {
-    const newNumber = stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`);
+    const newNumber = leftAlign(stubNumberParaPr.replace(/^<hh:paraPr id="3"/, `<hh:paraPr id="${numberId}"`));
     header = header.replace('</hh:paraProperties>', newNumber + '</hh:paraProperties>');
     injected++;
   }
@@ -1929,19 +1953,26 @@ function injectHancomListInfra(doc) {
 // web rejects our synthesised list paraPrs even when byte-level identical to
 // stock, so reusing an existing one is the only reliable path to list
 // rendering surviving cloud open.
-function reuseExistingListParaPr(doc, type, lvl) {
+function reuseExistingListParaPr(doc, type, lvl, opts) {
+  const allowCentred = !opts || opts.allowCentred !== false;
   const headerName = doc.headerName();
   if (!headerName) return null;
   const header = doc.read(headerName);
   const paraPrs = scanTopLevel(header, 'hh:paraPr');
+  // Prefer a left/justified list paraPr over a centred one: docs stamped by
+  // older create.js builds carry the stub's CENTER bullet paraPr, and reusing
+  // it centres every list item (GT: Hancom's own bullet paragraphs are LEFT /
+  // body-aligned). If only a centred match exists it is still reused.
+  let centred = null;
   for (const pp of paraPrs) {
     const hm = pp.inner.match(/<hh:heading\s+type="([^"]+)"\s+idRef="[^"]*"\s+level="(\d+)"/);
     if (!hm) continue;
     if (hm[1] !== type) continue;
     if (Number(hm[2]) !== lvl) continue;
+    if (/<hh:align\s+horizontal="CENTER"/.test(pp.inner)) { if (!centred) centred = getAttr(pp.attrs, 'id'); continue; }
     return getAttr(pp.attrs, 'id');
   }
-  return null;
+  return allowCentred ? centred : null;
 }
 
 // Bullet / numbered list — Hancom's mechanism is a paraPr with
@@ -1972,7 +2003,7 @@ function opSetParagraphList(doc, index, type, level, options) {
   // the host doc's existing ones if it has any.
   if (t === 'BULLET' || t === 'NUMBER') {
     // 1. Try reusing an existing Hancom-authored list paraPr.
-    let reused = reuseExistingListParaPr(doc, t, lvl);
+    let reused = reuseExistingListParaPr(doc, t, lvl, { allowCentred: false });
     // 2. If none exists, inject the Hancom-round-trip stub fingerprint into
     //    this doc (native BULLET + NUMBER paraPrs, bullets/numbering tables,
     //    xmlns:hwpunitchar, Scripts/ — from templates/hancom_native_stub.hwpx)
@@ -1981,7 +2012,10 @@ function opSetParagraphList(doc, index, type, level, options) {
     //    rendering, not just docs that already round-tripped through Hancom.
     if (!reused) {
       const injected = injectHancomListInfra(doc);
-      if (injected) reused = reuseExistingListParaPr(doc, t, lvl);
+      if (injected) reused = reuseExistingListParaPr(doc, t, lvl, { allowCentred: false });
+      // Injection impossible (stub missing) but a centred native paraPr exists →
+      // still better than losing list semantics: reuse it (items render centred).
+      if (!reused) reused = reuseExistingListParaPr(doc, t, lvl, { allowCentred: true });
     }
     if (reused) {
       const newOpen = el.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${reused}"`);
@@ -2079,12 +2113,7 @@ function opSetParagraphList(doc, index, type, level, options) {
   }
 
   // Otherwise — reuse a placeholder paraPr (Hancom-native trick) or append new.
-  const refCounts = {};
-  for (const name of doc.sectionNames()) {
-    for (const m of doc.read(name).matchAll(/paraPrIDRef="(\d+)"/g)) {
-      refCounts[m[1]] = (refCounts[m[1]] || 0) + 1;
-    }
-  }
+  const refCounts = buildParaPrRefCounts(doc);
   const placeholder = paraPrs.find((pp) => (refCounts[getAttr(pp.attrs, 'id')] || 0) === 0 && getAttr(pp.attrs, 'id') !== srcParaRef);
   const useId = placeholder ? getAttr(placeholder.attrs, 'id')
                             : String(Math.max(...paraPrs.map((pp) => Number(getAttr(pp.attrs, 'id') || 0))) + 1);
@@ -2092,7 +2121,7 @@ function opSetParagraphList(doc, index, type, level, options) {
   const updated = `<hh:paraPr${mutAttrs}>${wantInner}</hh:paraPr>`;
   header = placeholder
     ? spliceEl(header, placeholder, updated)
-    : bumpListCount(spliceEl(header, base, `<hh:paraPr${base.attrs}>${base.inner}</hh:paraPr>` + updated), 'hh:paraProperties', +1);
+    : bumpListCount(appendToList(header, 'hh:paraProperties', updated), 'hh:paraProperties', +1);
   doc.write(headerName, header);
   const newOpen = el.attrs.replace(/paraPrIDRef="\d+"/, `paraPrIDRef="${useId}"`);
   doc.write(section, spliceEl(doc.read(section), el, `<hp:p${newOpen}>${el.inner}</hp:p>`));
@@ -2325,15 +2354,43 @@ function opDistributeTable(doc, tableIndex, mode) {
   const tbl = el.inner;
   const rows = scanTopLevel(tbl, 'hp:tr');
   if (!rows.length) throw new Error('distribute_table: table has no rows');
-  const rowH = rows.map((r) => { const c = scanTopLevel(r.inner, 'hp:tc')[0]; const m = c && c.inner.match(/<hp:cellSz width="\d+" height="(\d+)"/); return m ? Number(m[1]) : 0; });
-  const cols = scanTopLevel(rows[0].inner, 'hp:tc');
-  const colW = cols.map((c) => { const m = c.inner.match(/<hp:cellSz width="(\d+)"/); return m ? Number(m[1]) : 0; });
-  const eqH = Math.round(rowH.reduce((a, b) => a + b, 0) / rows.length);
-  const eqW = Math.round(colW.reduce((a, b) => a + b, 0) / (cols.length || 1));
-  const newInner = tbl.replace(/<hp:cellSz width="(\d+)" height="(\d+)"\/>/g, (m, w, h) =>
-    `<hp:cellSz width="${mode === 'height' ? w : eqW}" height="${mode === 'width' ? h : eqH}"/>`);
+  // Grid-aware (sweep 2026-11-02): a merged/split table has cells spanning
+  // several grid columns/rows. Giving EVERY cell the same width made rows with
+  // more cells wider than the table (one row summed to 1.7× the table width →
+  // the table ran off the page). Distribute per GRID column/row: unit = table
+  // width ÷ colCnt, cell width = unit × colSpan (same for heights / rowSpan).
+  const colCnt = Number((el.attrs.match(/\bcolCnt="(\d+)"/) || [, 0])[1]) || 0;
+  const rowCnt = Number((el.attrs.match(/\browCnt="(\d+)"/) || [, 0])[1]) || rows.length;
+  const spanSum = (row, attr, sz) => scanTopLevel(row.inner, 'hp:tc').reduce((a, tc) => {
+    const span = Number((tc.inner.match(new RegExp(`<hp:cellSpan[^>]*\\b${attr}="(\\d+)"`)) || [, 1])[1]) || 1;
+    return a + (span === 1 ? Number((tc.inner.match(new RegExp(`<hp:cellSz[^>]*\\b${sz}="(\\d+)"`)) || [, 0])[1]) : 0);
+  }, 0);
+  // table width: hp:sz if present, else the widest single-span row sum
+  const szW = Number((tbl.match(/<hp:sz\b[^>]*\bwidth="(\d+)"/) || [, 0])[1]);
+  const rowSums = rows.map((r) => scanTopLevel(r.inner, 'hp:tc').reduce((a, tc) => a + Number((tc.inner.match(/<hp:cellSz width="(\d+)"/) || [, 0])[1]), 0));
+  const totalW = szW || Math.max(...rowSums);
+  // table height: sum of each grid row's height taken from a rowSpan-1 cell
+  const rowH = rows.map((r) => { const tc = scanTopLevel(r.inner, 'hp:tc').find((c) => !/<hp:cellSpan[^>]*rowSpan="([2-9]|\d{2,})"/.test(c.inner)) || scanTopLevel(r.inner, 'hp:tc')[0]; const m = tc && tc.inner.match(/<hp:cellSz width="\d+" height="(\d+)"/); return m ? Number(m[1]) : 0; });
+  const totalH = rowH.reduce((a, b) => a + b, 0);
+  const unitW = colCnt ? totalW / colCnt : 0;
+  const unitH = rowCnt ? totalH / rowCnt : 0;
+  let newInner = tbl;
+  const newRows = rows.map((r) => {
+    const tcs = scanTopLevel(r.inner, 'hp:tc');
+    let ri = r.inner;
+    for (let i = tcs.length - 1; i >= 0; i--) {
+      const tc = tcs[i];
+      const cs = Number((tc.inner.match(/<hp:cellSpan[^>]*colSpan="(\d+)"/) || [, 1])[1]) || 1;
+      const rs = Number((tc.inner.match(/<hp:cellSpan[^>]*rowSpan="(\d+)"/) || [, 1])[1]) || 1;
+      const inner2 = tc.inner.replace(/<hp:cellSz width="(\d+)" height="(\d+)"\/>/, (m, w, h) =>
+        `<hp:cellSz width="${mode === 'height' || !unitW ? w : Math.round(unitW * cs)}" height="${mode === 'width' || !unitH ? h : Math.round(unitH * rs)}"/>`);
+      ri = ri.slice(0, tc.start) + `<hp:tc${tc.attrs}>${inner2}</hp:tc>` + ri.slice(tc.end);
+    }
+    return `<hp:tr${r.attrs}>${ri}</hp:tr>`;
+  });
+  for (let i = rows.length - 1; i >= 0; i--) newInner = newInner.slice(0, rows[i].start) + newRows[i] + newInner.slice(rows[i].end);
   doc.write(section, spliceEl(doc.read(section), el, `<hp:tbl${el.attrs}>${newInner}</hp:tbl>`));
-  return { table: tableIndex, mode, eqWidth: mode !== 'height' ? eqW : undefined, eqHeight: mode !== 'width' ? eqH : undefined, rows: rows.length, cols: cols.length };
+  return { table: tableIndex, mode, gridCols: colCnt, gridRows: rowCnt, unitWidth: mode !== 'height' ? Math.round(unitW) : undefined, unitHeight: mode !== 'width' ? Math.round(unitH) : undefined };
 }
 
 // ── style operations (clone-mutate-retarget in header.xml) ───────────────────
@@ -2349,8 +2406,13 @@ function opDistributeTable(doc, tableIndex, mode) {
 //
 // Uses a balanced run scan so an empty self-closing <hp:run/> sitting just
 // before the text node isn't mistaken for its parent.
+// Inline <hp:markpenBegin/>/<hp:markpenEnd/> (highlight) live INSIDE <hp:t>;
+// a target that follows one in the same hp:t must still be found (sweep
+// 2026-11-02: every apply_text_style after a highlight in the same paragraph
+// silently returned retargeted:0).
+const MARKPEN_TAG = '<hp:markpen(?:Begin|End)\\b[^>]*/>';
 function findRunForText(xml, target) {
-  const tRe = new RegExp(`<hp:t(?:\\s[^>]*)?>[^<]*${escapeRegex(target)}`);
+  const tRe = new RegExp(`<hp:t(?:\\s[^>]*)?>(?:[^<]|${MARKPEN_TAG})*${escapeRegex(target)}`);
   for (const r of scanTopLevel(xml, 'hp:run')) {
     if (r.selfClosing) continue;
     if (r.inner.includes('<hp:tbl')) continue;
@@ -2378,12 +2440,16 @@ function retargetRun(xml, run, newId) {
 // inner is more complex than a single <hp:t> (e.g. has tabs, line breaks,
 // embedded controls) and can't be safely split.
 function splitRunAroundText(xml, run, target, newId) {
-  const tMatch = run.inner.match(/^<hp:t(\s[^>]*)?>([^<]*)<\/hp:t>$/);
+  const tMatch = run.inner.match(new RegExp(`^<hp:t(\\s[^>]*)?>((?:[^<]|${MARKPEN_TAG})*)<\\/hp:t>$`));
   if (!tMatch) return null;
   const tAttrs = tMatch[1] || '';
   const text = tMatch[2];
   const idx = text.indexOf(target);
   if (idx < 0) return null;
+  // Don't cut a highlight pair in half: if the target sits between an open
+  // markpenBegin and its markpenEnd, fall back to a whole-run retarget.
+  const openBefore = (text.slice(0, idx).match(/<hp:markpenBegin\b/g) || []).length - (text.slice(0, idx).match(/<hp:markpenEnd\b/g) || []).length;
+  if (openBefore > 0) return null;
   if (idx === 0 && idx + target.length === text.length) return retargetRun(xml, run, newId);
   const before = text.slice(0, idx);
   const after = text.slice(idx + target.length);
@@ -2454,11 +2520,34 @@ function findFontIdByFace(doc, face) {
   return m ? m[1] : null;
 }
 
+// paraPr twin of buildCharPrRefCounts — section refs + <hh:style paraPrIDRef>
+// (a named style's paraPr is not a free placeholder either).
+function buildParaPrRefCounts(doc) {
+  const counts = { '0': 1 };   // id 0 = document default — never a placeholder
+  for (const name of doc.sectionNames()) {
+    for (const m of doc.read(name).matchAll(/paraPrIDRef="(\d+)"/g)) counts[m[1]] = (counts[m[1]] || 0) + 1;
+  }
+  const headerName = doc.headerName();
+  if (headerName) {
+    for (const m of doc.read(headerName).matchAll(/<hh:style\b[^>]*\bparaPrIDRef="(\d+)"/g)) counts[m[1]] = (counts[m[1]] || 0) + 1;
+  }
+  return counts;
+}
 function buildCharPrRefCounts(doc) {
-  const counts = {};
+  const counts = { '0': 1 };   // id 0 = document default — never a placeholder
   for (const name of doc.sectionNames()) {
     const xml = doc.read(name);
     for (const m of xml.matchAll(/charPrIDRef="(\d+)"/g)) {
+      counts[m[1]] = (counts[m[1]] || 0) + 1;
+    }
+  }
+  // A charPr that no run uses but a named <hh:style> points at (바탕글/본문/
+  // 개요 N …) is NOT a free placeholder: rewriting it in place silently
+  // restyles that named style (sweep 2026-11-02: a size_pt:16 op turned the
+  // 본문 style into 16pt). Count style references too.
+  const headerName = doc.headerName();
+  if (headerName) {
+    for (const m of doc.read(headerName).matchAll(/<hh:style\b[^>]*\bcharPrIDRef="(\d+)"/g)) {
       counts[m[1]] = (counts[m[1]] || 0) + 1;
     }
   }
@@ -2560,7 +2649,7 @@ function opApplyTextStyle(doc, target, style) {
   if (placeholder) {
     h2 = spliceEl(header, placeholder, updatedCharPr); // in-place rewrite, itemCnt unchanged
   } else {
-    h2 = spliceEl(header, base, `<hh:charPr${base.attrs}>${base.inner}</hh:charPr>` + updatedCharPr);
+    h2 = appendToList(header, 'hh:charProperties', updatedCharPr);
     h2 = bumpListCount(h2, 'hh:charProperties', +1);
   }
   doc.write(headerName, h2);
@@ -2764,7 +2853,7 @@ function opApplyParagraphStyle(doc, index, style) {
     mutInner = mutInner.replace(/(<hh:intent unit="[^"]*" value=")[-\d]+(")/, (m, a, b) => a + style.indent + b);
   }
   const newParaPr = `<hh:paraPr${mutAttrs}>${mutInner}</hh:paraPr>`;
-  header = spliceEl(header, base, `<hh:paraPr${base.attrs}>${base.inner}</hh:paraPr>` + newParaPr);
+  header = appendToList(header, 'hh:paraProperties', newParaPr);
   header = bumpListCount(header, 'hh:paraProperties', +1);
   doc.write(headerName, header);
   // Retarget the Nth body paragraph.
@@ -2800,7 +2889,11 @@ function opApplyStyle(doc, index, style) {
     throw new Error(`apply_style: style "${want}" not found. Available: ${avail}`);
   }
   const styleId = getAttr(hit.attrs, 'id');
-  const ppr = getAttr(hit.attrs, 'paraPrIDRef');
+  let ppr = getAttr(hit.attrs, 'paraPrIDRef');
+  // Guard: rhwp-built docs declare styles with paraPrIDRef="1042" (a paraPr that
+  // doesn't exist; Hancom native uses 0). Never hand a paragraph a dangling id —
+  // fall back to 0, the document default, like Hancom's own files.
+  if (ppr != null && !new RegExp(`<hh:paraPr\\b[^>]*\\bid="${ppr}"`).test(doc.read(headerName))) ppr = '0';
   const cpr = getAttr(hit.attrs, 'charPrIDRef');
   const paras = doc.paragraphs();
   if (index < 0 || index >= paras.length) throw new Error(`apply_style: index ${index} out of range (0..${paras.length - 1})`);
@@ -2862,6 +2955,18 @@ function opParaLine(doc, index, opts) {
 
 // Increment itemCnt="N" on the named OWPML list wrapper (e.g. hh:charPrList),
 // so Hancom's strict reader doesn't ignore an appended definition.
+// Hancom web resolves charPrIDRef / paraPrIDRef by the item's POSITION inside
+// <hh:charProperties> / <hh:paraProperties> (ids are contiguous 0..N-1 in every
+// Hancom file), NOT by the id attribute. Inserting a new item mid-list — the old
+// "splice it right after its base" habit — shifts every later item, so runs
+// suddenly pick up a neighbour's size/colour (sweep 2026-11-02: body text rendered
+// in the heading charPr, a word in the hyperlink charPr). New items go at the END.
+function appendToList(header, listTag, itemXml) {
+  const close = `</${listTag}>`;
+  const at = header.lastIndexOf(close);
+  if (at < 0) throw new Error(`${listTag} not found in header.xml`);
+  return header.slice(0, at) + itemXml + header.slice(at);
+}
 function bumpListCount(header, listTag, delta) {
   const re = new RegExp(`(<${listTag.replace(/:/g, '\\:')}\\b[^>]*itemCnt=")(\\d+)(")`);
   return header.replace(re, (m, a, n, b) => a + (Number(n) + delta) + b);
@@ -3224,10 +3329,16 @@ function sealParaPrMetrics(doc, paraPrId) {
     const blk = h.slice(i, end < 0 ? i + 5000 : end);
     const caseM = blk.match(/HwpUnitChar[\s\S]*?<hh:margin>([\s\S]*?)<\/hh:margin>/);
     const marg = (caseM ? caseM[1] : (blk.match(/<hh:margin>([\s\S]*?)<\/hh:margin>/) || [, ''])[1]) || '';
+    // NOTE (2026-11-02): although hp:case margins are stored as mm×100, the
+    // /283.46 reading below is what matches Hancom web's rendered line pitch
+    // (verified again on a plain 5-line doc: switching to /100 put the stamp
+    // ~6 mm too low). Keep it; the object-line leading below is the real fix
+    // for documents with stacked objects.
+    const div = 283.46;
     const prev = marg.match(/<hc:prev value="(\d+)"/);
     const next = marg.match(/<hc:next value="(\d+)"/);
-    if (prev) out.prevMm = Number(prev[1]) / 283.46;
-    if (next) out.nextMm = Number(next[1]) / 283.46;
+    if (prev) out.prevMm = Number(prev[1]) / div;
+    if (next) out.nextMm = Number(next[1]) / div;
     const ls = blk.match(/<hh:lineSpacing[^>]*type="PERCENT"[^>]*value="(\d+)"/);
     if (ls) out.pct = Number(ls[1]);
     return out;
@@ -3251,12 +3362,45 @@ function sealParaAlign(doc, paraPrId) {
   return 'LEFT';
 }
 // Vertical advance (mm) from a paragraph's top to the next block's top.
+// Height (mm) that in-flow objects inside a paragraph / cell add to its line:
+// inline (treatAsChar=1) or 자리차지 (TOP_AND_BOTTOM) pictures, shapes, charts,
+// equations and text boxes take their <hp:sz> height + outMargin top/bottom (+ a
+// caption line). Floating front/behind/square objects don't push the flow.
+// Render sweep 2026-11-02: a stamp anchored below charts/shapes/text boxes
+// landed ~110 mm too high because only text lines were summed.
+function sealInlineObjHeightMm(doc, inner) {
+  let h = 0;
+  for (const tag of ['hp:pic', 'hp:rect', 'hp:ellipse', 'hp:line', 'hp:arc', 'hp:polygon', 'hp:curve', 'hp:chart', 'hp:equation', 'hp:container']) {
+    for (const o of scanTopLevel(inner, tag)) {
+      if (o.selfClosing) continue;
+      const pos = o.inner.match(/<hp:pos\b[^>]*>/);
+      const inline = pos && /treatAsChar="1"/.test(pos[0]);
+      const tb = /textWrap="TOP_AND_BOTTOM"/.test(o.attrs);
+      if (!inline && !tb) continue;
+      const sz = o.inner.match(/<hp:sz\b[^>]*\bheight="(\d+)"/);
+      const om = o.inner.match(/<hp:outMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
+      let oh = (sz ? Number(sz[1]) : 0) / 283.46 + (om ? (Number(om[1]) + Number(om[2])) / 283.46 : 0);
+      if (/<hp:caption\b/.test(o.inner)) {
+        const gap = o.inner.match(/<hp:caption\b[^>]*\bgap="(\d+)"/);
+        oh += (gap ? Number(gap[1]) / 283.46 : 3) + charPrFontPt(doc, (o.inner.match(/<hp:caption\b[\s\S]*?charPrIDRef="(\d+)"/) || [, null])[1]) * PT2MM * 1.6;
+      }
+      h = Math.max(h, oh);
+    }
+  }
+  return h;
+}
 function sealParaAdvanceMm(doc, pInner, pAttrs, pageTextWmm) {
   const pt = charPrFontPt(doc, (pInner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
   const m = sealParaPrMetrics(doc, (pAttrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
   const txt = (pInner.match(/<hp:t>([^<]*)<\/hp:t>/g) || []).map((s) => s.replace(/<\/?hp:t>/g, '')).join('');
   const lines = Math.max(1, Math.ceil(estTextWidthMm(txt, pt) / Math.max(10, pageTextWmm)));
-  return m.prevMm + lines * (pt * PT2MM * (m.pct / 100)) + m.nextMm;
+  const textH = lines * (pt * PT2MM * (m.pct / 100));
+  const objH = sealInlineObjHeightMm(doc, pInner);
+  // An in-flow object makes its line as tall as the object PLUS the line's
+  // leading (Hancom keeps the paragraph line-spacing % on object lines: a 15 mm
+  // text box renders ~16.8 mm tall at 150%). Render-measured 2026-11-02.
+  const leading = pt * PT2MM * Math.max(0, m.pct / 100 - 1);
+  return m.prevMm + Math.max(textH, objH ? objH + leading : 0) + m.nextMm;
 }
 // Vertical advance (mm) of a table block = outMargin top/bottom + Σ row heights.
 function sealTableAdvanceMm(doc, tblInner) {
@@ -3272,7 +3416,7 @@ function sealTableAdvanceMm(doc, tblInner) {
       const ptc = charPrFontPt(doc, (c.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
       const cm = c.inner.match(/<hp:cellMargin\b[^>]*\btop="(\d+)"[^>]*\bbottom="(\d+)"/);
       const mv = cm ? (Number(cm[1]) + Number(cm[2])) / 283.46 : 2.8;
-      rh = Math.max(rh, lines * (ptc * PT2MM * 1.3) + mv);
+      rh = Math.max(rh, lines * (ptc * PT2MM * 1.3) + mv, sealInlineObjHeightMm(doc, c.inner) + mv);
     }
     h += rh || 7;
   }
@@ -3479,7 +3623,10 @@ function opPlaceSeal(doc, op) {
     // ≈ -0.08 when the origin is the line's own top (PARA cell / clamped body),
     // ≈ +0.2 when the origin is the page/content top and originYMm carried the
     // line's distance down to it (free-text PAGE frame). dy_mm overrides.
-    const lineMidMm = pt * PT2MM * vFactor;
+    // PAGE frame (free text): the caller passes the anchor line's real middle
+    // (paraPr prev-gap + half the first line's height) as lineMidOverrideMm —
+    // the old 0.2 em guess sat the stamp ~3 mm above the line (sweep 2026-11-02).
+    const lineMidMm = o && o.lineMidOverrideMm != null ? o.lineMidOverrideMm : pt * PT2MM * vFactor;
     let dx = originXMm + lineLeft + (ov ? (startX + aw / 2 - wMm / 2) : (startX + aw + 2));
     let dy = originYMm + (lineMidMm - sealMm / 2);
     if (op.dx_mm != null) dx = Number(op.dx_mm);
@@ -3516,7 +3663,9 @@ function opPlaceSeal(doc, op) {
         if (b.inner.includes('<hp:tbl')) topMm += sealTableAdvanceMm(doc, scanTopLevel(b.inner, 'hp:tbl')[0].inner);
         else topMm += sealParaAdvanceMm(doc, b.inner, b.attrs, roomWidthMm);
       }
-      o = { originYMm: topMm, roomWidthMm, vFactor: 0.2 };
+      const am = sealParaPrMetrics(doc, (p.attrs.match(/paraPrIDRef="(\d+)"/) || [, null])[1]);
+      const apt = op.font_pt != null ? Number(op.font_pt) : charPrFontPt(doc, (p.inner.match(/charPrIDRef="(\d+)"/) || [, null])[1]);
+      o = { originYMm: topMm, roomWidthMm, vFactor: 0.2, lineMidOverrideMm: am.prevMm + (apt * PT2MM * (am.pct / 100)) / 2 };
     } else {
       o = { roomWidthMm }; // user forced PARA/PAPER (PARA rests low — its choice)
     }
@@ -3865,6 +4014,35 @@ function buildPic(doc, itemId, width, height) {
 
 const VALID_APPLY = new Set(['BOTH', 'EVEN', 'ODD']);
 
+// Host a new <hp:header>/<hp:footer> control the way Hancom does. GT
+// (2026-11-07, 한컴독스 page-number footer + header applied to a doc whose first
+// paragraph holds text — handoff/shared/gt/pagenum-in-secpr-para-GT-{footer,header}.hwpx):
+// Hancom puts the control in its OWN <hp:run> inside the SAME paragraph that
+// carries <hp:secPr>, right after the secPr run, and never adds a body
+// paragraph. Our old path inserted a wrapper paragraph after the first body
+// paragraph, which Hancom rendered as a visible blank line under the title
+// (merge smoke 2026-11-07). Falls back to the wrapper paragraph only when no
+// paragraph carries a secPr run.
+function insertSectionCtrlRun(doc, ctrlXml) {
+  const firstSec = doc.sectionNames()[0];
+  if (!firstSec) throw new Error('no Contents/section*.xml found');
+  const xml = doc.read(firstSec);
+  const paras = scanTopLevel(xml, 'hp:p');
+  if (!paras.length) throw new Error('no <hp:p> in first section to anchor insertion');
+  const host = paras.find((p) => /<hp:secPr\b/.test(p.inner));
+  const secRun = host ? scanTopLevel(host.inner, 'hp:run').find((r) => /<hp:secPr\b/.test(r.inner)) : null;
+  if (host && secRun) {
+    const charRef = getAttr(secRun.attrs, 'charPrIDRef') || '0';
+    const newInner = host.inner.slice(0, secRun.end) + `<hp:run charPrIDRef="${charRef}">${ctrlXml}</hp:run>` + host.inner.slice(secRun.end);
+    doc.write(firstSec, dropLinesegs(spliceEl(xml, host, `<hp:p${host.attrs}>${newInner}</hp:p>`)));
+    return { hostedInSecPrParagraph: true };
+  }
+  const wrapper = `<hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">${ctrlXml}</hp:run></hp:p>`;
+  const at = paras[0].end;
+  doc.write(firstSec, dropLinesegs(xml.slice(0, at) + wrapper + xml.slice(at)));
+  return { hostedInSecPrParagraph: false, wrapperParagraphAdded: true };
+}
+
 function opSetHeaderFooter(doc, kind, text, applyPageType, align) {
   const tag = `hp:${kind}`;
   const apply = String(applyPageType || 'BOTH').toUpperCase();
@@ -3892,9 +4070,28 @@ function opSetHeaderFooter(doc, kind, text, applyPageType, align) {
     const els = scanTopLevel(xml, tag);
     if (!els.length) continue;
     const el = els[0];
-    let newInner = setCellInner(el.inner, text); // header/footer share subList>p>run>t shape with cells
-    // Retarget the inner paragraph's alignment when requested (first inner hp:p).
-    if (pprId != null) newInner = newInner.replace(/(<hp:p\b[^>]*\bparaPrIDRef=")\d+(")/, `$1${pprId}$2`);
+    // A footer/header may already hold a page-number paragraph (set_page_number).
+    // Keep it: replace/insert only the TEXT paragraph (the first one without an
+    // autoNum control), so footer text and page number coexist (sweep 2026-11-02:
+    // set_footer after set_page_number wiped the number).
+    let newInner;
+    const subs = scanTopLevel(el.inner, 'hp:subList');
+    const sub = subs[0];
+    const ps = sub ? scanTopLevel(sub.inner, 'hp:p') : [];
+    const textP = ps.find((pp) => !/<hp:autoNum\b/.test(pp.inner));
+    const textRef = pprId != null ? pprId : '0';
+    const textPara = `<hp:p id="${freshId()}" paraPrIDRef="${textRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run></hp:p>`;
+    if (sub && textP) {
+      const keepAttrs = pprId != null ? textP.attrs.replace(/\bparaPrIDRef="\d+"/, `paraPrIDRef="${pprId}"`) : textP.attrs;
+      const charRef = (textP.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+      const newP = `<hp:p${keepAttrs}>${runWithText(charRef, text)}</hp:p>`;
+      newInner = spliceEl(el.inner, sub, `<hp:subList${sub.attrs}>${spliceEl(sub.inner, textP, newP)}</hp:subList>`);
+    } else if (sub) {
+      newInner = spliceEl(el.inner, sub, `<hp:subList${sub.attrs}>${textPara}${sub.inner}</hp:subList>`);
+    } else {
+      newInner = setCellInner(el.inner, text);
+      if (pprId != null) newInner = newInner.replace(/(<hp:p\b[^>]*\bparaPrIDRef=")\d+(")/, `$1${pprId}$2`);
+    }
     let attrs = el.attrs;
     attrs = /applyPageType="[^"]*"/.test(attrs)
       ? attrs.replace(/applyPageType="[^"]*"/, `applyPageType="${apply}"`)
@@ -3904,29 +4101,20 @@ function opSetHeaderFooter(doc, kind, text, applyPageType, align) {
     return { kind, applyPageType: apply, align: resultAlign, updated: true };
   }
 
-  // None present — insert into the first section after its first body paragraph.
-  const firstSec = doc.sectionNames()[0];
-  if (!firstSec) throw new Error(`set_${kind}: no Contents/section*.xml found`);
-  let xml = doc.read(firstSec);
-  const paras = scanTopLevel(xml, 'hp:p');
-  if (!paras.length) throw new Error(`set_${kind}: no <hp:p> in first section to anchor insertion`);
-  const wrapper =
-    `<hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
-      `<hp:run charPrIDRef="0">` +
-        `<hp:ctrl>` +
-          `<${tag} id="0" applyPageType="${apply}">` +
-            `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
-              `<hp:p id="0" paraPrIDRef="${innerRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
-                `<hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run>` +
-              `</hp:p>` +
-            `</hp:subList>` +
-          `</${tag}>` +
-        `</hp:ctrl>` +
-      `</hp:run>` +
-    `</hp:p>`;
-  const insertAt = paras[0].end;
-  doc.write(firstSec, dropLinesegs(xml.slice(0, insertAt) + wrapper + xml.slice(insertAt)));
-  return { kind, applyPageType: apply, align: resultAlign, inserted: true };
+  // None present — host the control in the first section's secPr paragraph (GT).
+  const ctrl =
+    `<hp:ctrl>` +
+      `<${tag} id="0" applyPageType="${apply}">` +
+        `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="${kind === 'footer' ? 'BOTTOM' : 'TOP'}" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
+          `<hp:p id="0" paraPrIDRef="${innerRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
+            `<hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run>` +
+          `</hp:p>` +
+        `</hp:subList>` +
+      `</${tag}>` +
+    `</hp:ctrl>`;
+  let hosted;
+  try { hosted = insertSectionCtrlRun(doc, ctrl); } catch (e) { throw new Error(`set_${kind}: ${e.message}`); }
+  return { kind, applyPageType: apply, align: resultAlign, inserted: true, ...hosted };
 }
 
 // Page number (쪽번호) — a header/footer whose paragraph holds an <hp:autoNum
@@ -3937,27 +4125,42 @@ function opSetPageNumber(doc, where, align) {
   const kind = String(where || 'footer').toLowerCase() === 'header' ? 'header' : 'footer';
   const tag = `hp:${kind}`;
   const al = String(align || 'CENTER').toUpperCase();
+  // Alignment = the inner paragraph's paraPr (GT: 한컴독스 page-number footer
+  // center → footer paragraph paraPr with <hh:align horizontal="CENTER">). Use
+  // the same web-safe clean paraPr helper as set_footer/apply_paragraph_style —
+  // the old "find any paraPr with that align" lookup silently fell back to
+  // paraPr 0 (LEFT) when none existed (sweep 2026-11-02: CENTER rendered left).
   let pprId = '0';
-  const headerName = doc.headerName();
-  if (headerName && al !== 'LEFT') {
-    const hit = scanTopLevel(doc.read(headerName), 'hh:paraPr').find((pp) => new RegExp(`<hh:align\\b[^>]*horizontal="${al}"`).test(pp.inner));
-    if (hit) pprId = getAttr(hit.attrs, 'id');
-  }
-  const firstSec = doc.sectionNames()[0];
-  if (!firstSec) throw new Error('set_page_number: no Contents/section*.xml found');
-  let xml = doc.read(firstSec);
-  const paras = scanTopLevel(xml, 'hp:p');
-  if (!paras.length) throw new Error('set_page_number: no <hp:p> to anchor insertion');
+  if (!ALIGN_VALUES.has(al)) throw new Error(`set_page_number: align must be one of ${[...ALIGN_VALUES].join('/')}`);
+  if (al !== 'LEFT') pprId = ensureCleanAlignParaPr(doc, al) || '0';
   const autoNum = `<hp:ctrl><hp:autoNum num="1" numType="PAGE"><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar="" supscript="0"/></hp:autoNum></hp:ctrl><hp:t/>`;
-  const wrapper =
-    `<hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:ctrl>` +
+  const numPara = `<hp:p id="${freshId()}" paraPrIDRef="${pprId}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">${autoNum}</hp:run></hp:p>`;
+  // If a footer/header of this kind already exists (set_footer text), append the
+  // page-number paragraph INTO it — Hancom shows only the first instance of a
+  // kind, so a second <hp:footer> would hide one of them.
+  for (const name of doc.sectionNames()) {
+    const xml0 = doc.read(name);
+    const els = scanTopLevel(xml0, tag);
+    if (!els.length) continue;
+    const el = els[0];
+    if (/<hp:autoNum\b[^>]*numType="PAGE"/.test(el.inner)) return { where: kind, align: al, paraPrId: pprId, inserted: false, alreadyPresent: true };
+    const subs = scanTopLevel(el.inner, 'hp:subList');
+    if (!subs.length) continue;
+    const sub = subs[0];
+    const newInner = spliceEl(el.inner, sub, `<hp:subList${sub.attrs}>${sub.inner}${numPara}</hp:subList>`);
+    doc.write(name, dropLinesegs(spliceEl(xml0, el, `<${tag}${el.attrs}>${newInner}</${tag}>`)));
+    return { where: kind, align: al, paraPrId: pprId, inserted: true, mergedIntoExisting: true };
+  }
+  // None present — host the control in the first section's secPr paragraph (GT).
+  const ctrl =
+    `<hp:ctrl>` +
       `<${tag} id="0" applyPageType="BOTH"><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="${kind === 'footer' ? 'BOTTOM' : 'TOP'}" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
         `<hp:p id="0" paraPrIDRef="${pprId}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">${autoNum}</hp:run></hp:p>` +
       `</hp:subList></${tag}>` +
-    `</hp:ctrl></hp:run></hp:p>`;
-  const at = paras[0].end;
-  doc.write(firstSec, dropLinesegs(xml.slice(0, at) + wrapper + xml.slice(at)));
-  return { where: kind, align: al, paraPrId: pprId, inserted: true };
+    `</hp:ctrl>`;
+  let hosted;
+  try { hosted = insertSectionCtrlRun(doc, ctrl); } catch (e) { throw new Error(`set_page_number: ${e.message}`); }
+  return { where: kind, align: al, paraPrId: pprId, inserted: true, ...hosted };
 }
 
 function opRemoveHeaderFooter(doc, kind) {
@@ -3968,13 +4171,20 @@ function opRemoveHeaderFooter(doc, kind) {
     if (!xml.includes(`<${tag}`)) continue;
     const runs = scanTopLevel(xml, 'hp:run');
     let changed = false;
-    // Splice from the end so earlier offsets remain valid.
+    // Splice from the end so earlier offsets remain valid. Remove only the
+    // <hp:ctrl> holding the header/footer; Hancom may keep body text in the same
+    // run (GT 2026-11-07: header control + title text in one run), so dropping
+    // the whole run would delete that text. The run goes only when it is empty.
     for (let i = runs.length - 1; i >= 0; i--) {
-      if (!runs[i].self && runs[i].inner.includes(`<${tag}`)) {
-        xml = spliceEl(xml, runs[i], '');
-        removed++;
-        changed = true;
+      if (runs[i].selfClosing || !runs[i].inner.includes(`<${tag}`)) continue;
+      let inner = runs[i].inner;
+      const ctrls = scanTopLevel(inner, 'hp:ctrl');
+      for (let j = ctrls.length - 1; j >= 0; j--) {
+        if (ctrls[j].inner.includes(`<${tag}`)) { inner = spliceEl(inner, ctrls[j], ''); removed++; }
       }
+      const rest = inner.replace(/<hp:t\s*\/>|<hp:t>\s*<\/hp:t>/g, '').trim();
+      xml = spliceEl(xml, runs[i], rest ? `<hp:run${runs[i].attrs}>${inner}</hp:run>` : '');
+      changed = true;
     }
     if (changed) doc.write(name, dropLinesegs(xml));
   }
@@ -4002,13 +4212,32 @@ function opInsertNote(doc, kind, paragraphIndex, text) {
   }
   const { section, el } = paras[paragraphIndex];
   const charPrId = (el.inner.match(/charPrIDRef="(\d+)"/) || [, '0'])[1];
+  // GT (handoff/shared/gt/pagenum-footnote-endnote-hyperlink-GT.hwpx, 한컴독스
+  // footnote/endnote): <hp:footNote number="N" suffixChar="41" instId="…"> whose
+  // inner paragraph uses the 각주/미주 style and opens with the note's own
+  // <hp:autoNum numType="FOOTNOTE|ENDNOTE"> control, then the text. The earlier
+  // id="0" shell without the autoNum rendered the marker but, with a footnote
+  // in the same document, Hancom web dropped the endnote body (sweep 2026-11-02).
+  const numType = kind === 'footNote' ? 'FOOTNOTE' : 'ENDNOTE';
+  let number = 1;
+  for (const name of doc.sectionNames()) number += (doc.read(name).match(new RegExp(`<${tag}\\b`, 'g')) || []).length;
+  const headerName = doc.headerName();
+  let styleId = '0';
+  if (headerName) {
+    const want = kind === 'footNote' ? '각주' : '미주';
+    const st = doc.read(headerName).match(new RegExp(`<hh:style\\b[^>]*\\bid="(\\d+)"[^>]*\\bname="${want}"`));
+    if (st) styleId = st[1];
+  }
   const noteRun =
     `<hp:run charPrIDRef="${charPrId}">` +
       `<hp:ctrl>` +
-        `<${tag} id="0">` +
+        `<${tag} number="${number}" suffixChar="41" instId="${freshId()}">` +
           `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
-            `<hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
-              `<hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run>` +
+            `<hp:p id="0" paraPrIDRef="0" styleIDRef="${styleId}" pageBreak="0" columnBreak="0" merged="0">` +
+              `<hp:run charPrIDRef="${charPrId}">` +
+                `<hp:ctrl><hp:autoNum num="${number}" numType="${numType}"><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/></hp:autoNum></hp:ctrl>` +
+                `<hp:t> ${xmlEscape(text)}</hp:t>` +
+              `</hp:run>` +
             `</hp:p>` +
           `</hp:subList>` +
         `</${tag}>` +
@@ -4016,26 +4245,9 @@ function opInsertNote(doc, kind, paragraphIndex, text) {
     `</hp:run>`;
   const rebuilt = `<hp:p${el.attrs}>${el.inner + noteRun}</hp:p>`;
   doc.write(section, dropLinesegs(spliceEl(doc.read(section), el, rebuilt)));
-  return { kind: kind === 'footNote' ? 'footnote' : 'endnote', index: paragraphIndex, inserted: true };
+  return { kind: kind === 'footNote' ? 'footnote' : 'endnote', index: paragraphIndex, number, inserted: true };
 }
 
-// ── hyperlink ────────────────────────────────────────────────────────────────
-
-// HWPX models a hyperlink as a paired Hancom *field* embedded in a run:
-// <hp:run>
-//   <hp:ctrl><hp:fieldBegin id=B type="HYPERLINK" fieldid=F>
-//              <hp:parameters cnt=6>… Path/Command/Category/TargetType/DocOpenType …</hp:parameters>
-//            </hp:fieldBegin></hp:ctrl>
-//   <hp:t>표시 텍스트</hp:t>
-//   <hp:ctrl><hp:fieldEnd beginIDRef=B fieldid=F/></hp:ctrl>
-// </hp:run>
-// Template here mirrors a real government-doc instance verbatim (only the URL,
-// display text, and id pair vary). Hancom renders the run's <hp:t> as a
-// clickable link.
-// Bookmark = named anchor at the start of a paragraph's first run, used as
-// the jump target for cross-references / "Go to". The OWPML shape is a
-// minimal self-closing element wrapped in <hp:ctrl>:
-//   <hp:run charPrIDRef="N"><hp:ctrl><hp:bookmark name="…"/></hp:ctrl><hp:t>…</hp:t></hp:run>
 function opInsertBookmark(doc, index, name) {
   if (!name) throw new Error('insert_bookmark: "name" is required');
   const paras = doc.paragraphs();
@@ -4091,7 +4303,7 @@ function ensureHyperlinkCharPr(doc, baseCharPrId) {
   const updated = `<hh:charPr${newAttrs}>${wantInner}</hh:charPr>`;
   header = placeholder
     ? spliceEl(header, placeholder, updated)
-    : bumpListCount(spliceEl(header, base, `<hh:charPr${base.attrs}>${base.inner}</hh:charPr>` + updated), 'hh:charProperties', +1);
+    : bumpListCount(appendToList(header, 'hh:charProperties', updated), 'hh:charProperties', +1);
   doc.write(headerName, header);
   return useId;
 }
@@ -4134,11 +4346,16 @@ function opInsertHyperlink(doc, paragraphIndex, url, text) {
   // Without this, the original text and the hyperlink display label render
   // back-to-back. Multi-run or ctrl-bearing paragraphs append (don't drop
   // structural runs blindly).
+  // Documented contract (hwpx-edit-ops.md): the link is APPENDED to whatever
+  // the paragraph holds — "link-only paragraph" = append_paragraph "" first.
+  // An earlier build replaced a single plain-text run outright, which silently
+  // deleted the paragraph's text (sweep 2026-11-02). Only a run whose text is
+  // EMPTY is replaced (so the link-only pattern leaves no empty run behind).
   const runs = scanTopLevel(el.inner, 'hp:run');
-  const onlyPlainText = (r) =>
+  const emptyPlainRun = (r) =>
     !/<hp:ctrl\b/.test(r.inner) &&
-    /^\s*<hp:t[^>]*>[^<]*<\/hp:t>\s*$/.test(r.inner);
-  const newInner = runs.length === 1 && onlyPlainText(runs[0])
+    /^\s*<hp:t[^>]*>\s*<\/hp:t>\s*$/.test(r.inner);
+  const newInner = runs.length === 1 && emptyPlainRun(runs[0])
     ? spliceEl(el.inner, runs[0], run)
     : el.inner + run;
   const rebuilt = `<hp:p${el.attrs}>${newInner}</hp:p>`;
@@ -4273,9 +4490,17 @@ function opSetPageSetup(doc, opts) {
     if (preset) { w = toHu(preset[0]); h = toHu(preset[1]); }
     if (opts.width_mm != null) w = toHu(opts.width_mm);
     if (opts.height_mm != null) h = toHu(opts.height_mm);
+    // Orientation is the `landscape` enum, NOT the dims (GT 2026-11-02, Hancom
+    // native: portrait = landscape="WIDELY", landscape = landscape="NARROWLY",
+    // paper dims identical W<H in both). Dims are normalised to W<H so a doc
+    // that was previously "landscaped" by swapping W/H (old behaviour, issue
+    // #46 — Hancom read it as a custom 297×210 paper and rotated it again) is
+    // repaired on the way through.
+    if (w > h) [w, h] = [h, w];
     if (opts.orientation) {
       const land = String(opts.orientation).toLowerCase() === 'landscape';
-      if ((land && w < h) || (!land && w > h)) [w, h] = [h, w];
+      const val = land ? 'NARROWLY' : 'WIDELY';
+      pagePr = /\blandscape="/.test(pagePr) ? pagePr.replace(/\blandscape="[^"]*"/, `landscape="${val}"`) : pagePr.replace(/^<hp:pagePr\b/, `<hp:pagePr landscape="${val}"`);
     }
     pagePr = pagePr.replace(/\bwidth="\d+"/, `width="${w}"`).replace(/\bheight="\d+"/, `height="${h}"`);
     xml = xml.replace(pm[0], pagePr);
@@ -4386,19 +4611,32 @@ function stdSer(idx, name, cat, values, explode, color, pointColors, stroke, pie
   const cl = colLetter(idx);
   return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>`
     + `<c:tx><c:strRef><c:f>Sheet1!$${cl}$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>${xmlEscape(name)}</c:v></c:pt></c:strCache></c:strRef></c:tx>`
-    + `${serSpPr(color, stroke)}<c:invertIfNegative val="0"/>`
+    + `${serSpPr(color, stroke)}`
+    // GT (chart-line-stroke-schemeclr.hwpx): line/radar series declare a hidden
+    // marker (symbol none) right after spPr; bar/area/pie carry invertIfNegative.
+    + (stroke ? `<c:marker><c:symbol val="none"/><c:size val="7"/></c:marker>` : `<c:invertIfNegative val="0"/>`)
     + (explode ? `<c:explosion val="25"/>` : '')
     + dPtXml(pointColors, pie)
     + `<c:cat><c:strRef><c:f>Sheet1!$A$2:$A$${cat.length + 1}</c:f><c:strCache>${strCachePts(cat)}</c:strCache></c:strRef></c:cat>`
     + `<c:val><c:numRef><c:f>Sheet1!$${cl}$2:$${cl}$${values.length + 1}</c:f><c:numCache>${numCachePts(values)}</c:numCache></c:numRef></c:val>`
     + `</c:ser>`;
 }
-// Scatter series: xVal + yVal (numeric X shared from `cat`).
-function scatterSer(idx, name, xvals, yvals) {
+// Scatter series: xVal + yVal (numeric X shared from `cat`). Colour lives on
+// the MARKER (fill + 9525-EMU outline), not the series spPr — GT
+// chart-scatter-marker-schemeclr.hwpx (한컴독스 chart-style theme): the series
+// spPr keeps <a:ln><a:noFill/> (no connecting line) and <c:marker> carries
+// <c:spPr><a:solidFill/> + <a:ln><a:solidFill/>. Default (no colour) = the
+// GT default <c:marker><c:size val="7"/><c:spPr/></c:marker>.
+function scatterMarker(color) {
+  const f = chartColorFill(color);
+  if (!f) return '<c:marker><c:size val="7"/><c:spPr/></c:marker>';
+  return `<c:marker><c:size val="7"/><c:spPr>${f}<a:ln w="9525" cap="flat" cmpd="sng" algn="ctr">${f}<a:prstDash val="solid"/><a:round/><a:headEnd w="med" len="med"/><a:tailEnd w="med" len="med"/></a:ln></c:spPr></c:marker>`;
+}
+function scatterSer(idx, name, xvals, yvals, color) {
   const cl = colLetter(idx);
   return `<c:ser><c:idx val="${idx}"/><c:order val="${idx}"/>`
     + `<c:tx><c:strRef><c:f>Sheet1!$${cl}$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>${xmlEscape(name)}</c:v></c:pt></c:strCache></c:strRef></c:tx>`
-    + `<c:spPr><a:ln w="28575"><a:noFill/></a:ln></c:spPr><c:marker><c:symbol val="circle"/><c:size val="7"/></c:marker>`
+    + `<c:spPr><a:ln w="28575" cap="flat" cmpd="sng" algn="ctr"><a:noFill/><a:prstDash val="solid"/><a:round/><a:headEnd w="med" len="med"/><a:tailEnd w="med" len="med"/></a:ln></c:spPr>${scatterMarker(color)}`
     + `<c:xVal><c:numRef><c:f>Sheet1!$A$2:$A$${xvals.length + 1}</c:f><c:numCache>${numCachePts(xvals)}</c:numCache></c:numRef></c:xVal>`
     + `<c:yVal><c:numRef><c:f>Sheet1!$${cl}$2:$${cl}$${yvals.length + 1}</c:f><c:numCache>${numCachePts(yvals)}</c:numCache></c:numRef></c:yVal>`
     + `</c:ser>`;
@@ -4424,7 +4662,7 @@ function buildChartSpace(spec, cat, series) {
       const v = Number(c);
       return (c !== undefined && c !== '' && Number.isFinite(v)) ? v : i + 1;
     });
-    const sers = series.map((s, i) => scatterSer(i, s.name, xs, s.values)).join('');
+    const sers = series.map((s, i) => scatterSer(i, s.name, xs, s.values, s.color)).join('');
     plot = `<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>${sers}<c:axId val="${ax1}"/><c:axId val="${ax2}"/></c:scatterChart>`
       + valAxXml(ax1, 'b', ax2) + valAxXml(ax2, 'l', ax1);
   } else if (spec.pie) {
@@ -4567,6 +4805,12 @@ function opInsertChart(doc, op) {
 function buildShape(shape, w, h, fillColor, lineColor, lineWidth, wrap, x, y, margin) {
   const id = freshId(), inst = freshId();
   const lw = lineWidth || 33;
+  // A `line` with height_mm:0 (horizontal rule) must still own a box at least
+  // as tall as its stroke: with <hp:sz height="0"> Hancom web draws NOTHING
+  // (render sweep 2026-11-02 — box height = stroke width draws the rule at the
+  // box top; startPt/endPt keep y=0 so the line stays horizontal).
+  const endY = h;
+  if (shape === 'line' && h < lw) h = lw;
   const tw = wrap || 'IN_FRONT_OF_TEXT';
   const hx = Math.round(Number(x) || 0), vy = Math.round(Number(y) || 0);
   const om = margin != null ? Math.round(Number(margin)) : 0;
@@ -4587,7 +4831,7 @@ function buildShape(shape, w, h, fillColor, lineColor, lineWidth, wrap, x, y, ma
   const open = (extra) => `<hp:${shape} id="${id}" zOrder="0" numberingType="PICTURE" textWrap="${tw}" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="${inst}"${extra}>`;
   if (shape === 'line') {
     return open(' isReverseHV="0"') + common + shadow
-      + `<hc:startPt x="0" y="0"/><hc:endPt x="${w}" y="${h}"/>` + tail + `<hp:shapeComment>선</hp:shapeComment></hp:line>`;
+      + `<hc:startPt x="0" y="0"/><hc:endPt x="${w}" y="${endY}"/>` + tail + `<hp:shapeComment>선</hp:shapeComment></hp:line>`;
   }
   if (shape === 'ellipse') {
     return open(' intervalDirty="0" hasArcPr="0" arcType="NORMAL"') + common + fill + shadow
@@ -4748,6 +4992,17 @@ function applyOp(doc, op) {
 }
 
 function save(doc, outputPath) {
+  // Hancom-native docs declare xmlns:hwpunitchar on every <hs:sec> root (GT;
+  // python-hwpx's package validator requires it — issue #48). Done HERE, after
+  // all ops ran: splicing it mid-op shifts the section byte offsets that
+  // already-scanned paragraph/table elements rely on (corrupted a paragraph
+  // when tried inside injectHancomListInfra). Idempotent.
+  for (const secName of doc.sectionNames()) {
+    const sx = doc.read(secName);
+    const root = sx.match(/<hs:sec\b[^>]*>/);
+    if (!root || /xmlns:hwpunitchar=/.test(root[0])) continue;
+    doc.write(secName, sx.replace(/<hs:sec\b([^>]*?)>/, '<hs:sec$1 xmlns:hwpunitchar="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">'));
+  }
   // Write dirty text files back into the byte map, then zip.
   for (const name of doc.dirty) doc.files[name] = strToU8(doc.text[name]);
   // mimetype must be the first entry and STORED (uncompressed) per HWPX spec.
