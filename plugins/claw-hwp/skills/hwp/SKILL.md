@@ -484,6 +484,8 @@ Filling a blank form (the user gives a `.hwp`/`.hwpx` template and wants the fie
 ### "Show me what this looks like" / "Preview this HWP file"
 
 > ⚠️ **Preview is feedback, not verification.** This is our own lightweight renderer (rhwp WASM canvas) — fast and convenient for showing edits visually, but **NOT** a 한컴 compatibility check. It can show a file as fine that 한컴독스 silently rejects (round-trip strips, fingerprint issues, web-only mis-renders, silent attribute drops). **Real verification = 한컴독스 (web) or 한컴오피스 (desktop) only** — see the "Verifying in 한컴독스" section for the companion skill (`hancomdocs-capture`).
+>
+> The divergence runs **both ways**: the preview can also show a defect that 한컴 does not have. Known case: long text inside a table cell drawn squashed / overlapping / spilling past the cell border in the preview, while 한컴독스 wraps it correctly. **If something looks wrong only in the preview, do not change the document to "fix" it** — and never hand-patch the file's binary records or write your own byte-level script for it. Tell the user it may be a preview rendering limit and confirm in 한컴독스 (web) / 한컴오피스 (desktop) first: use `hancomdocs-capture` if it is installed, otherwise ask the user to open the file there. Edit the document only if 한컴 shows the same problem.
 
 The skill ships a tiny Node HTTP server (`scripts/preview-server.js`) that serves a vanilla-JS canvas-based viewer; rhwp WASM does the actual rendering in the browser. It's good for eyeballing content and layout, but **its rendering can diverge from 한컴 and it never exercises 한컴 round-trip parsing** — opening the preview only proves *the preview* opened it, not that 한컴 will. That's what the companion verification skill is for. No LibreOffice, no external browser plugin.
 
@@ -593,7 +595,7 @@ Auto-detection: if no file argument is passed, the launcher picks the most recen
 
 #### When to fire preview (all paths)
 
-Don't ask, just do it. **Showing the user a quick visual is your job** — but flag that this preview is feedback only, NOT a 한컴 compatibility verification (real verification = 한컴독스 / 한컴오피스 — see "Verifying in 한컴독스" section).
+Don't ask, just do it. **Showing the user a quick visual is your job** — but flag that this preview is feedback only, NOT a 한컴 compatibility verification (real verification = 한컴독스 / 한컴오피스 — see "Verifying in 한컴독스" section). If the preview looks odd (overlapping or clipped text in table cells, strange line breaks), that is a signal to verify in 한컴독스 — not a reason to edit the file. See the ⚠️ note at the top of this section.
 
 1. Right after `create.js` writes a new file.
 2. Right after the user uploads a `.hwp` / `.hwpx` or mentions one by path.
