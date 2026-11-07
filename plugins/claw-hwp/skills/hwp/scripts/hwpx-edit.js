@@ -4014,6 +4014,35 @@ function buildPic(doc, itemId, width, height) {
 
 const VALID_APPLY = new Set(['BOTH', 'EVEN', 'ODD']);
 
+// Host a new <hp:header>/<hp:footer> control the way Hancom does. GT
+// (2026-11-07, 한컴독스 page-number footer + header applied to a doc whose first
+// paragraph holds text — handoff/shared/gt/pagenum-in-secpr-para-GT-{footer,header}.hwpx):
+// Hancom puts the control in its OWN <hp:run> inside the SAME paragraph that
+// carries <hp:secPr>, right after the secPr run, and never adds a body
+// paragraph. Our old path inserted a wrapper paragraph after the first body
+// paragraph, which Hancom rendered as a visible blank line under the title
+// (merge smoke 2026-11-07). Falls back to the wrapper paragraph only when no
+// paragraph carries a secPr run.
+function insertSectionCtrlRun(doc, ctrlXml) {
+  const firstSec = doc.sectionNames()[0];
+  if (!firstSec) throw new Error('no Contents/section*.xml found');
+  const xml = doc.read(firstSec);
+  const paras = scanTopLevel(xml, 'hp:p');
+  if (!paras.length) throw new Error('no <hp:p> in first section to anchor insertion');
+  const host = paras.find((p) => /<hp:secPr\b/.test(p.inner));
+  const secRun = host ? scanTopLevel(host.inner, 'hp:run').find((r) => /<hp:secPr\b/.test(r.inner)) : null;
+  if (host && secRun) {
+    const charRef = getAttr(secRun.attrs, 'charPrIDRef') || '0';
+    const newInner = host.inner.slice(0, secRun.end) + `<hp:run charPrIDRef="${charRef}">${ctrlXml}</hp:run>` + host.inner.slice(secRun.end);
+    doc.write(firstSec, dropLinesegs(spliceEl(xml, host, `<hp:p${host.attrs}>${newInner}</hp:p>`)));
+    return { hostedInSecPrParagraph: true };
+  }
+  const wrapper = `<hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">${ctrlXml}</hp:run></hp:p>`;
+  const at = paras[0].end;
+  doc.write(firstSec, dropLinesegs(xml.slice(0, at) + wrapper + xml.slice(at)));
+  return { hostedInSecPrParagraph: false, wrapperParagraphAdded: true };
+}
+
 function opSetHeaderFooter(doc, kind, text, applyPageType, align) {
   const tag = `hp:${kind}`;
   const apply = String(applyPageType || 'BOTH').toUpperCase();
@@ -4072,29 +4101,20 @@ function opSetHeaderFooter(doc, kind, text, applyPageType, align) {
     return { kind, applyPageType: apply, align: resultAlign, updated: true };
   }
 
-  // None present — insert into the first section after its first body paragraph.
-  const firstSec = doc.sectionNames()[0];
-  if (!firstSec) throw new Error(`set_${kind}: no Contents/section*.xml found`);
-  let xml = doc.read(firstSec);
-  const paras = scanTopLevel(xml, 'hp:p');
-  if (!paras.length) throw new Error(`set_${kind}: no <hp:p> in first section to anchor insertion`);
-  const wrapper =
-    `<hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
-      `<hp:run charPrIDRef="0">` +
-        `<hp:ctrl>` +
-          `<${tag} id="0" applyPageType="${apply}">` +
-            `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
-              `<hp:p id="0" paraPrIDRef="${innerRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
-                `<hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run>` +
-              `</hp:p>` +
-            `</hp:subList>` +
-          `</${tag}>` +
-        `</hp:ctrl>` +
-      `</hp:run>` +
-    `</hp:p>`;
-  const insertAt = paras[0].end;
-  doc.write(firstSec, dropLinesegs(xml.slice(0, insertAt) + wrapper + xml.slice(insertAt)));
-  return { kind, applyPageType: apply, align: resultAlign, inserted: true };
+  // None present — host the control in the first section's secPr paragraph (GT).
+  const ctrl =
+    `<hp:ctrl>` +
+      `<${tag} id="0" applyPageType="${apply}">` +
+        `<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="${kind === 'footer' ? 'BOTTOM' : 'TOP'}" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
+          `<hp:p id="0" paraPrIDRef="${innerRef}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">` +
+            `<hp:run charPrIDRef="0"><hp:t>${xmlEscape(text)}</hp:t></hp:run>` +
+          `</hp:p>` +
+        `</hp:subList>` +
+      `</${tag}>` +
+    `</hp:ctrl>`;
+  let hosted;
+  try { hosted = insertSectionCtrlRun(doc, ctrl); } catch (e) { throw new Error(`set_${kind}: ${e.message}`); }
+  return { kind, applyPageType: apply, align: resultAlign, inserted: true, ...hosted };
 }
 
 // Page number (쪽번호) — a header/footer whose paragraph holds an <hp:autoNum
@@ -4131,20 +4151,16 @@ function opSetPageNumber(doc, where, align) {
     doc.write(name, dropLinesegs(spliceEl(xml0, el, `<${tag}${el.attrs}>${newInner}</${tag}>`)));
     return { where: kind, align: al, paraPrId: pprId, inserted: true, mergedIntoExisting: true };
   }
-  const firstSec = doc.sectionNames()[0];
-  if (!firstSec) throw new Error('set_page_number: no Contents/section*.xml found');
-  let xml = doc.read(firstSec);
-  const paras = scanTopLevel(xml, 'hp:p');
-  if (!paras.length) throw new Error('set_page_number: no <hp:p> to anchor insertion');
-  const wrapper =
-    `<hp:p id="${freshId()}" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:ctrl>` +
+  // None present — host the control in the first section's secPr paragraph (GT).
+  const ctrl =
+    `<hp:ctrl>` +
       `<${tag} id="0" applyPageType="BOTH"><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="${kind === 'footer' ? 'BOTTOM' : 'TOP'}" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">` +
         `<hp:p id="0" paraPrIDRef="${pprId}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">${autoNum}</hp:run></hp:p>` +
       `</hp:subList></${tag}>` +
-    `</hp:ctrl></hp:run></hp:p>`;
-  const at = paras[0].end;
-  doc.write(firstSec, dropLinesegs(xml.slice(0, at) + wrapper + xml.slice(at)));
-  return { where: kind, align: al, paraPrId: pprId, inserted: true };
+    `</hp:ctrl>`;
+  let hosted;
+  try { hosted = insertSectionCtrlRun(doc, ctrl); } catch (e) { throw new Error(`set_page_number: ${e.message}`); }
+  return { where: kind, align: al, paraPrId: pprId, inserted: true, ...hosted };
 }
 
 function opRemoveHeaderFooter(doc, kind) {
@@ -4155,13 +4171,20 @@ function opRemoveHeaderFooter(doc, kind) {
     if (!xml.includes(`<${tag}`)) continue;
     const runs = scanTopLevel(xml, 'hp:run');
     let changed = false;
-    // Splice from the end so earlier offsets remain valid.
+    // Splice from the end so earlier offsets remain valid. Remove only the
+    // <hp:ctrl> holding the header/footer; Hancom may keep body text in the same
+    // run (GT 2026-11-07: header control + title text in one run), so dropping
+    // the whole run would delete that text. The run goes only when it is empty.
     for (let i = runs.length - 1; i >= 0; i--) {
-      if (!runs[i].self && runs[i].inner.includes(`<${tag}`)) {
-        xml = spliceEl(xml, runs[i], '');
-        removed++;
-        changed = true;
+      if (runs[i].selfClosing || !runs[i].inner.includes(`<${tag}`)) continue;
+      let inner = runs[i].inner;
+      const ctrls = scanTopLevel(inner, 'hp:ctrl');
+      for (let j = ctrls.length - 1; j >= 0; j--) {
+        if (ctrls[j].inner.includes(`<${tag}`)) { inner = spliceEl(inner, ctrls[j], ''); removed++; }
       }
+      const rest = inner.replace(/<hp:t\s*\/>|<hp:t>\s*<\/hp:t>/g, '').trim();
+      xml = spliceEl(xml, runs[i], rest ? `<hp:run${runs[i].attrs}>${inner}</hp:run>` : '');
+      changed = true;
     }
     if (changed) doc.write(name, dropLinesegs(xml));
   }
