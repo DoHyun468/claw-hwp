@@ -1010,7 +1010,10 @@ const HANDLERS = {
         header: pd.marginHeader, footer: pd.marginFooter, gutter: pd.marginGutter,
       };
     }
-    log.push(`setup_document: ${op.page_size || "default"} ${op.orientation || pd.landscape ? "landscape" : "portrait"}, margin=${op.margin_mm ?? "?"}mm, base_font=${op.base_font || "default"}`);
+    // Log the orientation actually stored in PageDef. (Was `op.orientation ||
+    // pd.landscape ? … : …`, which parses as `(op.orientation || pd.landscape) ?`
+    // and printed "landscape" for every explicit orientation, portrait included.)
+    log.push(`setup_document: ${op.page_size || "default"} ${pd.landscape ? "landscape" : "portrait"}, margin=${op.margin_mm ?? "?"}mm, base_font=${op.base_font || "default"}`);
   },
 
   append_paragraph(doc, op, cursor) {
