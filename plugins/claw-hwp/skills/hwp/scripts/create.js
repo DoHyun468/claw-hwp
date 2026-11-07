@@ -141,6 +141,18 @@ function makeCursor(doc) {
   return { sec, para, charOffset, firstParaUsed: paras > 1 || charOffset > 0 };
 }
 
+// Force rhwp to recompute a cell paragraph's line layout.
+// See the call site in append_table for why this is needed.
+function relayoutCellParagraph(doc, sec, paraIdx, controlIdx, cellIdx, textLen, log) {
+  if (!textLen) return;
+  try {
+    unwrap(doc.insertTextInCell(sec, paraIdx, controlIdx, cellIdx, 0, textLen, " "), "relayout insert");
+    unwrap(doc.deleteTextInCell(sec, paraIdx, controlIdx, cellIdx, 0, textLen, 1), "relayout delete");
+  } catch (err) {
+    log.push(`cell relayout skipped (cell ${cellIdx}): ${err.message?.slice(0, 80)}`);
+  }
+}
+
 function unwrap(jsonStr, opName) {
   // Most rhwp methods return a JSON string {ok: true/false, ...}. A few
   // return numeric IDs or void. Caller decides whether to call this.
@@ -1344,6 +1356,14 @@ const HANDLERS = {
           }
           runOffset += len;
         }
+        // applyCharFormatInCell collapses the cell paragraph's
+        // line layout to ONE line, and neither applyParaFormatInCell nor the
+        // reflowLinesegs() pass before export recomputes it (the cached
+        // lineseg is non-empty, so it isn't "uncomputed"). Long cell text then
+        // renders past the cell's right edge (rhwp preview clips it). Appending
+        // and deleting one character makes rhwp re-layout the paragraph
+        // against the cell width; text and char shapes are left unchanged.
+        relayoutCellParagraph(doc, cursor.sec, tableParaIdx, controlIdx, cellIdx, cellText.length, log);
       }
     }
 
