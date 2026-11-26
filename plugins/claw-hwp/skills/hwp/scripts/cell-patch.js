@@ -5154,6 +5154,7 @@ const SHAPE_REC_SIZE = {
   0x4f: { w: [[9, 1], [17, 1]], h: [[21, 1], [29, 1]] },          // RECTANGLE — 4 corners (verified)
   0x4e: { w: [[8, 1]], h: [[12, 1]] },                            // LINE — endpoint vector (verified)
   0x50: { w: [[4, 0.5], [12, 1], [20, 0.5]], h: [[8, 0.5], [16, 0.5]] }, // ELLIPSE — center(W/2,H/2)+axis(W,H/2) endpoints
+  0x55: { w: [[20, 1], [28, 1]], h: [[32, 1], [40, 1]] },        // PICTURE — 4 corners at 12..44 (Hancom draws the image into these)
   // arc (0x51) is center+axis+sweep-angle (W@17 H@13, irregular) — resizing W/H
   // alone won't preserve the curve; kept guarded (see resize guard below).
 };
